@@ -7,27 +7,33 @@ use windows::{
     core::*,
     Win32::{
         Foundation::{COLORREF, E_POINTER, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM},
+        Graphics::Dwm::{
+            DwmSetWindowAttribute, DWMWA_CAPTION_COLOR, DWMWA_TEXT_COLOR,
+            DWMWA_USE_IMMERSIVE_DARK_MODE,
+        },
         Graphics::Gdi::{
             self, BeginPaint, CreateFontW, CreatePen, CreateSolidBrush, DeleteObject, DrawTextW,
-            EndPaint, FillRect, GetStockObject, InvalidateRect, RoundRect, SelectObject,
-            SetBkMode, SetTextColor, DT_END_ELLIPSIS, DT_LEFT, DT_SINGLELINE, DT_VCENTER,
-            HBRUSH, HDC, HFONT, HGDIOBJ, NULL_BRUSH, NULL_PEN, TRANSPARENT,
+            EndPaint, FillRect, GetMonitorInfoW, GetStockObject, InvalidateRect, LineTo,
+            MonitorFromWindow, MoveToEx, RoundRect, SelectObject, SetBkMode, SetTextColor,
+            DT_CENTER, DT_END_ELLIPSIS, DT_LEFT, DT_SINGLELINE, DT_VCENTER, HBRUSH, HDC, HFONT,
+            HGDIOBJ, MONITORINFO, MONITOR_DEFAULTTONEAREST, NULL_BRUSH, NULL_PEN, TRANSPARENT,
         },
         System::{Com::*, LibraryLoader},
         UI::{
             Controls::{EM_SETMARGINS, EM_SETSEL},
             HiDpi,
             Input::KeyboardAndMouse::{
-                GetKeyState, SetFocus, VK_CONTROL, VK_F5, VK_MENU, VK_RETURN,
+                GetKeyState, SetFocus, VK_CONTROL, VK_F11, VK_F5, VK_MENU, VK_RETURN,
             },
             WindowsAndMessaging::{
-                self, CREATESTRUCTW, CW_USEDEFAULT, GWLP_USERDATA, HMENU, IDC_ARROW, MSG,
-                EC_LEFTMARGIN, EC_RIGHTMARGIN, GWLP_WNDPROC, WNDPROC,
+                self, CREATESTRUCTW, CW_USEDEFAULT, EC_LEFTMARGIN, EC_RIGHTMARGIN, GWLP_USERDATA,
+                GWLP_WNDPROC, GWL_STYLE, HMENU, HWND_TOP, ICON_BIG, ICON_SMALL, IDC_ARROW, MSG,
                 WINDOW_EX_STYLE, WINDOW_LONG_PTR_INDEX, WINDOW_STYLE, WM_APP, WM_CHAR, WM_CLOSE,
                 WM_COMMAND, WM_CREATE, WM_CTLCOLORBTN, WM_CTLCOLOREDIT, WM_CTLCOLORSTATIC,
                 WM_DESTROY, WM_KEYDOWN, WM_LBUTTONDOWN, WM_MOUSEMOVE, WM_NCCREATE, WM_PAINT,
-                WM_SETCURSOR, WM_SETFOCUS, WM_SIZE, WNDCLASSW, WS_BORDER, WS_CHILD,
-                WS_CLIPCHILDREN, WS_CLIPSIBLINGS, WS_OVERLAPPEDWINDOW, WS_TABSTOP, WS_VISIBLE,
+                WM_SETCURSOR, WM_SETFOCUS, WM_SETFONT, WM_SETICON, WM_SIZE, WM_TIMER, WNDCLASSW,
+                WNDPROC, WS_CHILD, WS_CLIPCHILDREN, WS_CLIPSIBLINGS, WS_EX_DLGMODALFRAME,
+                WS_OVERLAPPEDWINDOW, WS_POPUP, WS_TABSTOP, WS_VISIBLE,
             },
         },
     },
@@ -36,18 +42,23 @@ use windows::{
 const APP_NAME: PCWSTR = w!("Aster");
 const CLASS_NAME: PCWSTR = w!("AsterWindow");
 const ADDRESS_ID: i32 = 1001;
-const SIDEBAR_WIDTH: i32 = 232;
+const DEFAULT_URL: &str = "https://www.google.com";
+const SIDEBAR_EXPANDED: f32 = 248.0;
+const SIDEBAR_COLLAPSED: f32 = 64.0;
 const TOPBAR_HEIGHT: i32 = 58;
-const TAB_HEIGHT: i32 = 42;
-const TAB_TOP: i32 = 78;
+const TAB_HEIGHT: i32 = 48;
+const TAB_TOP: i32 = 76;
+const SIDEBAR_TIMER_ID: usize = 42;
 
 const COLOR_BLACK: u32 = 0x000000;
 const COLOR_PANEL: u32 = 0x090909;
-const COLOR_PANEL_2: u32 = 0x111111;
-const COLOR_ACTIVE: u32 = 0x1c1c1c;
-const COLOR_BORDER: u32 = 0x2b2b2b;
+const COLOR_PANEL_2: u32 = 0x121212;
+const COLOR_SURFACE: u32 = 0x161616;
+const COLOR_SURFACE_HOVER: u32 = 0x242424;
+const COLOR_BORDER: u32 = 0x343434;
 const COLOR_TEXT: u32 = 0xf5f5f5;
 const COLOR_MUTED: u32 = 0xa1a1a1;
+const COLOR_ACCENT: u32 = 0xf16f63;
 
 static mut OLD_ADDRESS_PROC: WNDPROC = None;
 
@@ -104,6 +115,45 @@ struct Tab {
     webview: ICoreWebView2,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HoverTarget {
+    Logo,
+    NewTab,
+    Back,
+    Forward,
+    Reload,
+    Settings,
+    ModeRow,
+    ModeAuto,
+    ModeDark,
+    ModeLight,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SiteMode {
+    Auto,
+    Dark,
+    Light,
+}
+
+impl SiteMode {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Auto => "Auto",
+            Self::Dark => "Dark",
+            Self::Light => "Light",
+        }
+    }
+
+    fn scheme(self) -> COREWEBVIEW2_PREFERRED_COLOR_SCHEME {
+        match self {
+            Self::Auto => COREWEBVIEW2_PREFERRED_COLOR_SCHEME_AUTO,
+            Self::Dark => COREWEBVIEW2_PREFERRED_COLOR_SCHEME_DARK,
+            Self::Light => COREWEBVIEW2_PREFERRED_COLOR_SCHEME_LIGHT,
+        }
+    }
+}
+
 impl Drop for Tab {
     fn drop(&mut self) {
         unsafe {
@@ -113,17 +163,17 @@ impl Drop for Tab {
 }
 
 struct UiFonts {
-    title: HFONT,
     body: HFONT,
     small: HFONT,
+    icon: HFONT,
 }
 
 impl Drop for UiFonts {
     fn drop(&mut self) {
         unsafe {
-            let _ = DeleteObject(HGDIOBJ(self.title.0));
             let _ = DeleteObject(HGDIOBJ(self.body.0));
             let _ = DeleteObject(HGDIOBJ(self.small.0));
+            let _ = DeleteObject(HGDIOBJ(self.icon.0));
         }
     }
 }
@@ -132,7 +182,6 @@ struct UiBrushes {
     black: HBRUSH,
     panel: HBRUSH,
     panel_2: HBRUSH,
-    active: HBRUSH,
     edit: HBRUSH,
 }
 
@@ -142,7 +191,6 @@ impl Drop for UiBrushes {
             let _ = DeleteObject(HGDIOBJ(self.black.0));
             let _ = DeleteObject(HGDIOBJ(self.panel.0));
             let _ = DeleteObject(HGDIOBJ(self.panel_2.0));
-            let _ = DeleteObject(HGDIOBJ(self.active.0));
             let _ = DeleteObject(HGDIOBJ(self.edit.0));
         }
     }
@@ -159,24 +207,41 @@ struct App {
     brushes: UiBrushes,
     hover_close: Option<usize>,
     hover_tab: Option<usize>,
+    hover_target: Option<HoverTarget>,
+    sidebar_width: f32,
+    sidebar_target: f32,
+    sidebar_collapsed: bool,
+    site_mode: SiteMode,
+    settings_open: bool,
+    mode_menu_open: bool,
+    fullscreen: bool,
+    saved_style: isize,
+    saved_rect: RECT,
 }
 
 impl App {
     fn new(hwnd: HWND, environment: ICoreWebView2Environment) -> AppResult<Self> {
         let fonts = UiFonts {
-            title: create_font(20, 700)?,
-            body: create_font(15, 500)?,
-            small: create_font(13, 500)?,
+            body: create_font(14, 400)?,
+            small: create_font(12, 400)?,
+            icon: create_font_with_face(18, 400, w!("Segoe Fluent Icons"))?,
         };
         let brushes = UiBrushes {
             black: solid_brush(COLOR_BLACK),
             panel: solid_brush(COLOR_PANEL),
             panel_2: solid_brush(COLOR_PANEL_2),
-            active: solid_brush(COLOR_ACTIVE),
             edit: solid_brush(0x151515),
         };
 
         let address_hwnd = create_address_bar(hwnd)?;
+        unsafe {
+            let _ = WindowsAndMessaging::SendMessageW(
+                address_hwnd,
+                WM_SETFONT,
+                Some(WPARAM(fonts.body.0 as usize)),
+                Some(LPARAM(1)),
+            );
+        }
         let mut app = Self {
             hwnd,
             address_hwnd,
@@ -188,8 +253,18 @@ impl App {
             brushes,
             hover_close: None,
             hover_tab: None,
+            hover_target: None,
+            sidebar_width: SIDEBAR_EXPANDED,
+            sidebar_target: SIDEBAR_EXPANDED,
+            sidebar_collapsed: false,
+            site_mode: SiteMode::Auto,
+            settings_open: false,
+            mode_menu_open: false,
+            fullscreen: false,
+            saved_style: 0,
+            saved_rect: RECT::default(),
         };
-        app.create_tab("https://vercel.com")?;
+        app.create_tab(DEFAULT_URL)?;
         Ok(app)
     }
 
@@ -197,11 +272,13 @@ impl App {
         let controller = create_webview_controller(&self.environment, self.hwnd)?;
         let webview = unsafe { controller.CoreWebView2()? };
         configure_webview(&webview)?;
+        apply_site_mode_to_webview(&webview, self.site_mode);
 
         let id = self.next_id;
         self.next_id += 1;
         let index = self.tabs.len();
         self.attach_events(index, id, &webview)?;
+        self.attach_controller_events(&controller)?;
 
         unsafe {
             controller.SetIsVisible(false)?;
@@ -218,7 +295,39 @@ impl App {
         Ok(())
     }
 
-    fn attach_events(&self, index_hint: usize, tab_id: usize, webview: &ICoreWebView2) -> AppResult<()> {
+    fn attach_controller_events(&self, controller: &ICoreWebView2Controller) -> AppResult<()> {
+        unsafe {
+            let hwnd = self.hwnd;
+            let mut token = 0;
+            controller.add_AcceleratorKeyPressed(
+                &AcceleratorKeyPressedEventHandler::create(Box::new(move |_sender, args| {
+                    if let Some(args) = args {
+                        let mut kind = COREWEBVIEW2_KEY_EVENT_KIND(0);
+                        let mut key = 0;
+                        if args.KeyEventKind(&mut kind).is_ok()
+                            && args.VirtualKey(&mut key).is_ok()
+                            && (kind.0 == COREWEBVIEW2_KEY_EVENT_KIND_KEY_DOWN.0
+                                || kind.0 == COREWEBVIEW2_KEY_EVENT_KIND_SYSTEM_KEY_DOWN.0)
+                            && is_aster_shortcut(key)
+                        {
+                            handle_keydown(hwnd, WPARAM(key as usize));
+                            let _ = args.SetHandled(true);
+                        }
+                    }
+                    Ok(())
+                })),
+                &mut token,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn attach_events(
+        &self,
+        index_hint: usize,
+        tab_id: usize,
+        webview: &ICoreWebView2,
+    ) -> AppResult<()> {
         unsafe {
             let hwnd = self.hwnd;
             let mut token = 0;
@@ -305,7 +414,11 @@ impl App {
             .enumerate()
             .find(|(_, tab)| tab.id == tab_id)
         {
-            tab.url = if url == "about:blank" { String::new() } else { url };
+            tab.url = if url == "about:blank" {
+                String::new()
+            } else {
+                url
+            };
             if index == self.active {
                 set_window_text(self.address_hwnd, &tab.url);
             }
@@ -327,7 +440,9 @@ impl App {
         if let Some(tab) = self.tabs.get(index) {
             set_window_text(self.address_hwnd, &tab.url);
             unsafe {
-                let _ = tab.controller.MoveFocus(COREWEBVIEW2_MOVE_FOCUS_REASON_PROGRAMMATIC);
+                let _ = tab
+                    .controller
+                    .MoveFocus(COREWEBVIEW2_MOVE_FOCUS_REASON_PROGRAMMATIC);
             }
         }
         self.refresh();
@@ -339,7 +454,7 @@ impl App {
         }
         self.tabs.remove(index);
         if self.tabs.is_empty() {
-            let _ = self.create_tab("https://vercel.com");
+            let _ = self.create_tab(DEFAULT_URL);
             return;
         }
         let next = if index >= self.tabs.len() {
@@ -399,22 +514,131 @@ impl App {
         }
     }
 
+    fn sidebar_width(&self) -> i32 {
+        self.sidebar_width.round() as i32
+    }
+
+    fn content_left(&self) -> i32 {
+        self.sidebar_width()
+    }
+
+    fn top_button_rects(&self) -> (RECT, RECT, RECT) {
+        let x = self.content_left() + 18;
+        (
+            RECT {
+                left: x,
+                top: 13,
+                right: x + 36,
+                bottom: 49,
+            },
+            RECT {
+                left: x + 44,
+                top: 13,
+                right: x + 80,
+                bottom: 49,
+            },
+            RECT {
+                left: x + 88,
+                top: 13,
+                right: x + 124,
+                bottom: 49,
+            },
+        )
+    }
+
+    fn logo_rect(&self) -> RECT {
+        RECT {
+            left: 16,
+            top: 14,
+            right: 48,
+            bottom: 46,
+        }
+    }
+
+    fn new_tab_rect(&self) -> RECT {
+        let right = self.sidebar_width() - 16;
+        RECT {
+            left: right - 36,
+            top: 13,
+            right,
+            bottom: 49,
+        }
+    }
+
+    fn settings_rect(&self) -> RECT {
+        let rect = client_rect(self.hwnd);
+        RECT {
+            left: 16,
+            top: rect.bottom - 52,
+            right: 48,
+            bottom: rect.bottom - 20,
+        }
+    }
+
+    fn settings_menu_rect(&self) -> RECT {
+        let settings = self.settings_rect();
+        let bottom = settings.top - 8;
+        RECT {
+            left: 12,
+            top: bottom - 108,
+            right: 196,
+            bottom,
+        }
+    }
+
+    fn mode_row_rect(&self) -> RECT {
+        let menu = self.settings_menu_rect();
+        RECT {
+            left: menu.left + 8,
+            top: menu.top + 10,
+            right: menu.right - 8,
+            bottom: menu.top + 46,
+        }
+    }
+
+    fn mode_options_rect(&self) -> RECT {
+        let row = self.mode_row_rect();
+        RECT {
+            left: row.right + 8,
+            top: row.top - 6,
+            right: row.right + 132,
+            bottom: row.top + 108,
+        }
+    }
+
+    fn address_rect(&self) -> RECT {
+        let rect = client_rect(self.hwnd);
+        let (_, _, reload) = self.top_button_rects();
+        RECT {
+            left: reload.right + 14,
+            top: 13,
+            right: (rect.right - 18).max(reload.right + 220),
+            bottom: 49,
+        }
+    }
+
+    fn new_tab_opacity(&self) -> f32 {
+        ((self.sidebar_width - 118.0) / (SIDEBAR_EXPANDED - 118.0)).clamp(0.0, 1.0)
+    }
+
     fn layout(&self) {
         let rect = client_rect(self.hwnd);
+        let address = self.address_rect();
         unsafe {
             let _ = WindowsAndMessaging::SetWindowPos(
                 self.address_hwnd,
                 None,
-                SIDEBAR_WIDTH + 132,
-                14,
-                (rect.right - SIDEBAR_WIDTH - 222).max(180),
-                32,
+                address.left + 36,
+                address.top + 7,
+                (address.right - address.left - 52).max(120),
+                22,
                 WindowsAndMessaging::SWP_NOZORDER,
             );
         }
 
+        let left = self.content_left();
         let bounds = RECT {
-            left: SIDEBAR_WIDTH,
+            left,
             top: TOPBAR_HEIGHT,
             right: rect.right,
             bottom: rect.bottom,
@@ -432,124 +656,358 @@ impl App {
         unsafe {
             let _ = FillRect(hdc, &rect, self.brushes.black);
 
+            let sidebar_width = self.sidebar_width();
             let sidebar = RECT {
                 left: 0,
                 top: 0,
-                right: SIDEBAR_WIDTH,
+                right: sidebar_width,
                 bottom: rect.bottom,
             };
             let _ = FillRect(hdc, &sidebar, self.brushes.panel);
+            fill_rect(
+                hdc,
+                RECT {
+                    left: sidebar.right - 1,
+                    top: 0,
+                    right: sidebar.right,
+                    bottom: rect.bottom,
+                },
+                COLOR_BORDER,
+            );
 
             let topbar = RECT {
-                left: SIDEBAR_WIDTH,
+                left: sidebar_width,
                 top: 0,
                 right: rect.right,
                 bottom: TOPBAR_HEIGHT,
             };
             let _ = FillRect(hdc, &topbar, self.brushes.panel);
+            fill_rect(
+                hdc,
+                RECT {
+                    left: topbar.left,
+                    top: TOPBAR_HEIGHT - 1,
+                    right: rect.right,
+                    bottom: TOPBAR_HEIGHT,
+                },
+                0x202020,
+            );
 
+            draw_logo(
+                hdc,
+                self.logo_rect(),
+                self.hover_target == Some(HoverTarget::Logo),
+            );
+            let new_tab_opacity = self.new_tab_opacity();
+            if new_tab_opacity > 0.08 {
+                draw_icon_button(
+                    hdc,
+                    self.new_tab_rect(),
+                    IconKind::Plus,
+                    self.hover_target == Some(HoverTarget::NewTab),
+                    new_tab_opacity,
+                    &self.fonts.icon,
+                );
+            }
+
+            let (back, forward, reload) = self.top_button_rects();
+            draw_icon_button(
+                hdc,
+                back,
+                IconKind::Back,
+                self.hover_target == Some(HoverTarget::Back),
+                1.0,
+                &self.fonts.icon,
+            );
+            draw_icon_button(
+                hdc,
+                forward,
+                IconKind::Forward,
+                self.hover_target == Some(HoverTarget::Forward),
+                1.0,
+                &self.fonts.icon,
+            );
+            draw_icon_button(
+                hdc,
+                reload,
+                IconKind::Reload,
+                self.hover_target == Some(HoverTarget::Reload),
+                1.0,
+                &self.fonts.icon,
+            );
+
+            let edit_rect = self.address_rect();
+            fill_round_rect(hdc, edit_rect, 0x151515, 12);
+            draw_outline(hdc, edit_rect, COLOR_BORDER, 12);
+            draw_icon_glyph(
+                hdc,
+                &self.fonts.icon,
+                glyph(0xE774).as_str(),
+                RECT {
+                    left: edit_rect.left + 10,
+                    top: edit_rect.top,
+                    right: edit_rect.left + 34,
+                    bottom: edit_rect.bottom,
+                },
+                COLOR_MUTED,
+            );
+
+            draw_settings_button(
+                hdc,
+                self.settings_rect(),
+                self.hover_target == Some(HoverTarget::Settings),
+                &self.fonts.icon,
+            );
+
+            if sidebar_width > 92 {
+                for (index, tab) in self.tabs.iter().enumerate() {
+                    self.paint_tab(hdc, index, tab);
+                }
+            }
+
+            if self.settings_open {
+                self.paint_settings_menu(hdc);
+            }
+        }
+    }
+
+    fn paint_settings_menu(&self, hdc: HDC) {
+        unsafe {
+            let menu = self.settings_menu_rect();
+            fill_round_rect(hdc, menu, 0x151515, 12);
+            draw_outline(hdc, menu, COLOR_BORDER, 12);
+
+            let row = self.mode_row_rect();
+            let row_hover = self.hover_target == Some(HoverTarget::ModeRow)
+                || matches!(
+                    self.hover_target,
+                    Some(HoverTarget::ModeAuto | HoverTarget::ModeDark | HoverTarget::ModeLight)
+                );
+            if row_hover || self.mode_menu_open {
+                fill_round_rect(hdc, row, COLOR_SURFACE_HOVER, 9);
+            }
             draw_text(
                 hdc,
-                &self.fonts.title,
-                "Aster",
+                &self.fonts.small,
+                "Mode",
                 RECT {
-                    left: 20,
-                    top: 18,
-                    right: 120,
-                    bottom: 48,
+                    left: row.left + 12,
+                    top: row.top,
+                    right: row.right - 62,
+                    bottom: row.bottom,
                 },
                 COLOR_TEXT,
             );
-            draw_button(hdc, RECT { left: 172, top: 14, right: 212, bottom: 46 }, "+", &self.fonts.body);
+            draw_text(
+                hdc,
+                &self.fonts.small,
+                self.site_mode.label(),
+                RECT {
+                    left: row.right - 58,
+                    top: row.top,
+                    right: row.right - 24,
+                    bottom: row.bottom,
+                },
+                COLOR_MUTED,
+            );
+            draw_icon_glyph(
+                hdc,
+                &self.fonts.icon,
+                glyph(0xE76C).as_str(),
+                RECT {
+                    left: row.right - 24,
+                    top: row.top,
+                    right: row.right - 6,
+                    bottom: row.bottom,
+                },
+                COLOR_MUTED,
+            );
 
-            draw_button(hdc, RECT { left: SIDEBAR_WIDTH + 18, top: 14, right: SIDEBAR_WIDTH + 50, bottom: 46 }, "<", &self.fonts.body);
-            draw_button(hdc, RECT { left: SIDEBAR_WIDTH + 58, top: 14, right: SIDEBAR_WIDTH + 90, bottom: 46 }, ">", &self.fonts.body);
-            draw_button(hdc, RECT { left: SIDEBAR_WIDTH + 98, top: 14, right: SIDEBAR_WIDTH + 130, bottom: 46 }, "R", &self.fonts.body);
-
-            let edit_rect = RECT {
-                left: SIDEBAR_WIDTH + 132,
-                top: 14,
-                right: (rect.right - 90).max(SIDEBAR_WIDTH + 330),
-                bottom: 46,
-            };
-            draw_outline(hdc, edit_rect, COLOR_BORDER, 8);
-
-            for (index, tab) in self.tabs.iter().enumerate() {
-                self.paint_tab(hdc, index, tab);
+            if self.mode_menu_open {
+                let options = self.mode_options_rect();
+                fill_round_rect(hdc, options, 0x151515, 12);
+                draw_outline(hdc, options, COLOR_BORDER, 12);
+                let modes = [
+                    (SiteMode::Auto, HoverTarget::ModeAuto, "Auto"),
+                    (SiteMode::Dark, HoverTarget::ModeDark, "Dark"),
+                    (SiteMode::Light, HoverTarget::ModeLight, "Light"),
+                ];
+                for (index, (mode, hover, label)) in modes.iter().enumerate() {
+                    let top = options.top + 8 + index as i32 * 34;
+                    let item = RECT {
+                        left: options.left + 8,
+                        top,
+                        right: options.right - 8,
+                        bottom: top + 30,
+                    };
+                    if self.hover_target == Some(*hover) {
+                        fill_round_rect(hdc, item, COLOR_SURFACE_HOVER, 8);
+                    }
+                    if self.site_mode == *mode {
+                        fill_round_rect(
+                            hdc,
+                            RECT {
+                                left: item.left + 8,
+                                top: item.top + 11,
+                                right: item.left + 16,
+                                bottom: item.top + 19,
+                            },
+                            COLOR_ACCENT,
+                            4,
+                        );
+                    }
+                    draw_text(
+                        hdc,
+                        &self.fonts.small,
+                        label,
+                        RECT {
+                            left: item.left + 24,
+                            top: item.top,
+                            right: item.right - 8,
+                            bottom: item.bottom,
+                        },
+                        COLOR_TEXT,
+                    );
+                }
             }
         }
     }
 
     fn paint_tab(&self, hdc: HDC, index: usize, tab: &Tab) {
         let top = TAB_TOP + index as i32 * TAB_HEIGHT;
+        let right = self.sidebar_width() - 12;
         let item = RECT {
             left: 12,
             top,
-            right: SIDEBAR_WIDTH - 12,
-            bottom: top + TAB_HEIGHT - 6,
+            right,
+            bottom: top + TAB_HEIGHT - 8,
         };
         unsafe {
-            let brush = if index == self.active {
-                self.brushes.active
-            } else if self.hover_tab == Some(index) {
-                self.brushes.panel_2
-            } else {
-                self.brushes.panel
+            if self.hover_tab == Some(index) {
+                fill_round_rect(hdc, item, 0x151515, 10);
+            }
+            let favicon = RECT {
+                left: item.left + 12,
+                top: item.top + 11,
+                right: item.left + 30,
+                bottom: item.top + 29,
             };
-            let _ = FillRect(hdc, &item, brush);
-            draw_outline(hdc, item, if index == self.active { COLOR_BORDER } else { COLOR_PANEL_2 }, 8);
+            fill_round_rect(
+                hdc,
+                favicon,
+                if index == self.active {
+                    COLOR_ACCENT
+                } else {
+                    0x2a2a2a
+                },
+                6,
+            );
             draw_text(
                 hdc,
                 &self.fonts.body,
                 &tab.title,
                 RECT {
-                    left: item.left + 14,
+                    left: item.left + 40,
                     top: item.top,
-                    right: item.right - 34,
+                    right: item.right - 36,
                     bottom: item.bottom,
                 },
-                if index == self.active { COLOR_TEXT } else { COLOR_MUTED },
-            );
-            let close_color = if self.hover_close == Some(index) { COLOR_TEXT } else { COLOR_MUTED };
-            draw_text(
-                hdc,
-                &self.fonts.small,
-                "x",
-                RECT {
-                    left: item.right - 26,
-                    top: item.top,
-                    right: item.right - 8,
-                    bottom: item.bottom,
+                if index == self.active {
+                    COLOR_TEXT
+                } else {
+                    COLOR_MUTED
                 },
-                close_color,
             );
+            if self.hover_tab == Some(index) {
+                let close_color = if self.hover_close == Some(index) {
+                    COLOR_TEXT
+                } else {
+                    COLOR_MUTED
+                };
+                draw_icon_glyph(
+                    hdc,
+                    &self.fonts.icon,
+                    glyph(0xE711).as_str(),
+                    RECT {
+                        left: item.right - 30,
+                        top: item.top,
+                        right: item.right - 8,
+                        bottom: item.bottom,
+                    },
+                    close_color,
+                );
+            }
         }
     }
 
     fn handle_click(&mut self, x: i32, y: i32) {
-        if y >= 14 && y <= 46 {
-            if x >= 172 && x <= 212 {
-                let _ = self.create_tab("https://vercel.com");
+        if self.settings_open {
+            if self.mode_menu_open {
+                let options = self.mode_options_rect();
+                if point_in_rect(x, y, options) {
+                    let local_y = y - options.top - 8;
+                    if local_y >= 0 {
+                        match local_y / 34 {
+                            0 => self.set_site_mode(SiteMode::Auto),
+                            1 => self.set_site_mode(SiteMode::Dark),
+                            2 => self.set_site_mode(SiteMode::Light),
+                            _ => {}
+                        }
+                    }
+                    return;
+                }
+            }
+
+            if point_in_rect(x, y, self.mode_row_rect()) {
+                self.mode_menu_open = !self.mode_menu_open;
+                self.refresh();
                 return;
             }
-            if x >= SIDEBAR_WIDTH + 18 && x <= SIDEBAR_WIDTH + 50 {
-                self.go_back();
-                return;
-            }
-            if x >= SIDEBAR_WIDTH + 58 && x <= SIDEBAR_WIDTH + 90 {
-                self.go_forward();
-                return;
-            }
-            if x >= SIDEBAR_WIDTH + 98 && x <= SIDEBAR_WIDTH + 130 {
-                self.reload();
-                return;
+
+            if !point_in_rect(x, y, self.settings_menu_rect())
+                && !point_in_rect(x, y, self.settings_rect())
+            {
+                self.settings_open = false;
+                self.mode_menu_open = false;
+                self.refresh();
             }
         }
 
-        if x < SIDEBAR_WIDTH && y >= TAB_TOP {
+        if point_in_rect(x, y, self.logo_rect()) {
+            self.toggle_sidebar();
+            return;
+        }
+
+        if self.new_tab_opacity() > 0.6 && point_in_rect(x, y, self.new_tab_rect()) {
+            let _ = self.create_tab(DEFAULT_URL);
+            return;
+        }
+
+        let (back, forward, reload) = self.top_button_rects();
+        if point_in_rect(x, y, back) {
+            self.go_back();
+            return;
+        }
+        if point_in_rect(x, y, forward) {
+            self.go_forward();
+            return;
+        }
+        if point_in_rect(x, y, reload) {
+            self.reload();
+            return;
+        }
+
+        if point_in_rect(x, y, self.settings_rect()) {
+            self.settings_open = !self.settings_open;
+            self.mode_menu_open = false;
+            self.refresh();
+            return;
+        }
+
+        if self.sidebar_width() > 92 && x < self.sidebar_width() && y >= TAB_TOP {
             let index = ((y - TAB_TOP) / TAB_HEIGHT) as usize;
             if index < self.tabs.len() {
-                let close_left = SIDEBAR_WIDTH - 38;
+                let close_left = self.sidebar_width() - 42;
                 if x >= close_left {
                     self.close_tab(index);
                 } else {
@@ -562,20 +1020,147 @@ impl App {
     fn handle_mouse_move(&mut self, x: i32, y: i32) {
         let old_close = self.hover_close;
         let old_tab = self.hover_tab;
+        let old_target = self.hover_target;
+        let old_mode_menu = self.mode_menu_open;
         self.hover_close = None;
         self.hover_tab = None;
-        if x < SIDEBAR_WIDTH && y >= TAB_TOP {
+        self.hover_target = None;
+
+        if point_in_rect(x, y, self.logo_rect()) {
+            self.hover_target = Some(HoverTarget::Logo);
+        } else if self.new_tab_opacity() > 0.6 && point_in_rect(x, y, self.new_tab_rect()) {
+            self.hover_target = Some(HoverTarget::NewTab);
+        } else {
+            let (back, forward, reload) = self.top_button_rects();
+            if point_in_rect(x, y, back) {
+                self.hover_target = Some(HoverTarget::Back);
+            } else if point_in_rect(x, y, forward) {
+                self.hover_target = Some(HoverTarget::Forward);
+            } else if point_in_rect(x, y, reload) {
+                self.hover_target = Some(HoverTarget::Reload);
+            } else if point_in_rect(x, y, self.settings_rect()) {
+                self.hover_target = Some(HoverTarget::Settings);
+            } else if self.settings_open && point_in_rect(x, y, self.mode_row_rect()) {
+                self.hover_target = Some(HoverTarget::ModeRow);
+                self.mode_menu_open = true;
+            } else if self.settings_open
+                && self.mode_menu_open
+                && point_in_rect(x, y, self.mode_options_rect())
+            {
+                let options = self.mode_options_rect();
+                let local_y = y - options.top - 8;
+                if local_y >= 0 {
+                    self.hover_target = match local_y / 34 {
+                        0 => Some(HoverTarget::ModeAuto),
+                        1 => Some(HoverTarget::ModeDark),
+                        2 => Some(HoverTarget::ModeLight),
+                        _ => None,
+                    };
+                }
+            }
+        }
+
+        if self.sidebar_width() > 92 && x < self.sidebar_width() && y >= TAB_TOP {
             let index = ((y - TAB_TOP) / TAB_HEIGHT) as usize;
             if index < self.tabs.len() {
                 self.hover_tab = Some(index);
-                if x >= SIDEBAR_WIDTH - 38 {
+                if x >= self.sidebar_width() - 42 {
                     self.hover_close = Some(index);
                 }
             }
         }
-        if old_close != self.hover_close || old_tab != self.hover_tab {
+        if old_close != self.hover_close
+            || old_tab != self.hover_tab
+            || old_target != self.hover_target
+            || old_mode_menu != self.mode_menu_open
+        {
             self.refresh();
         }
+    }
+
+    fn toggle_sidebar(&mut self) {
+        self.sidebar_collapsed = !self.sidebar_collapsed;
+        self.sidebar_target = if self.sidebar_collapsed {
+            SIDEBAR_COLLAPSED
+        } else {
+            SIDEBAR_EXPANDED
+        };
+        unsafe {
+            let _ = WindowsAndMessaging::SetTimer(Some(self.hwnd), SIDEBAR_TIMER_ID, 15, None);
+        }
+    }
+
+    fn tick_sidebar_animation(&mut self) {
+        let distance = self.sidebar_target - self.sidebar_width;
+        if distance.abs() < 0.75 {
+            self.sidebar_width = self.sidebar_target;
+            unsafe {
+                let _ = WindowsAndMessaging::KillTimer(Some(self.hwnd), SIDEBAR_TIMER_ID);
+            }
+        } else {
+            self.sidebar_width += distance * 0.22;
+        }
+        self.layout();
+        self.refresh();
+    }
+
+    fn set_site_mode(&mut self, mode: SiteMode) {
+        self.site_mode = mode;
+        self.settings_open = false;
+        self.mode_menu_open = false;
+        for tab in &self.tabs {
+            apply_site_mode_to_webview(&tab.webview, self.site_mode);
+            unsafe {
+                let _ = tab.webview.Reload();
+            }
+        }
+        self.refresh();
+    }
+
+    fn toggle_fullscreen(&mut self) {
+        unsafe {
+            if !self.fullscreen {
+                let _ = WindowsAndMessaging::GetWindowRect(self.hwnd, &mut self.saved_rect);
+                self.saved_style = WindowsAndMessaging::GetWindowLongPtrW(self.hwnd, GWL_STYLE);
+
+                let monitor = MonitorFromWindow(self.hwnd, MONITOR_DEFAULTTONEAREST);
+                let mut monitor_info = MONITORINFO {
+                    cbSize: mem::size_of::<MONITORINFO>() as u32,
+                    ..Default::default()
+                };
+
+                if GetMonitorInfoW(monitor, &mut monitor_info).as_bool() {
+                    let _ = SetWindowLong(self.hwnd, GWL_STYLE, (WS_POPUP | WS_VISIBLE).0 as isize);
+                    let bounds = monitor_info.rcMonitor;
+                    let _ = WindowsAndMessaging::SetWindowPos(
+                        self.hwnd,
+                        Some(HWND_TOP),
+                        bounds.left,
+                        bounds.top,
+                        bounds.right - bounds.left,
+                        bounds.bottom - bounds.top,
+                        WindowsAndMessaging::SWP_FRAMECHANGED
+                            | WindowsAndMessaging::SWP_NOOWNERZORDER,
+                    );
+                    self.fullscreen = true;
+                }
+            } else {
+                let _ = SetWindowLong(self.hwnd, GWL_STYLE, self.saved_style);
+                let rect = self.saved_rect;
+                let _ = WindowsAndMessaging::SetWindowPos(
+                    self.hwnd,
+                    Some(HWND_TOP),
+                    rect.left,
+                    rect.top,
+                    rect.right - rect.left,
+                    rect.bottom - rect.top,
+                    WindowsAndMessaging::SWP_FRAMECHANGED | WindowsAndMessaging::SWP_NOOWNERZORDER,
+                );
+                self.fullscreen = false;
+            }
+        }
+        self.layout();
+        self.refresh();
     }
 
     fn refresh(&self) {
@@ -627,7 +1212,10 @@ fn create_environment() -> AppResult<ICoreWebView2Environment> {
     Ok(rx.recv()??)
 }
 
-fn create_webview_controller(environment: &ICoreWebView2Environment, hwnd: HWND) -> AppResult<ICoreWebView2Controller> {
+fn create_webview_controller(
+    environment: &ICoreWebView2Environment,
+    hwnd: HWND,
+) -> AppResult<ICoreWebView2Controller> {
     let (tx, rx) = mpsc::channel();
     let environment = environment.clone();
     CreateCoreWebView2ControllerCompletedHandler::wait_for_async_operation(
@@ -658,6 +1246,16 @@ fn configure_webview(webview: &ICoreWebView2) -> AppResult<()> {
     Ok(())
 }
 
+fn apply_site_mode_to_webview(webview: &ICoreWebView2, mode: SiteMode) {
+    unsafe {
+        if let Ok(webview13) = webview.cast::<ICoreWebView2_13>() {
+            if let Ok(profile) = webview13.Profile() {
+                let _ = profile.SetPreferredColorScheme(mode.scheme());
+            }
+        }
+    }
+}
+
 fn register_window_class() -> AppResult<()> {
     unsafe {
         let hinstance = HINSTANCE(LibraryLoader::GetModuleHandleW(None)?.0);
@@ -681,7 +1279,7 @@ fn create_main_window() -> AppResult<HWND> {
     unsafe {
         let hinstance = HINSTANCE(LibraryLoader::GetModuleHandleW(None)?.0);
         let hwnd = WindowsAndMessaging::CreateWindowExW(
-            WINDOW_EX_STYLE::default(),
+            WS_EX_DLGMODALFRAME,
             CLASS_NAME,
             APP_NAME,
             WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN | WS_CLIPSIBLINGS,
@@ -694,7 +1292,46 @@ fn create_main_window() -> AppResult<HWND> {
             Some(hinstance),
             None,
         )?;
+        let _ = WindowsAndMessaging::SendMessageW(
+            hwnd,
+            WM_SETICON,
+            Some(WPARAM(ICON_SMALL as usize)),
+            Some(LPARAM(0)),
+        );
+        let _ = WindowsAndMessaging::SendMessageW(
+            hwnd,
+            WM_SETICON,
+            Some(WPARAM(ICON_BIG as usize)),
+            Some(LPARAM(0)),
+        );
+        enable_dark_titlebar(hwnd);
         Ok(hwnd)
+    }
+}
+
+fn enable_dark_titlebar(hwnd: HWND) {
+    unsafe {
+        let enabled = 1i32;
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_USE_IMMERSIVE_DARK_MODE,
+            &enabled as *const _ as *const _,
+            mem::size_of_val(&enabled) as u32,
+        );
+        let caption = COLOR_PANEL;
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_CAPTION_COLOR,
+            &caption as *const _ as *const _,
+            mem::size_of_val(&caption) as u32,
+        );
+        let text = COLOR_TEXT;
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_TEXT_COLOR,
+            &text as *const _ as *const _,
+            mem::size_of_val(&text) as u32,
+        );
     }
 }
 
@@ -704,11 +1341,11 @@ fn create_address_bar(parent: HWND) -> AppResult<HWND> {
             WINDOW_EX_STYLE::default(),
             w!("EDIT"),
             w!(""),
-            WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0 | WS_BORDER.0),
-            SIDEBAR_WIDTH + 132,
-            14,
+            WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0),
+            SIDEBAR_EXPANDED as i32 + 168,
+            20,
             680,
-            32,
+            22,
             Some(parent),
             Some(HMENU(ADDRESS_ID as usize as *mut _)),
             Some(HINSTANCE(LibraryLoader::GetModuleHandleW(None)?.0)),
@@ -718,7 +1355,7 @@ fn create_address_bar(parent: HWND) -> AppResult<HWND> {
             hwnd,
             EM_SETMARGINS,
             Some(WPARAM((EC_LEFTMARGIN | EC_RIGHTMARGIN) as usize)),
-            Some(LPARAM((10 | (10 << 16)) as isize)),
+            Some(LPARAM((2 | (2 << 16)) as isize)),
         );
         OLD_ADDRESS_PROC = mem::transmute(WindowsAndMessaging::SetWindowLongPtrW(
             hwnd,
@@ -779,6 +1416,13 @@ extern "system" fn window_proc(hwnd: HWND, msg: u32, w_param: WPARAM, l_param: L
             with_app(hwnd, |app| app.handle_mouse_move(x, y));
             LRESULT(0)
         }
+        WM_TIMER => {
+            if w_param.0 == SIDEBAR_TIMER_ID {
+                with_app(hwnd, |app| app.tick_sidebar_animation());
+                return LRESULT(0);
+            }
+            unsafe { WindowsAndMessaging::DefWindowProcW(hwnd, msg, w_param, l_param) }
+        }
         WM_COMMAND => {
             let id = loword(w_param.0 as u32) as i32;
             let code = hiword(w_param.0 as u32) as u16;
@@ -803,21 +1447,22 @@ extern "system" fn window_proc(hwnd: HWND, msg: u32, w_param: WPARAM, l_param: L
             with_app(hwnd, |app| {
                 if let Some(tab) = app.tabs.get(app.active) {
                     unsafe {
-                        let _ = tab.controller.MoveFocus(COREWEBVIEW2_MOVE_FOCUS_REASON_PROGRAMMATIC);
+                        let _ = tab
+                            .controller
+                            .MoveFocus(COREWEBVIEW2_MOVE_FOCUS_REASON_PROGRAMMATIC);
                     }
                 }
             });
             LRESULT(0)
         }
-        WM_CTLCOLORSTATIC | WM_CTLCOLOREDIT | WM_CTLCOLORBTN => {
-            unsafe {
-                let hdc = HDC(w_param.0 as *mut _);
-                let _ = SetTextColor(hdc, COLORREF(COLOR_TEXT));
-                let _ = SetBkMode(hdc, TRANSPARENT);
-                let brush = with_app_return(hwnd, |app| app.brushes.edit).unwrap_or_else(|| solid_brush(0x151515));
-                LRESULT(brush.0 as isize)
-            }
-        }
+        WM_CTLCOLORSTATIC | WM_CTLCOLOREDIT | WM_CTLCOLORBTN => unsafe {
+            let hdc = HDC(w_param.0 as *mut _);
+            let _ = SetTextColor(hdc, COLORREF(COLOR_TEXT));
+            let _ = SetBkMode(hdc, TRANSPARENT);
+            let brush = with_app_return(hwnd, |app| app.brushes.edit)
+                .unwrap_or_else(|| solid_brush(0x151515));
+            LRESULT(brush.0 as isize)
+        },
         WM_SETCURSOR => unsafe { WindowsAndMessaging::DefWindowProcW(hwnd, msg, w_param, l_param) },
         WM_CLOSE => {
             unsafe {
@@ -854,14 +1499,27 @@ fn handle_keydown(hwnd: HWND, w_param: WPARAM) {
                 );
             }
             0x54 if ctrl => {
-                let _ = app.create_tab("https://vercel.com");
+                let _ = app.create_tab(DEFAULT_URL);
             }
+            0x53 if ctrl => app.toggle_sidebar(),
             0x57 if ctrl => app.close_tab(app.active),
             0x25 if alt => app.go_back(),
             0x27 if alt => app.go_forward(),
             code if code == VK_F5.0 as u32 => app.reload(),
+            code if code == VK_F11.0 as u32 => app.toggle_fullscreen(),
             _ => {}
         });
+    }
+}
+
+fn is_aster_shortcut(key: u32) -> bool {
+    unsafe {
+        let ctrl = (GetKeyState(VK_CONTROL.0 as i32) as u16 & 0x8000) != 0;
+        let alt = (GetKeyState(VK_MENU.0 as i32) as u16 & 0x8000) != 0;
+        matches!(key, 0x4C | 0x53 | 0x54 | 0x57 if ctrl)
+            || matches!(key, 0x25 | 0x27 if alt)
+            || key == VK_F5.0 as u32
+            || key == VK_F11.0 as u32
     }
 }
 
@@ -884,6 +1542,10 @@ fn message_loop() -> AppResult<()> {
 }
 
 fn create_font(size: i32, weight: i32) -> AppResult<HFONT> {
+    create_font_with_face(size, weight, w!("Segoe UI"))
+}
+
+fn create_font_with_face(size: i32, weight: i32, face: PCWSTR) -> AppResult<HFONT> {
     unsafe {
         Ok(CreateFontW(
             -size,
@@ -899,26 +1561,124 @@ fn create_font(size: i32, weight: i32) -> AppResult<HFONT> {
             Gdi::CLIP_DEFAULT_PRECIS,
             Gdi::CLEARTYPE_QUALITY,
             (Gdi::DEFAULT_PITCH.0 | Gdi::FF_SWISS.0) as u32,
-            w!("Segoe UI"),
+            face,
         ))
     }
 }
 
-fn draw_button(hdc: HDC, rect: RECT, label: &str, font: &HFONT) {
+#[derive(Clone, Copy)]
+enum IconKind {
+    Plus,
+    Back,
+    Forward,
+    Reload,
+}
+
+fn draw_icon_button(
+    hdc: HDC,
+    rect: RECT,
+    icon: IconKind,
+    hovered: bool,
+    opacity: f32,
+    icon_font: &HFONT,
+) {
     unsafe {
-        fill_round_rect(hdc, rect, COLOR_PANEL_2, 8);
-        draw_outline(hdc, rect, COLOR_BORDER, 8);
-        draw_text(hdc, font, label, rect, COLOR_TEXT);
+        let fill = mix_color(
+            COLOR_PANEL,
+            if hovered {
+                COLOR_SURFACE_HOVER
+            } else {
+                COLOR_SURFACE
+            },
+            opacity,
+        );
+        let border = mix_color(
+            COLOR_PANEL,
+            if hovered { 0x464646 } else { COLOR_BORDER },
+            opacity,
+        );
+        let icon_color = mix_color(COLOR_PANEL, COLOR_TEXT, opacity);
+        fill_round_rect(hdc, rect, fill, 10);
+        draw_outline(hdc, rect, border, 10);
+        draw_icon_glyph(hdc, icon_font, icon.glyph(), rect, icon_color);
     }
+}
+
+fn draw_logo(hdc: HDC, rect: RECT, hovered: bool) {
+    unsafe {
+        let color = if hovered { 0xff877f } else { COLOR_ACCENT };
+        draw_aster_mark(hdc, rect, color);
+    }
+}
+
+fn draw_settings_button(hdc: HDC, rect: RECT, hovered: bool, icon_font: &HFONT) {
+    unsafe {
+        if hovered {
+            fill_round_rect(hdc, rect, COLOR_SURFACE_HOVER, 10);
+        }
+        draw_icon_glyph(hdc, icon_font, glyph(0xE713).as_str(), rect, COLOR_MUTED);
+    }
+}
+
+impl IconKind {
+    fn glyph(self) -> &'static str {
+        match self {
+            Self::Plus => "\u{E710}",
+            Self::Back => "\u{E72B}",
+            Self::Forward => "\u{E72A}",
+            Self::Reload => "\u{E72C}",
+        }
+    }
+}
+
+unsafe fn draw_aster_mark(hdc: HDC, rect: RECT, color: u32) {
+    let cx = (rect.left + rect.right) / 2;
+    let cy = (rect.top + rect.bottom) / 2;
+    let radius = ((rect.right - rect.left).min(rect.bottom - rect.top) / 2) - 7;
+    with_pen(hdc, color, 5, || {
+        let _ = MoveToEx(hdc, cx, cy - radius, None);
+        let _ = LineTo(hdc, cx, cy + radius);
+        let dx = radius * 9 / 10;
+        let dy = radius / 2;
+        let _ = MoveToEx(hdc, cx - dx, cy - dy, None);
+        let _ = LineTo(hdc, cx + dx, cy + dy);
+        let _ = MoveToEx(hdc, cx + dx, cy - dy, None);
+        let _ = LineTo(hdc, cx - dx, cy + dy);
+    });
+}
+
+unsafe fn with_pen<F>(hdc: HDC, color: u32, width: i32, f: F)
+where
+    F: FnOnce(),
+{
+    let pen = CreatePen(Gdi::PS_SOLID, width, COLORREF(color));
+    let old_pen = SelectObject(hdc, HGDIOBJ(pen.0));
+    f();
+    let _ = SelectObject(hdc, old_pen);
+    let _ = DeleteObject(HGDIOBJ(pen.0));
 }
 
 unsafe fn fill_round_rect(hdc: HDC, rect: RECT, color: u32, radius: i32) {
     let brush = solid_brush(color);
     let old_brush = SelectObject(hdc, HGDIOBJ(brush.0));
     let old_pen = SelectObject(hdc, GetStockObject(NULL_PEN));
-    let _ = RoundRect(hdc, rect.left, rect.top, rect.right, rect.bottom, radius, radius);
+    let _ = RoundRect(
+        hdc,
+        rect.left,
+        rect.top,
+        rect.right,
+        rect.bottom,
+        radius,
+        radius,
+    );
     let _ = SelectObject(hdc, old_pen);
     let _ = SelectObject(hdc, old_brush);
+    let _ = DeleteObject(HGDIOBJ(brush.0));
+}
+
+unsafe fn fill_rect(hdc: HDC, rect: RECT, color: u32) {
+    let brush = solid_brush(color);
+    let _ = FillRect(hdc, &rect, brush);
     let _ = DeleteObject(HGDIOBJ(brush.0));
 }
 
@@ -926,7 +1686,15 @@ unsafe fn draw_outline(hdc: HDC, rect: RECT, color: u32, radius: i32) {
     let pen = CreatePen(Gdi::PS_SOLID, 1, COLORREF(color));
     let old_pen = SelectObject(hdc, HGDIOBJ(pen.0));
     let old_brush = SelectObject(hdc, GetStockObject(NULL_BRUSH));
-    let _ = RoundRect(hdc, rect.left, rect.top, rect.right, rect.bottom, radius, radius);
+    let _ = RoundRect(
+        hdc,
+        rect.left,
+        rect.top,
+        rect.right,
+        rect.bottom,
+        radius,
+        radius,
+    );
     let _ = SelectObject(hdc, old_brush);
     let _ = SelectObject(hdc, old_pen);
     let _ = DeleteObject(HGDIOBJ(pen.0));
@@ -945,6 +1713,39 @@ unsafe fn draw_text(hdc: HDC, font: &HFONT, text: &str, mut rect: RECT, color: u
         DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS,
     );
     let _ = SelectObject(hdc, old_font);
+}
+
+unsafe fn draw_icon_glyph(hdc: HDC, font: &HFONT, text: &str, mut rect: RECT, color: u32) {
+    let old_font = SelectObject(hdc, HGDIOBJ(font.0));
+    let _ = SetBkMode(hdc, TRANSPARENT);
+    let _ = SetTextColor(hdc, COLORREF(color));
+    let mut wide = to_wide(text);
+    let text_len = wide.len().saturating_sub(1);
+    let _ = DrawTextW(
+        hdc,
+        &mut wide[..text_len],
+        &mut rect,
+        DT_CENTER | DT_VCENTER | DT_SINGLELINE,
+    );
+    let _ = SelectObject(hdc, old_font);
+}
+
+fn glyph(codepoint: u32) -> String {
+    char::from_u32(codepoint).unwrap_or(' ').to_string()
+}
+
+fn mix_color(from: u32, to: u32, amount: f32) -> u32 {
+    let t = amount.clamp(0.0, 1.0);
+    let fr = (from & 0xff) as f32;
+    let fg = ((from >> 8) & 0xff) as f32;
+    let fb = ((from >> 16) & 0xff) as f32;
+    let tr = (to & 0xff) as f32;
+    let tg = ((to >> 8) & 0xff) as f32;
+    let tb = ((to >> 16) & 0xff) as f32;
+    let r = (fr + (tr - fr) * t).round() as u32;
+    let g = (fg + (tg - fg) * t).round() as u32;
+    let b = (fb + (tb - fb) * t).round() as u32;
+    r | (g << 8) | (b << 16)
 }
 
 fn client_rect(hwnd: HWND) -> RECT {
@@ -980,14 +1781,17 @@ fn get_window_text(hwnd: HWND) -> String {
 fn normalize_address(raw: &str) -> String {
     let value = raw.trim();
     if value.is_empty() {
-        return "https://vercel.com".to_string();
+        return DEFAULT_URL.to_string();
     }
     if value.contains("://") || value.starts_with("about:") {
         value.to_string()
     } else if value.contains('.') && !value.contains(' ') {
         format!("https://{value}")
     } else {
-        format!("https://www.google.com/search?q={}", value.replace(' ', "+"))
+        format!(
+            "https://www.google.com/search?q={}",
+            value.replace(' ', "+")
+        )
     }
 }
 
@@ -1018,6 +1822,10 @@ fn loword(value: u32) -> u16 {
 
 fn hiword(value: u32) -> u16 {
     ((value >> 16) & 0xffff) as u16
+}
+
+fn point_in_rect(x: i32, y: i32, rect: RECT) -> bool {
+    x >= rect.left && x < rect.right && y >= rect.top && y < rect.bottom
 }
 
 fn with_app<F>(hwnd: HWND, f: F)

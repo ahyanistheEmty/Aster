@@ -1,0 +1,6 @@
+<svg width="500" height="500" viewBox="0 0 500 500" role="img" xmlns="http://www.w3.org/2000/svg">
+  <title>Aster star</title>
+  <rect x="222" y="102" width="56" height="296" rx="28" fill="#636ff1" transform="rotate(0, 250, 250)"/>
+  <rect x="222" y="102" width="56" height="296" rx="28" fill="#636ff1" transform="rotate(60, 250, 250)"/>
+  <rect x="222" y="102" width="56" height="296" rx="28" fill="#636ff1" transform="rotate(120, 250, 250)"/>
+</svg>

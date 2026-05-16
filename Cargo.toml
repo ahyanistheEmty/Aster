@@ -8,6 +8,7 @@ description = "A fast Chromium-based desktop browser with vertical tabs."
 webview2-com = "0.36"
 windows = { version = "0.60", features = [
     "Win32_Foundation",
+    "Win32_Graphics_Dwm",
     "Win32_Graphics_Gdi",
     "Win32_System_Com",
     "Win32_System_LibraryLoader",
