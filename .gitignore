@@ -1,0 +1,6 @@
+/target/
+/.cargo/
+/.aster-profile/
+*.pdb
+*.ilk
+*.obj
