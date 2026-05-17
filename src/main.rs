@@ -33,7 +33,7 @@ use windows::{
                 WM_COMMAND, WM_CREATE, WM_CTLCOLORBTN, WM_CTLCOLOREDIT, WM_CTLCOLORSTATIC,
                 WM_DESTROY, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDOWN, WM_MOUSEMOVE, WM_NCCREATE, WM_PAINT,
                 WM_SETCURSOR, WM_SETFOCUS, WM_SETFONT, WM_SETICON, WM_SIZE, WM_TIMER, WNDCLASSW,
-                WNDPROC, WS_CHILD, WS_CLIPSIBLINGS, WS_EX_DLGMODALFRAME,
+                WNDPROC, WS_CHILD, WS_CLIPCHILDREN, WS_CLIPSIBLINGS, WS_EX_DLGMODALFRAME,
                 WS_OVERLAPPEDWINDOW, WS_POPUP, WS_TABSTOP, WS_VISIBLE,
             },
         },
@@ -670,17 +670,18 @@ impl App {
     fn layout(&self) {
         let rect = client_rect(self.hwnd);
         let address = self.address_rect();
-        unsafe {
-            let flags = WindowsAndMessaging::SWP_NOZORDER;
-            let _ = WindowsAndMessaging::SetWindowPos(
-                self.address_hwnd,
-                None,
-                address.left + 36,
-                address.top + 7,
-                (address.right - address.left - 52).max(120),
-                22,
-                flags,
-            );
+        if !self.animating_sidebar {
+            unsafe {
+                let _ = WindowsAndMessaging::SetWindowPos(
+                    self.address_hwnd,
+                    None,
+                    address.left + 36,
+                    address.top + 7,
+                    (address.right - address.left - 52).max(120),
+                    22,
+                    WindowsAndMessaging::SWP_NOZORDER,
+                );
+            }
         }
 
         let sidebar_width = self.sidebar_width();
@@ -748,12 +749,12 @@ impl App {
                             clip_right,
                             clip_bottom,
                         );
-                        let _ = SetWindowRgn(tab.child_hwnd, Some(region), true);
+                        let _ = SetWindowRgn(tab.child_hwnd, Some(region), false);
                         self.last_clip_width.set(sidebar_width as f32);
                     }
                 } else {
                     if self.last_clip_width.get() != 0.0 {
-                        let _ = SetWindowRgn(tab.child_hwnd, None, true);
+                        let _ = SetWindowRgn(tab.child_hwnd, None, false);
                         self.last_clip_width.set(0.0);
                     }
                 }
@@ -1205,11 +1206,12 @@ impl App {
                 }
             }
         }
-        if old_close != self.hover_close
-            || old_tab != self.hover_tab
-            || old_target != self.hover_target
-            || old_mode_menu != self.mode_menu_open
-            || old_hovering != self.hovering_sidebar
+        if !self.animating_sidebar
+            && (old_close != self.hover_close
+                || old_tab != self.hover_tab
+                || old_target != self.hover_target
+                || old_mode_menu != self.mode_menu_open
+                || old_hovering != self.hovering_sidebar)
         {
             self.refresh();
         }
@@ -1283,10 +1285,12 @@ impl App {
                 let _ = Gdi::UpdateWindow(self.hwnd);
             }
         } else {
+            let old_sw = self.sidebar_width.ceil() as i32;
             self.sidebar_width += distance * 0.22;
             self.layout();
             let rect = client_rect(self.hwnd);
-            let sw = self.sidebar_width.ceil() as i32;
+            let new_sw = self.sidebar_width.ceil() as i32;
+            let max_sw = old_sw.max(new_sw);
             let topbar = RECT {
                 left: 0,
                 top: 0,
@@ -1296,7 +1300,7 @@ impl App {
             let sidebar = RECT {
                 left: 0,
                 top: TOPBAR_HEIGHT,
-                right: sw,
+                right: max_sw,
                 bottom: rect.bottom,
             };
             unsafe {
@@ -1310,7 +1314,7 @@ impl App {
         self.last_clip_width.set(0.0);
         for tab in &self.tabs {
             unsafe {
-                let _ = SetWindowRgn(tab.child_hwnd, None, true);
+                let _ = SetWindowRgn(tab.child_hwnd, None, false);
             }
         }
     }
@@ -1519,7 +1523,7 @@ fn register_window_class() -> AppResult<()> {
             hInstance: hinstance,
             lpszClassName: CLASS_NAME,
             lpfnWndProc: Some(window_proc),
-            style: WindowsAndMessaging::CS_HREDRAW | WindowsAndMessaging::CS_VREDRAW,
+            style: WindowsAndMessaging::WNDCLASS_STYLES(0),
             ..Default::default()
         };
         if WindowsAndMessaging::RegisterClassW(&wc) == 0 {
@@ -1536,7 +1540,7 @@ fn create_main_window() -> AppResult<HWND> {
             WS_EX_DLGMODALFRAME,
             CLASS_NAME,
             APP_NAME,
-            WS_OVERLAPPEDWINDOW | WS_CLIPSIBLINGS,
+            WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN | WS_CLIPSIBLINGS,
             CW_USEDEFAULT,
             CW_USEDEFAULT,
             1280,
