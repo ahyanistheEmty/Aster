@@ -15,7 +15,7 @@ use windows::{
             self, BeginPaint, BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, CreateFontW, CreatePen,
             CreateSolidBrush, DeleteDC, DeleteObject, DrawTextW, EndPaint, FillRect, GetMonitorInfoW,
             GetStockObject, InvalidateRect, LineTo, MonitorFromWindow, MoveToEx, RoundRect, ScreenToClient,
-            SelectObject, SetBkMode, SetTextColor, SRCCOPY, DT_CENTER, DT_END_ELLIPSIS, DT_LEFT, DT_SINGLELINE,
+            SelectObject, SetBkMode, SetTextColor, SetWindowRgn, SRCCOPY, DT_CENTER, DT_END_ELLIPSIS, DT_LEFT, DT_SINGLELINE,
             DT_VCENTER, HBRUSH, HDC, HFONT, HGDIOBJ, MONITORINFO, MONITOR_DEFAULTTONEAREST, NULL_BRUSH,
             NULL_PEN, TRANSPARENT,
         },
@@ -27,8 +27,8 @@ use windows::{
                 GetKeyState, SetFocus, VK_CONTROL, VK_F11, VK_F5, VK_MENU, VK_RETURN,
             },
             WindowsAndMessaging::{
-                self, CREATESTRUCTW, CW_USEDEFAULT, EC_LEFTMARGIN, EC_RIGHTMARGIN, GetCursorPos, GWLP_USERDATA,
-                GWLP_WNDPROC, GWL_STYLE, HMENU, HWND_TOP, ICON_BIG, ICON_SMALL, IDC_ARROW, MSG,
+                self, CREATESTRUCTW, CW_USEDEFAULT, EC_LEFTMARGIN, EC_RIGHTMARGIN, GetCursorPos, GetTopWindow, GetWindow,
+                GWLP_USERDATA, GWLP_WNDPROC, GWL_STYLE, GW_HWNDNEXT, HMENU, HWND_TOP, ICON_BIG, ICON_SMALL, IDC_ARROW, MSG,
                 WINDOW_EX_STYLE, WINDOW_LONG_PTR_INDEX, WINDOW_STYLE, WM_APP, WM_CHAR, WM_CLOSE,
                 WM_COMMAND, WM_CREATE, WM_CTLCOLORBTN, WM_CTLCOLOREDIT, WM_CTLCOLORSTATIC,
                 WM_DESTROY, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDOWN, WM_MOUSEMOVE, WM_NCCREATE, WM_PAINT,
@@ -116,6 +116,7 @@ struct Tab {
     url: String,
     controller: ICoreWebView2Controller,
     webview: ICoreWebView2,
+    child_hwnd: HWND,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -299,12 +300,16 @@ impl App {
         unsafe {
             controller.SetIsVisible(false)?;
         }
+
+        let child_hwnd = find_webview_child(self.hwnd, self.address_hwnd);
+
         self.tabs.push(Tab {
             id,
             title: "New Tab".to_string(),
             url: url.to_string(),
             controller,
             webview,
+            child_hwnd,
         });
         self.switch_to(index);
         self.navigate_active(url);
@@ -539,7 +544,7 @@ impl App {
             SidebarMode::Hidden => {
                 if self.sidebar_target >= SIDEBAR_EXPANDED {
                     match self.sidebar_expand_mode {
-                        SidebarMode::Overlay => 0,
+                        SidebarMode::Overlay => 56,
                         SidebarMode::Pushed => self.sidebar_width(),
                         _ => 56,
                     }
@@ -547,7 +552,7 @@ impl App {
                     56
                 }
             }
-            SidebarMode::Overlay => 0,
+            SidebarMode::Overlay => 56,
             SidebarMode::Pushed => self.sidebar_width(),
         }
     }
@@ -677,7 +682,7 @@ impl App {
                 if self.sidebar_target >= SIDEBAR_EXPANDED {
                     match self.sidebar_expand_mode {
                         SidebarMode::Overlay => RECT {
-                            left: 0,
+                            left: sidebar_width,
                             top: TOPBAR_HEIGHT,
                             right: rect.right,
                             bottom: rect.bottom,
@@ -705,7 +710,7 @@ impl App {
                 }
             }
             SidebarMode::Overlay => RECT {
-                left: 0,
+                left: sidebar_width,
                 top: TOPBAR_HEIGHT,
                 right: rect.right,
                 bottom: rect.bottom,
@@ -1211,9 +1216,11 @@ impl App {
             }
             if self.sidebar_width < 0.5 {
                 self.sidebar_mode = SidebarMode::Hidden;
+                self.clear_webview_clipping();
             } else if self.sidebar_target >= SIDEBAR_EXPANDED {
                 self.sidebar_mode = self.sidebar_expand_mode;
                 if self.sidebar_mode == SidebarMode::Overlay {
+                    self.set_webview_fullscreen();
                     unsafe {
                         let _ = WindowsAndMessaging::SetTimer(
                             Some(self.hwnd),
@@ -1231,6 +1238,30 @@ impl App {
         unsafe {
             let _ = InvalidateRect(Some(self.hwnd), None, false);
             let _ = Gdi::UpdateWindow(self.hwnd);
+        }
+    }
+
+    fn set_webview_fullscreen(&self) {
+        let rect = client_rect(self.hwnd);
+        let bounds = RECT {
+            left: 0,
+            top: TOPBAR_HEIGHT,
+            right: rect.right,
+            bottom: rect.bottom,
+        };
+        for tab in &self.tabs {
+            unsafe {
+                let _ = SetWindowRgn(tab.child_hwnd, None, true);
+                let _ = tab.controller.SetBounds(bounds);
+            }
+        }
+    }
+
+    fn clear_webview_clipping(&self) {
+        for tab in &self.tabs {
+            unsafe {
+                let _ = SetWindowRgn(tab.child_hwnd, None, true);
+            }
         }
     }
 
@@ -1921,6 +1952,19 @@ fn client_rect(hwnd: HWND) -> RECT {
         let _ = WindowsAndMessaging::GetClientRect(hwnd, &mut rect);
     }
     rect
+}
+
+fn find_webview_child(parent: HWND, exclude: HWND) -> HWND {
+    unsafe {
+        let mut child = GetTopWindow(Some(parent)).unwrap_or_default();
+        while !child.is_invalid() {
+            if child != exclude {
+                return child;
+            }
+            child = GetWindow(child, GW_HWNDNEXT).unwrap_or_default();
+        }
+        HWND::default()
+    }
 }
 
 fn set_process_dpi_awareness() {
