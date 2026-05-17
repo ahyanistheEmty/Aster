@@ -13,7 +13,7 @@ use windows::{
         },
         Graphics::Gdi::{
             self, BeginPaint, BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, CreateFontW, CreatePen,
-            CreateSolidBrush, DeleteDC, DeleteObject, DrawTextW, EndPaint, FillRect, GetMonitorInfoW,
+            CreateRectRgn, CreateSolidBrush, DeleteDC, DeleteObject, DrawTextW, EndPaint, FillRect, GetMonitorInfoW,
             GetStockObject, InvalidateRect, LineTo, MonitorFromWindow, MoveToEx, RoundRect, ScreenToClient,
             SelectObject, SetBkMode, SetTextColor, SetWindowRgn, SRCCOPY, DT_CENTER, DT_END_ELLIPSIS, DT_LEFT, DT_SINGLELINE,
             DT_VCENTER, HBRUSH, HDC, HFONT, HGDIOBJ, MONITORINFO, MONITOR_DEFAULTTONEAREST, NULL_BRUSH,
@@ -682,7 +682,7 @@ impl App {
                 if self.sidebar_target >= SIDEBAR_EXPANDED {
                     match self.sidebar_expand_mode {
                         SidebarMode::Overlay => RECT {
-                            left: sidebar_width,
+                            left: 0,
                             top: TOPBAR_HEIGHT,
                             right: rect.right,
                             bottom: rect.bottom,
@@ -710,7 +710,7 @@ impl App {
                 }
             }
             SidebarMode::Overlay => RECT {
-                left: sidebar_width,
+                left: 0,
                 top: TOPBAR_HEIGHT,
                 right: rect.right,
                 bottom: rect.bottom,
@@ -725,6 +725,25 @@ impl App {
         for (i, tab) in self.tabs.iter().enumerate() {
             unsafe {
                 let _ = tab.controller.SetBounds(bounds);
+                if self.sidebar_mode == SidebarMode::Overlay
+                    || (self.sidebar_mode == SidebarMode::Hidden
+                        && self.sidebar_expand_mode == SidebarMode::Overlay
+                        && self.sidebar_target >= SIDEBAR_EXPANDED)
+                {
+                    if sidebar_width > 0 {
+                        let region = CreateRectRgn(
+                            sidebar_width,
+                            TOPBAR_HEIGHT,
+                            rect.right,
+                            rect.bottom,
+                        );
+                        let _ = SetWindowRgn(tab.child_hwnd, Some(region), true);
+                    } else {
+                        let _ = SetWindowRgn(tab.child_hwnd, None, true);
+                    }
+                } else {
+                    let _ = SetWindowRgn(tab.child_hwnd, None, true);
+                }
                 let _ = tab.controller.SetIsVisible(i == self.active);
             }
         }
@@ -1202,6 +1221,9 @@ impl App {
         self.animating_sidebar = true;
         unsafe {
             let _ = WindowsAndMessaging::KillTimer(Some(self.hwnd), HOVER_LEAVE_TIMER_ID);
+            if mode == SidebarMode::Hidden {
+                self.clear_webview_clipping();
+            }
             let _ = WindowsAndMessaging::SetTimer(Some(self.hwnd), SIDEBAR_TIMER_ID, 15, None);
         }
     }
@@ -1220,7 +1242,7 @@ impl App {
             } else if self.sidebar_target >= SIDEBAR_EXPANDED {
                 self.sidebar_mode = self.sidebar_expand_mode;
                 if self.sidebar_mode == SidebarMode::Overlay {
-                    self.set_webview_fullscreen();
+                    self.clear_webview_clipping();
                     unsafe {
                         let _ = WindowsAndMessaging::SetTimer(
                             Some(self.hwnd),
@@ -1238,22 +1260,6 @@ impl App {
         unsafe {
             let _ = InvalidateRect(Some(self.hwnd), None, false);
             let _ = Gdi::UpdateWindow(self.hwnd);
-        }
-    }
-
-    fn set_webview_fullscreen(&self) {
-        let rect = client_rect(self.hwnd);
-        let bounds = RECT {
-            left: 0,
-            top: TOPBAR_HEIGHT,
-            right: rect.right,
-            bottom: rect.bottom,
-        };
-        for tab in &self.tabs {
-            unsafe {
-                let _ = SetWindowRgn(tab.child_hwnd, None, true);
-                let _ = tab.controller.SetBounds(bounds);
-            }
         }
     }
 
