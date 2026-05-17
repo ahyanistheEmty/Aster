@@ -27,15 +27,14 @@ use windows::{
                 GetKeyState, SetFocus, VK_CONTROL, VK_F11, VK_F5, VK_MENU, VK_RETURN,
             },
             WindowsAndMessaging::{
-                self, CREATESTRUCTW, CW_USEDEFAULT, EC_LEFTMARGIN, EC_RIGHTMARGIN, GetTopWindow, GetWindow,
-                GWLP_USERDATA, GWLP_WNDPROC, GWL_STYLE, GW_HWNDNEXT, HMENU, HWND_TOP, ICON_BIG, ICON_SMALL,
-                IDC_ARROW, MSG, SetWindowPos, WINDOW_EX_STYLE, WINDOW_LONG_PTR_INDEX, WINDOW_STYLE, WM_APP,
-                WM_CHAR, WM_CLOSE, WM_COMMAND, WM_CREATE, WM_CTLCOLORBTN, WM_CTLCOLOREDIT, WM_CTLCOLORSTATIC,
+                self, CREATESTRUCTW, CW_USEDEFAULT, EC_LEFTMARGIN, EC_RIGHTMARGIN, GWLP_USERDATA,
+                GWLP_WNDPROC, GWL_STYLE, HMENU, HWND_TOP, ICON_BIG, ICON_SMALL, IDC_ARROW, MSG,
+                WINDOW_EX_STYLE, WINDOW_LONG_PTR_INDEX, WINDOW_STYLE, WM_APP, WM_CHAR, WM_CLOSE,
+                WM_COMMAND, WM_CREATE, WM_CTLCOLORBTN, WM_CTLCOLOREDIT, WM_CTLCOLORSTATIC,
                 WM_DESTROY, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDOWN, WM_MOUSEMOVE, WM_NCCREATE, WM_PAINT,
                 WM_SETCURSOR, WM_SETFOCUS, WM_SETFONT, WM_SETICON, WM_SIZE, WM_TIMER, WNDCLASSW,
                 WNDPROC, WS_CHILD, WS_CLIPSIBLINGS, WS_EX_DLGMODALFRAME,
                 WS_OVERLAPPEDWINDOW, WS_POPUP, WS_TABSTOP, WS_VISIBLE,
-                SWP_NOACTIVATE, SWP_NOCOPYBITS, SWP_NOZORDER,
             },
         },
     },
@@ -46,7 +45,8 @@ const CLASS_NAME: PCWSTR = w!("AsterWindow");
 const ADDRESS_ID: i32 = 1001;
 const DEFAULT_URL: &str = "https://www.google.com";
 const SIDEBAR_EXPANDED: f32 = 248.0;
-const SIDEBAR_COLLAPSED: f32 = 64.0;
+const SIDEBAR_COLLAPSED: f32 = 0.0;
+const HOVER_TRIGGER_ZONE: i32 = 16;
 const TOPBAR_HEIGHT: i32 = 58;
 const TAB_HEIGHT: i32 = 48;
 const TAB_TOP: i32 = 76;
@@ -115,7 +115,6 @@ struct Tab {
     url: String,
     controller: ICoreWebView2Controller,
     webview: ICoreWebView2,
-    child_hwnd: HWND,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -213,7 +212,8 @@ struct App {
     hover_target: Option<HoverTarget>,
     sidebar_width: f32,
     sidebar_target: f32,
-    sidebar_collapsed: bool,
+    sidebar_visible: bool,
+    hover_overlay_active: bool,
     animating_sidebar: bool,
     site_mode: SiteMode,
     settings_open: bool,
@@ -260,7 +260,8 @@ impl App {
             hover_target: None,
             sidebar_width: SIDEBAR_EXPANDED,
             sidebar_target: SIDEBAR_EXPANDED,
-            sidebar_collapsed: false,
+            sidebar_visible: true,
+            hover_overlay_active: false,
             animating_sidebar: false,
             site_mode: SiteMode::Auto,
             settings_open: false,
@@ -288,16 +289,12 @@ impl App {
         unsafe {
             controller.SetIsVisible(false)?;
         }
-
-        let child_hwnd = find_webview_child(self.hwnd, self.address_hwnd);
-
         self.tabs.push(Tab {
             id,
             title: "New Tab".to_string(),
             url: url.to_string(),
             controller,
             webview,
-            child_hwnd,
         });
         self.switch_to(index);
         self.navigate_active(url);
@@ -528,7 +525,11 @@ impl App {
     }
 
     fn content_left(&self) -> i32 {
-        self.sidebar_width()
+        if self.sidebar_visible {
+            self.sidebar_width()
+        } else {
+            0
+        }
     }
 
     fn top_button_rects(&self) -> (RECT, RECT, RECT) {
@@ -630,6 +631,10 @@ impl App {
         ((self.sidebar_width - 118.0) / (SIDEBAR_EXPANDED - 118.0)).clamp(0.0, 1.0)
     }
 
+    fn is_overlay(&self) -> bool {
+        !self.sidebar_visible && self.hover_overlay_active
+    }
+
     fn layout(&self) {
         let rect = client_rect(self.hwnd);
         let address = self.address_rect();
@@ -659,19 +664,7 @@ impl App {
         };
         for (i, tab) in self.tabs.iter().enumerate() {
             unsafe {
-                if self.animating_sidebar {
-                    let _ = SetWindowPos(
-                        tab.child_hwnd,
-                        None,
-                        left,
-                        TOPBAR_HEIGHT,
-                        rect.right - left,
-                        rect.bottom - TOPBAR_HEIGHT,
-                        SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOCOPYBITS,
-                    );
-                } else {
-                    let _ = tab.controller.SetBounds(bounds);
-                }
+                let _ = tab.controller.SetBounds(bounds);
                 let _ = tab.controller.SetIsVisible(i == self.active);
             }
         }
@@ -683,116 +676,140 @@ impl App {
             let _ = FillRect(hdc, &rect, self.brushes.black);
 
             let sidebar_width = self.sidebar_width();
-            let sidebar = RECT {
-                left: 0,
-                top: 0,
-                right: sidebar_width,
-                bottom: rect.bottom,
-            };
-            let _ = FillRect(hdc, &sidebar, self.brushes.panel);
-            fill_rect(
-                hdc,
-                RECT {
-                    left: sidebar.right - 1,
+            if sidebar_width > 0 {
+                let sidebar = RECT {
+                    left: 0,
                     top: 0,
-                    right: sidebar.right,
+                    right: sidebar_width,
                     bottom: rect.bottom,
-                },
-                COLOR_BORDER,
-            );
+                };
+                let _ = FillRect(hdc, &sidebar, self.brushes.panel);
+                if self.sidebar_visible {
+                    fill_rect(
+                        hdc,
+                        RECT {
+                            left: sidebar.right - 1,
+                            top: 0,
+                            right: sidebar.right,
+                            bottom: rect.bottom,
+                        },
+                        COLOR_BORDER,
+                    );
+                }
 
-            let topbar = RECT {
-                left: sidebar_width,
-                top: 0,
-                right: rect.right,
-                bottom: TOPBAR_HEIGHT,
-            };
-            let _ = FillRect(hdc, &topbar, self.brushes.panel);
-            fill_rect(
-                hdc,
-                RECT {
-                    left: topbar.left,
-                    top: TOPBAR_HEIGHT - 1,
+                let topbar = RECT {
+                    left: sidebar_width,
+                    top: 0,
                     right: rect.right,
                     bottom: TOPBAR_HEIGHT,
-                },
-                0x202020,
-            );
-
-            draw_logo(
-                hdc,
-                self.logo_rect(),
-                self.hover_target == Some(HoverTarget::Logo),
-            );
-            let new_tab_opacity = self.new_tab_opacity();
-            if new_tab_opacity > 0.08 {
-                draw_icon_button(
+                };
+                let _ = FillRect(hdc, &topbar, self.brushes.panel);
+                fill_rect(
                     hdc,
-                    self.new_tab_rect(),
-                    IconKind::Plus,
-                    self.hover_target == Some(HoverTarget::NewTab),
-                    new_tab_opacity,
-                    &self.fonts.icon,
+                    RECT {
+                        left: topbar.left,
+                        top: TOPBAR_HEIGHT - 1,
+                        right: rect.right,
+                        bottom: TOPBAR_HEIGHT,
+                    },
+                    0x202020,
+                );
+            } else {
+                let topbar = RECT {
+                    left: 0,
+                    top: 0,
+                    right: rect.right,
+                    bottom: TOPBAR_HEIGHT,
+                };
+                let _ = FillRect(hdc, &topbar, self.brushes.panel);
+                fill_rect(
+                    hdc,
+                    RECT {
+                        left: topbar.left,
+                        top: TOPBAR_HEIGHT - 1,
+                        right: rect.right,
+                        bottom: TOPBAR_HEIGHT,
+                    },
+                    0x202020,
                 );
             }
 
-            let (back, forward, reload) = self.top_button_rects();
-            draw_icon_button(
-                hdc,
-                back,
-                IconKind::Back,
-                self.hover_target == Some(HoverTarget::Back),
-                1.0,
-                &self.fonts.icon,
-            );
-            draw_icon_button(
-                hdc,
-                forward,
-                IconKind::Forward,
-                self.hover_target == Some(HoverTarget::Forward),
-                1.0,
-                &self.fonts.icon,
-            );
-            draw_icon_button(
-                hdc,
-                reload,
-                IconKind::Reload,
-                self.hover_target == Some(HoverTarget::Reload),
-                1.0,
-                &self.fonts.icon,
-            );
-
-            let edit_rect = self.address_rect();
-            fill_round_rect(hdc, edit_rect, 0x151515, 12);
-            draw_outline(hdc, edit_rect, COLOR_BORDER, 12);
-            draw_icon_glyph(
-                hdc,
-                &self.fonts.icon,
-                glyph(0xE774).as_str(),
-                RECT {
-                    left: edit_rect.left + 10,
-                    top: edit_rect.top,
-                    right: edit_rect.left + 34,
-                    bottom: edit_rect.bottom,
-                },
-                COLOR_MUTED,
-            );
-
-            draw_settings_button(
-                hdc,
-                self.settings_rect(),
-                self.hover_target == Some(HoverTarget::Settings),
-                &self.fonts.icon,
-            );
-
-            if sidebar_width > 92 {
-                for (index, tab) in self.tabs.iter().enumerate() {
-                    self.paint_tab(hdc, index, tab);
+            if sidebar_width > 0 {
+                draw_logo(
+                    hdc,
+                    self.logo_rect(),
+                    self.hover_target == Some(HoverTarget::Logo),
+                );
+                let new_tab_opacity = self.new_tab_opacity();
+                if new_tab_opacity > 0.08 {
+                    draw_icon_button(
+                        hdc,
+                        self.new_tab_rect(),
+                        IconKind::Plus,
+                        self.hover_target == Some(HoverTarget::NewTab),
+                        new_tab_opacity,
+                        &self.fonts.icon,
+                    );
                 }
-            }
 
-            if self.settings_open {
-                self.paint_settings_menu(hdc);
+                let (back, forward, reload) = self.top_button_rects();
+                draw_icon_button(
+                    hdc,
+                    back,
+                    IconKind::Back,
+                    self.hover_target == Some(HoverTarget::Back),
+                    1.0,
+                    &self.fonts.icon,
+                );
+                draw_icon_button(
+                    hdc,
+                    forward,
+                    IconKind::Forward,
+                    self.hover_target == Some(HoverTarget::Forward),
+                    1.0,
+                    &self.fonts.icon,
+                );
+                draw_icon_button(
+                    hdc,
+                    reload,
+                    IconKind::Reload,
+                    self.hover_target == Some(HoverTarget::Reload),
+                    1.0,
+                    &self.fonts.icon,
+                );
+
+                let edit_rect = self.address_rect();
+                fill_round_rect(hdc, edit_rect, 0x151515, 12);
+                draw_outline(hdc, edit_rect, COLOR_BORDER, 12);
+                draw_icon_glyph(
+                    hdc,
+                    &self.fonts.icon,
+                    glyph(0xE774).as_str(),
+                    RECT {
+                        left: edit_rect.left + 10,
+                        top: edit_rect.top,
+                        right: edit_rect.left + 34,
+                        bottom: edit_rect.bottom,
+                    },
+                    COLOR_MUTED,
+                );
+
+                draw_settings_button(
+                    hdc,
+                    self.settings_rect(),
+                    self.hover_target == Some(HoverTarget::Settings),
+                    &self.fonts.icon,
+                );
+
+                if sidebar_width > 92 {
+                    for (index, tab) in self.tabs.iter().enumerate() {
+                        self.paint_tab(hdc, index, tab);
+                    }
+                }
+
+                if self.settings_open {
+                    self.paint_settings_menu(hdc);
+                }
             }
         }
     }
@@ -967,6 +984,11 @@ impl App {
     }
 
     fn handle_click(&mut self, x: i32, y: i32) {
+        if self.hover_overlay_active && x >= self.sidebar_width() {
+            self.end_hover_overlay();
+            return;
+        }
+
         if self.settings_open {
             if self.mode_menu_open {
                 let options = self.mode_options_rect();
@@ -1052,6 +1074,19 @@ impl App {
         self.hover_tab = None;
         self.hover_target = None;
 
+        if x < HOVER_TRIGGER_ZONE && !self.sidebar_visible && !self.animating_sidebar {
+            if !self.hover_overlay_active {
+                self.start_hover_overlay();
+            }
+        } else if self.hover_overlay_active
+            && !self.animating_sidebar
+            && self.sidebar_width > SIDEBAR_EXPANDED - 1.0
+        {
+            if x < 0 || x >= self.sidebar_width() || y < 0 || y >= client_rect(self.hwnd).bottom {
+                self.end_hover_overlay();
+            }
+        }
+
         if point_in_rect(x, y, self.logo_rect()) {
             self.hover_target = Some(HoverTarget::Logo);
         } else if self.new_tab_opacity() > 0.6 && point_in_rect(x, y, self.new_tab_rect()) {
@@ -1086,11 +1121,18 @@ impl App {
             }
         }
 
-        if self.sidebar_width() > 92 && x < self.sidebar_width() && y >= TAB_TOP {
+        let sidebar_active_width = if self.is_overlay() {
+            self.sidebar_width()
+        } else if self.sidebar_visible {
+            self.sidebar_width()
+        } else {
+            0
+        };
+        if sidebar_active_width > 92 && x < sidebar_active_width && y >= TAB_TOP {
             let index = ((y - TAB_TOP) / TAB_HEIGHT) as usize;
             if index < self.tabs.len() {
                 self.hover_tab = Some(index);
-                if x >= self.sidebar_width() - 42 {
+                if x >= sidebar_active_width - 42 {
                     self.hover_close = Some(index);
                 }
             }
@@ -1105,12 +1147,45 @@ impl App {
     }
 
     fn toggle_sidebar(&mut self) {
-        self.sidebar_collapsed = !self.sidebar_collapsed;
-        self.sidebar_target = if self.sidebar_collapsed {
-            SIDEBAR_COLLAPSED
-        } else {
+        if self.hover_overlay_active {
+            self.hover_overlay_active = false;
+            self.sidebar_target = SIDEBAR_COLLAPSED;
+            self.animating_sidebar = true;
+            unsafe {
+                let _ = WindowsAndMessaging::SetTimer(Some(self.hwnd), SIDEBAR_TIMER_ID, 15, None);
+            }
+            return;
+        }
+        self.sidebar_visible = !self.sidebar_visible;
+        self.sidebar_target = if self.sidebar_visible {
             SIDEBAR_EXPANDED
+        } else {
+            SIDEBAR_COLLAPSED
         };
+        self.animating_sidebar = true;
+        unsafe {
+            let _ = WindowsAndMessaging::SetTimer(Some(self.hwnd), SIDEBAR_TIMER_ID, 15, None);
+        }
+    }
+
+    fn start_hover_overlay(&mut self) {
+        if self.sidebar_visible || self.animating_sidebar {
+            return;
+        }
+        self.hover_overlay_active = true;
+        self.sidebar_target = SIDEBAR_EXPANDED;
+        self.animating_sidebar = true;
+        unsafe {
+            let _ = WindowsAndMessaging::SetTimer(Some(self.hwnd), SIDEBAR_TIMER_ID, 15, None);
+        }
+    }
+
+    fn end_hover_overlay(&mut self) {
+        if !self.hover_overlay_active || self.animating_sidebar {
+            return;
+        }
+        self.hover_overlay_active = false;
+        self.sidebar_target = SIDEBAR_COLLAPSED;
         self.animating_sidebar = true;
         unsafe {
             let _ = WindowsAndMessaging::SetTimer(Some(self.hwnd), SIDEBAR_TIMER_ID, 15, None);
@@ -1856,19 +1931,6 @@ fn solid_brush(color: u32) -> HBRUSH {
 
 fn to_wide(text: &str) -> Vec<u16> {
     text.encode_utf16().chain(std::iter::once(0)).collect()
-}
-
-fn find_webview_child(parent: HWND, exclude: HWND) -> HWND {
-    unsafe {
-        let mut child = GetTopWindow(Some(parent)).unwrap_or_default();
-        while !child.is_invalid() {
-            if child != exclude {
-                return child;
-            }
-            child = GetWindow(child, GW_HWNDNEXT).unwrap_or_default();
-        }
-        HWND::default()
-    }
 }
 
 fn loword(value: u32) -> u16 {
