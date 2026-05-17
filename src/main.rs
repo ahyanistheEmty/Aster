@@ -60,12 +60,12 @@ const HOVER_DETECT_TIMER_ID: usize = 44;
 const COLOR_BLACK: u32 = 0x000000;
 const COLOR_PANEL: u32 = 0x090909;
 const COLOR_PANEL_2: u32 = 0x121212;
-const COLOR_SURFACE: u32 = 0x161616;
 const COLOR_SURFACE_HOVER: u32 = 0x242424;
 const COLOR_BORDER: u32 = 0x343434;
 const COLOR_TEXT: u32 = 0xf5f5f5;
 const COLOR_MUTED: u32 = 0xa1a1a1;
 const COLOR_ACCENT: u32 = 0xf16f63;
+const ASTER_BACKGROUND_SVG: &str = include_str!("../assets/aster-background.svg");
 
 static mut OLD_ADDRESS_PROC: WNDPROC = None;
 static mut OLD_COMMAND_POPUP_PROC: WNDPROC = None;
@@ -119,6 +119,7 @@ struct Tab {
     id: usize,
     title: String,
     url: String,
+    favicon_uri: String,
     controller: ICoreWebView2Controller,
     webview: ICoreWebView2,
     child_hwnd: HWND,
@@ -280,7 +281,7 @@ impl App {
                 Some(LPARAM(1)),
             );
         }
-        let mut app = Self {
+        let app = Self {
             hwnd,
             address_hwnd,
             command_hwnd,
@@ -315,7 +316,6 @@ impl App {
             saved_style: 0,
             saved_rect: RECT::default(),
         };
-        app.create_tab(DEFAULT_URL)?;
         unsafe {
             let _ = WindowsAndMessaging::SetTimer(Some(app.hwnd), HOVER_DETECT_TIMER_ID, 100, None);
         }
@@ -344,6 +344,7 @@ impl App {
             id,
             title: "New Tab".to_string(),
             url: url.to_string(),
+            favicon_uri: String::new(),
             controller,
             webview,
             child_hwnd,
@@ -429,6 +430,28 @@ impl App {
                 &mut token,
             )?;
 
+            if let Ok(webview15) = webview.cast::<ICoreWebView2_15>() {
+                let hwnd = self.hwnd;
+                let mut token = 0;
+                webview15.add_FaviconChanged(
+                    &FaviconChangedEventHandler::create(Box::new(move |sender, _args| {
+                        if let Some(sender) = sender {
+                            if let Ok(sender15) = sender.cast::<ICoreWebView2_15>() {
+                                let mut uri = PWSTR::null();
+                                if sender15.FaviconUri(&mut uri).is_ok() {
+                                    let favicon_uri = CoTaskMemPWSTR::from(uri).to_string();
+                                    with_app(hwnd, |app| {
+                                        app.update_tab_favicon_uri(tab_id, favicon_uri)
+                                    });
+                                }
+                            }
+                        }
+                        Ok(())
+                    })),
+                    &mut token,
+                )?;
+            }
+
             let hwnd = self.hwnd;
             let mut token = 0;
             webview.add_NewWindowRequested(
@@ -484,6 +507,13 @@ impl App {
         self.refresh();
     }
 
+    fn update_tab_favicon_uri(&mut self, tab_id: usize, favicon_uri: String) {
+        if let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == tab_id) {
+            tab.favicon_uri = favicon_uri;
+        }
+        self.refresh();
+    }
+
     fn switch_to(&mut self, index: usize) {
         if index >= self.tabs.len() {
             return;
@@ -512,7 +542,9 @@ impl App {
         }
         self.tabs.remove(index);
         if self.tabs.is_empty() {
-            let _ = self.create_tab(DEFAULT_URL);
+            self.active = 0;
+            self.layout();
+            self.refresh();
             return;
         }
         let next = if index >= self.tabs.len() {
@@ -554,7 +586,7 @@ impl App {
                 .tabs
                 .get(self.active)
                 .map(|tab| tab.url.as_str())
-                .unwrap_or(DEFAULT_URL),
+                .unwrap_or(""),
             CommandMode::NewTab => "",
         };
         set_window_text(self.address_hwnd, initial_text);
@@ -621,12 +653,16 @@ impl App {
         self.layout();
         match mode {
             CommandMode::Navigate => {
-                self.navigate_active(&url);
-                if let Some(tab) = self.tabs.get(self.active) {
-                    unsafe {
-                        let _ = tab
-                            .controller
-                            .MoveFocus(COREWEBVIEW2_MOVE_FOCUS_REASON_PROGRAMMATIC);
+                if self.tabs.is_empty() {
+                    let _ = self.create_tab(&url);
+                } else {
+                    self.navigate_active(&url);
+                    if let Some(tab) = self.tabs.get(self.active) {
+                        unsafe {
+                            let _ = tab
+                                .controller
+                                .MoveFocus(COREWEBVIEW2_MOVE_FOCUS_REASON_PROGRAMMATIC);
+                        }
                     }
                 }
             }
@@ -671,21 +707,7 @@ impl App {
     }
 
     fn top_button_x(&self) -> i32 {
-        match self.sidebar_mode {
-            SidebarMode::Hidden => {
-                if self.sidebar_target >= SIDEBAR_EXPANDED {
-                    match self.sidebar_expand_mode {
-                        SidebarMode::Overlay => 56,
-                        SidebarMode::Pushed => self.sidebar_width().max(56),
-                        _ => 56,
-                    }
-                } else {
-                    56
-                }
-            }
-            SidebarMode::Overlay => 56,
-            SidebarMode::Pushed => self.sidebar_width().max(56),
-        }
+        54
     }
 
     fn top_button_rects(&self) -> (RECT, RECT, RECT) {
@@ -714,20 +736,20 @@ impl App {
 
     fn logo_rect(&self) -> RECT {
         RECT {
-            left: 16,
-            top: 14,
-            right: 48,
-            bottom: 46,
+            left: 12,
+            top: 13,
+            right: 42,
+            bottom: 43,
         }
     }
 
     fn new_tab_rect(&self) -> RECT {
-        let right = self.sidebar_width().max(SIDEBAR_EXPANDED as i32) - 16;
+        let (_, _, reload) = self.top_button_rects();
         RECT {
-            left: right - 36,
-            top: 13,
-            right,
-            bottom: 49,
+            left: reload.right + 10,
+            top: 16,
+            right: reload.right + 38,
+            bottom: 44,
         }
     }
 
@@ -820,7 +842,7 @@ impl App {
     }
 
     fn new_tab_opacity(&self) -> f32 {
-        ((self.sidebar_width - 118.0) / (SIDEBAR_EXPANDED - 118.0)).clamp(0.0, 1.0)
+        1.0
     }
 
     fn layout(&self) {
@@ -988,6 +1010,18 @@ impl App {
                 0x202020,
             );
 
+            if self.tabs.is_empty() {
+                draw_aster_background(
+                    hdc,
+                    RECT {
+                        left: 0,
+                        top: TOPBAR_HEIGHT,
+                        right: rect.right,
+                        bottom: rect.bottom,
+                    },
+                );
+            }
+
             if sidebar_width >= 1 {
                 let sidebar = RECT {
                     left: 0,
@@ -1017,13 +1051,12 @@ impl App {
             );
             let new_tab_opacity = self.new_tab_opacity();
             if new_tab_opacity > 0.08 {
-                draw_icon_button(
+                draw_toolbar_icon_button(
                     hdc,
                     self.new_tab_rect(),
                     IconKind::Plus,
                     self.hover_target == Some(HoverTarget::NewTab),
-                    new_tab_opacity,
-                    &self.fonts.icon,
+                    &self.fonts.toolbar_icon,
                 );
             }
 
@@ -1071,18 +1104,6 @@ impl App {
                 },
                 11,
             );
-            draw_icon_glyph(
-                hdc,
-                &self.fonts.toolbar_icon,
-                glyph(0xE774).as_str(),
-                RECT {
-                    left: edit_rect.left + 8,
-                    top: edit_rect.top,
-                    right: edit_rect.left + 30,
-                    bottom: edit_rect.bottom,
-                },
-                COLOR_MUTED,
-            );
             let address_label = self
                 .tabs
                 .get(self.active)
@@ -1094,14 +1115,14 @@ impl App {
                     }
                 })
                 .unwrap_or("Search or Enter URL...");
-            draw_text(
+            draw_centered_text(
                 hdc,
                 &self.fonts.small,
                 address_label,
                 RECT {
-                    left: edit_rect.left + 32,
+                    left: edit_rect.left + 14,
                     top: edit_rect.top,
-                    right: edit_rect.right - 12,
+                    right: edit_rect.right - 14,
                     bottom: edit_rect.bottom,
                 },
                 COLOR_TEXT,
@@ -1261,6 +1282,7 @@ impl App {
             );
 
             let mode_text = match self.command_mode {
+                CommandMode::Navigate if self.tabs.is_empty() => "New tab",
                 CommandMode::Navigate => "Current tab",
                 CommandMode::NewTab => "New tab",
             };
@@ -1295,7 +1317,7 @@ impl App {
                 row.top -= self.command_popup_rect().top;
                 row.bottom -= self.command_popup_rect().top;
                 if index == self.active {
-                    fill_round_rect(hdc, row, 0x3030cc, 8);
+                    fill_round_rect(hdc, row, COLOR_ACCENT, 8);
                 }
                 let favicon = RECT {
                     left: row.left + 14,
@@ -1303,16 +1325,7 @@ impl App {
                     right: row.left + 30,
                     bottom: row.top + 24,
                 };
-                fill_round_rect(
-                    hdc,
-                    favicon,
-                    if index == self.active {
-                        COLOR_ACCENT
-                    } else {
-                        0x2a2a2a
-                    },
-                    5,
-                );
+                draw_favicon_mark(hdc, &self.fonts.small, favicon, tab);
                 draw_text(
                     hdc,
                     &self.fonts.body,
@@ -1384,16 +1397,7 @@ impl App {
                 right: item.left + 30,
                 bottom: item.top + 29,
             };
-            fill_round_rect(
-                hdc,
-                favicon,
-                if index == self.active {
-                    COLOR_ACCENT
-                } else {
-                    0x2a2a2a
-                },
-                6,
-            );
+            draw_favicon_mark(hdc, &self.fonts.small, favicon, tab);
             draw_text(
                 hdc,
                 &self.fonts.body,
@@ -2306,36 +2310,6 @@ enum IconKind {
     Reload,
 }
 
-fn draw_icon_button(
-    hdc: HDC,
-    rect: RECT,
-    icon: IconKind,
-    hovered: bool,
-    opacity: f32,
-    icon_font: &HFONT,
-) {
-    unsafe {
-        let fill = mix_color(
-            COLOR_PANEL,
-            if hovered {
-                COLOR_SURFACE_HOVER
-            } else {
-                COLOR_SURFACE
-            },
-            opacity,
-        );
-        let border = mix_color(
-            COLOR_PANEL,
-            if hovered { 0x464646 } else { COLOR_BORDER },
-            opacity,
-        );
-        let icon_color = mix_color(COLOR_PANEL, COLOR_TEXT, opacity);
-        fill_round_rect(hdc, rect, fill, 10);
-        draw_outline(hdc, rect, border, 10);
-        draw_icon_glyph(hdc, icon_font, icon.glyph(), rect, icon_color);
-    }
-}
-
 fn draw_toolbar_icon_button(
     hdc: HDC,
     rect: RECT,
@@ -2364,7 +2338,11 @@ fn draw_toolbar_icon_button(
 
 fn draw_logo(hdc: HDC, rect: RECT, hovered: bool) {
     unsafe {
-        let color = if hovered { 0xff877f } else { COLOR_ACCENT };
+        let color = if hovered {
+            mix_color(COLOR_ACCENT, COLOR_TEXT, 0.22)
+        } else {
+            COLOR_ACCENT
+        };
         draw_aster_mark(hdc, rect, color);
     }
 }
@@ -2473,6 +2451,21 @@ unsafe fn draw_text(hdc: HDC, font: &HFONT, text: &str, mut rect: RECT, color: u
     let _ = SelectObject(hdc, old_font);
 }
 
+unsafe fn draw_centered_text(hdc: HDC, font: &HFONT, text: &str, mut rect: RECT, color: u32) {
+    let old_font = SelectObject(hdc, HGDIOBJ(font.0));
+    let _ = SetBkMode(hdc, TRANSPARENT);
+    let _ = SetTextColor(hdc, COLORREF(color));
+    let mut wide = to_wide(text);
+    let text_len = wide.len().saturating_sub(1);
+    let _ = DrawTextW(
+        hdc,
+        &mut wide[..text_len],
+        &mut rect,
+        DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS,
+    );
+    let _ = SelectObject(hdc, old_font);
+}
+
 unsafe fn draw_icon_glyph(hdc: HDC, font: &HFONT, text: &str, mut rect: RECT, color: u32) {
     let old_font = SelectObject(hdc, HGDIOBJ(font.0));
     let _ = SetBkMode(hdc, TRANSPARENT);
@@ -2486,6 +2479,129 @@ unsafe fn draw_icon_glyph(hdc: HDC, font: &HFONT, text: &str, mut rect: RECT, co
         DT_CENTER | DT_VCENTER | DT_SINGLELINE,
     );
     let _ = SelectObject(hdc, old_font);
+}
+
+unsafe fn draw_favicon_mark(hdc: HDC, font: &HFONT, rect: RECT, tab: &Tab) {
+    let host = display_host(&tab.url);
+    let label_source = if host.is_empty() {
+        tab.title.as_str()
+    } else {
+        host.as_str()
+    };
+    let letter = label_source
+        .chars()
+        .find(|ch| ch.is_ascii_alphanumeric())
+        .map(|ch| ch.to_ascii_uppercase().to_string())
+        .unwrap_or_else(|| "A".to_string());
+    let color = site_color(if tab.favicon_uri.is_empty() {
+        label_source
+    } else {
+        tab.favicon_uri.as_str()
+    });
+    fill_round_rect(hdc, rect, 0xf6f6f6, 5);
+    draw_centered_text(hdc, font, &letter, rect, color);
+}
+
+unsafe fn draw_aster_background(hdc: HDC, rect: RECT) {
+    let _ = ASTER_BACKGROUND_SVG.len();
+    let clip = CreateRectRgn(rect.left, rect.top, rect.right, rect.bottom);
+    let _ = Gdi::SelectClipRgn(hdc, Some(clip));
+    fill_rect(hdc, rect, COLOR_BLACK);
+    let height = (rect.bottom - rect.top).max(1);
+    for step in 0..56 {
+        let y1 = rect.top + height * step / 56;
+        let y2 = rect.top + height * (step + 1) / 56 + 1;
+        let t = step as f32 / 55.0;
+        let color = mix_color(0x050505, 0x160f28, (1.0 - t) * 0.55);
+        fill_rect(
+            hdc,
+            RECT {
+                left: rect.left,
+                top: y1,
+                right: rect.right,
+                bottom: y2,
+            },
+            color,
+        );
+    }
+
+    let bottom_left = POINT {
+        x: rect.left,
+        y: rect.bottom,
+    };
+    let top_right = POINT {
+        x: rect.right,
+        y: rect.top,
+    };
+    draw_glow(hdc, bottom_left, rect, 660, 22);
+    draw_glow(hdc, top_right, rect, 430, 10);
+
+    for y in (rect.top + 24..rect.bottom).step_by(48) {
+        for x in (rect.left + 24..rect.right).step_by(48) {
+            fill_round_rect(
+                hdc,
+                RECT {
+                    left: x,
+                    top: y,
+                    right: x + 2,
+                    bottom: y + 2,
+                },
+                0x2f2f2f,
+                1,
+            );
+        }
+    }
+
+    for (radius, color) in [
+        (280, 0x4f3631),
+        (460, 0x33241f),
+        (650, 0x241918),
+        (880, 0x191212),
+    ] {
+        draw_ring(hdc, bottom_left, radius, color);
+    }
+    for (radius, color) in [(220, 0x322421), (400, 0x221918)] {
+        draw_ring(hdc, top_right, radius, color);
+    }
+    let _ = Gdi::SelectClipRgn(hdc, None);
+    let _ = DeleteObject(HGDIOBJ(clip.0));
+}
+
+unsafe fn draw_glow(hdc: HDC, center: POINT, bounds: RECT, radius: i32, steps: i32) {
+    for step in (1..=steps).rev() {
+        let r = radius * step / steps;
+        let amount = step as f32 / steps as f32;
+        let color = mix_color(0x050505, COLOR_ACCENT, amount * amount * 0.12);
+        let glow = RECT {
+            left: center.x - r,
+            top: center.y - r,
+            right: center.x + r,
+            bottom: center.y + r,
+        };
+        let clipped = RECT {
+            left: glow.left.max(bounds.left),
+            top: glow.top.max(bounds.top),
+            right: glow.right.min(bounds.right),
+            bottom: glow.bottom.min(bounds.bottom),
+        };
+        if clipped.left < clipped.right && clipped.top < clipped.bottom {
+            fill_round_rect(hdc, glow, color, r * 2);
+        }
+    }
+}
+
+unsafe fn draw_ring(hdc: HDC, center: POINT, radius: i32, color: u32) {
+    with_pen(hdc, color, 1, || {
+        let old_brush = SelectObject(hdc, GetStockObject(NULL_BRUSH));
+        let _ = Gdi::Ellipse(
+            hdc,
+            center.x - radius,
+            center.y - radius,
+            center.x + radius,
+            center.y + radius,
+        );
+        let _ = SelectObject(hdc, old_brush);
+    });
 }
 
 fn glyph(codepoint: u32) -> String {
@@ -2590,6 +2706,34 @@ fn label_for_url(url: &str) -> String {
         .filter(|s| !s.is_empty())
         .unwrap_or("New Tab")
         .to_string()
+}
+
+fn display_host(url: &str) -> String {
+    let without_scheme = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))
+        .unwrap_or(url);
+    without_scheme
+        .trim_start_matches("www.")
+        .split('/')
+        .next()
+        .filter(|s| !s.is_empty())
+        .unwrap_or("")
+        .to_string()
+}
+
+fn site_color(value: &str) -> u32 {
+    if value.is_empty() {
+        return COLOR_ACCENT;
+    }
+    let mut hash = 0u32;
+    for byte in value.bytes() {
+        hash = hash.wrapping_mul(16777619) ^ byte as u32;
+    }
+    let palette = [
+        0xf16f63, 0x62c455, 0x54b8ef, 0xe779d8, 0x68d7d1, 0x7ca8ff, 0x86d45f, 0xd8bd5f,
+    ];
+    palette[hash as usize % palette.len()]
 }
 
 fn solid_brush(color: u32) -> HBRUSH {

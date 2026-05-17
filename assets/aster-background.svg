@@ -1,0 +1,62 @@
+<svg width="1920" height="1080" viewBox="0 0 1920 1080" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <radialGradient id="gm" cx="0%" cy="100%" r="110%" gradientUnits="objectBoundingBox">
+      <stop offset="0%" stop-color="#636ff1" stop-opacity="0.6"/>
+      <stop offset="45%" stop-color="#636ff1" stop-opacity="0.15"/>
+      <stop offset="100%" stop-color="#636ff1" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="gs" cx="100%" cy="0%" r="65%" gradientUnits="objectBoundingBox">
+      <stop offset="0%" stop-color="#636ff1" stop-opacity="0.22"/>
+      <stop offset="100%" stop-color="#636ff1" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="gc" cx="50%" cy="50%" r="50%" gradientUnits="objectBoundingBox">
+      <stop offset="0%" stop-color="#636ff1" stop-opacity="0.06"/>
+      <stop offset="100%" stop-color="#636ff1" stop-opacity="0"/>
+    </radialGradient>
+    <pattern id="dots" x="0" y="0" width="48" height="48" patternUnits="userSpaceOnUse">
+      <circle cx="24" cy="24" r="0.9" fill="#ffffff" fill-opacity="0.18"/>
+    </pattern>
+  </defs>
+
+  <!-- Base -->
+  <rect width="1920" height="1080" fill="#000000"/>
+
+  <!-- Gradient glows -->
+  <rect width="1920" height="1080" fill="url(#gm)"/>
+  <rect width="1920" height="1080" fill="url(#gs)"/>
+  <rect width="1920" height="1080" fill="url(#gc)"/>
+
+  <!-- Dot grid -->
+  <rect width="1920" height="1080" fill="url(#dots)"/>
+
+  <!-- Concentric rings from bottom-left glow -->
+  <circle cx="0" cy="1080" r="280" fill="none" stroke="#636ff1" stroke-opacity="0.12" stroke-width="1"/>
+  <circle cx="0" cy="1080" r="460" fill="none" stroke="#636ff1" stroke-opacity="0.08" stroke-width="0.8"/>
+  <circle cx="0" cy="1080" r="650" fill="none" stroke="#636ff1" stroke-opacity="0.05" stroke-width="0.7"/>
+  <circle cx="0" cy="1080" r="880" fill="none" stroke="#636ff1" stroke-opacity="0.03" stroke-width="0.6"/>
+  <circle cx="0" cy="1080" r="1100" fill="none" stroke="#636ff1" stroke-opacity="0.02" stroke-width="0.5"/>
+
+  <!-- Rings from top-right glow -->
+  <circle cx="1920" cy="0" r="220" fill="none" stroke="#636ff1" stroke-opacity="0.07" stroke-width="0.7"/>
+  <circle cx="1920" cy="0" r="400" fill="none" stroke="#636ff1" stroke-opacity="0.04" stroke-width="0.5"/>
+
+  <!-- Scattered stars / particles -->
+  <circle cx="192" cy="216" r="1.8" fill="#636ff1" fill-opacity="0.6"/>
+  <circle cx="576" cy="108" r="1.2" fill="#ffffff" fill-opacity="0.4"/>
+  <circle cx="960" cy="270" r="1.5" fill="#636ff1" fill-opacity="0.4"/>
+  <circle cx="1440" cy="162" r="2.0" fill="#ffffff" fill-opacity="0.35"/>
+  <circle cx="1700" cy="350" r="1.2" fill="#636ff1" fill-opacity="0.45"/>
+  <circle cx="1300" cy="500" r="1.6" fill="#ffffff" fill-opacity="0.25"/>
+  <circle cx="340" cy="480" r="1.4" fill="#636ff1" fill-opacity="0.5"/>
+  <circle cx="740" cy="670" r="1.1" fill="#ffffff" fill-opacity="0.3"/>
+  <circle cx="1580" cy="770" r="1.7" fill="#636ff1" fill-opacity="0.3"/>
+  <circle cx="230" cy="830" r="1.9" fill="#636ff1" fill-opacity="0.55"/>
+  <circle cx="1190" cy="920" r="1.2" fill="#ffffff" fill-opacity="0.2"/>
+  <circle cx="1780" cy="990" r="1.4" fill="#636ff1" fill-opacity="0.25"/>
+  <circle cx="620" cy="900" r="1.0" fill="#ffffff" fill-opacity="0.3"/>
+  <circle cx="860" cy="80" r="1.3" fill="#636ff1" fill-opacity="0.35"/>
+  <circle cx="1060" cy="760" r="1.1" fill="#636ff1" fill-opacity="0.3"/>
+  <circle cx="440" cy="200" r="0.9" fill="#ffffff" fill-opacity="0.25"/>
+  <circle cx="1820" cy="540" r="1.5" fill="#636ff1" fill-opacity="0.2"/>
+  <circle cx="90" cy="680" r="1.6" fill="#636ff1" fill-opacity="0.4"/>
+</svg>
