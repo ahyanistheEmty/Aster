@@ -1257,7 +1257,6 @@ impl App {
             if mode != SidebarMode::Hidden {
                 let _ = WindowsAndMessaging::KillTimer(Some(self.hwnd), HOVER_DETECT_TIMER_ID);
             }
-            let _ = WindowsAndMessaging::ShowWindow(self.address_hwnd, WindowsAndMessaging::SW_HIDE);
             if mode == SidebarMode::Hidden {
                 self.clear_webview_clipping();
             }
@@ -1300,7 +1299,6 @@ impl App {
             }
             self.layout();
             unsafe {
-                let _ = WindowsAndMessaging::ShowWindow(self.address_hwnd, WindowsAndMessaging::SW_SHOW);
                 let _ = InvalidateRect(Some(self.hwnd), None, false);
                 let _ = Gdi::UpdateWindow(self.hwnd);
             }
