@@ -533,7 +533,8 @@ impl App {
 
     fn content_left(&self) -> i32 {
         match self.sidebar_mode {
-            SidebarMode::Hidden | SidebarMode::Overlay => 0,
+            SidebarMode::Hidden => HOVER_ZONE,
+            SidebarMode::Overlay => 0,
             SidebarMode::Pushed => self.sidebar_width(),
         }
     }
@@ -639,15 +640,7 @@ impl App {
 
     fn layout(&self) {
         let rect = client_rect(self.hwnd);
-        let sidebar_width = self.sidebar_width();
-        let left = match self.sidebar_mode {
-            SidebarMode::Hidden | SidebarMode::Overlay => 0,
-            SidebarMode::Pushed => sidebar_width,
-        };
-        let address_left = match self.sidebar_mode {
-            SidebarMode::Hidden | SidebarMode::Overlay => 18,
-            SidebarMode::Pushed => sidebar_width + 18,
-        };
+        let address = self.address_rect();
         unsafe {
             let flags = if self.animating_sidebar {
                 WindowsAndMessaging::SWP_NOZORDER | WindowsAndMessaging::SWP_NOREDRAW
@@ -657,19 +650,34 @@ impl App {
             let _ = WindowsAndMessaging::SetWindowPos(
                 self.address_hwnd,
                 None,
-                address_left + 36,
-                13 + 7,
-                (rect.right - address_left - 18 - 52).max(120),
+                address.left + 36,
+                address.top + 7,
+                (address.right - address.left - 52).max(120),
                 22,
                 flags,
             );
         }
 
-        let bounds = RECT {
-            left,
-            top: TOPBAR_HEIGHT,
-            right: rect.right,
-            bottom: rect.bottom,
+        let sidebar_width = self.sidebar_width();
+        let bounds = match self.sidebar_mode {
+            SidebarMode::Hidden => RECT {
+                left: HOVER_ZONE,
+                top: TOPBAR_HEIGHT,
+                right: rect.right,
+                bottom: rect.bottom,
+            },
+            SidebarMode::Overlay => RECT {
+                left: 0,
+                top: TOPBAR_HEIGHT,
+                right: rect.right,
+                bottom: rect.bottom,
+            },
+            SidebarMode::Pushed => RECT {
+                left: sidebar_width,
+                top: TOPBAR_HEIGHT,
+                right: rect.right,
+                bottom: rect.bottom,
+            },
         };
         for (i, tab) in self.tabs.iter().enumerate() {
             unsafe {
@@ -1149,11 +1157,12 @@ impl App {
     }
 
     fn set_sidebar_mode(&mut self, mode: SidebarMode) {
-        self.sidebar_mode = mode;
-        self.sidebar_target = match mode {
-            SidebarMode::Hidden => SIDEBAR_HIDDEN,
-            SidebarMode::Overlay | SidebarMode::Pushed => SIDEBAR_EXPANDED,
-        };
+        if mode == SidebarMode::Hidden {
+            self.sidebar_target = SIDEBAR_HIDDEN;
+        } else {
+            self.sidebar_target = SIDEBAR_EXPANDED;
+            self.sidebar_mode = mode;
+        }
         self.animating_sidebar = true;
         unsafe {
             let _ = WindowsAndMessaging::SetTimer(Some(self.hwnd), SIDEBAR_TIMER_ID, 15, None);
@@ -1170,6 +1179,8 @@ impl App {
             }
             if self.sidebar_width < 0.5 {
                 self.sidebar_mode = SidebarMode::Hidden;
+            } else if self.sidebar_mode == SidebarMode::Hidden {
+                self.sidebar_mode = SidebarMode::Pushed;
             }
         } else {
             self.sidebar_width += distance * 0.22;
