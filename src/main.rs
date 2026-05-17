@@ -6,7 +6,7 @@ use webview2_com::{Microsoft::Web::WebView2::Win32::*, *};
 use windows::{
     core::*,
     Win32::{
-        Foundation::{COLORREF, E_POINTER, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM},
+        Foundation::{COLORREF, E_POINTER, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM},
         Graphics::Dwm::{
             DwmSetWindowAttribute, DWMWA_CAPTION_COLOR, DWMWA_TEXT_COLOR,
             DWMWA_USE_IMMERSIVE_DARK_MODE,
@@ -14,7 +14,7 @@ use windows::{
         Graphics::Gdi::{
             self, BeginPaint, BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, CreateFontW, CreatePen,
             CreateSolidBrush, DeleteDC, DeleteObject, DrawTextW, EndPaint, FillRect, GetMonitorInfoW,
-            GetStockObject, InvalidateRect, LineTo, MonitorFromWindow, MoveToEx, RoundRect,
+            GetStockObject, InvalidateRect, LineTo, MonitorFromWindow, MoveToEx, RoundRect, ScreenToClient,
             SelectObject, SetBkMode, SetTextColor, SRCCOPY, DT_CENTER, DT_END_ELLIPSIS, DT_LEFT, DT_SINGLELINE,
             DT_VCENTER, HBRUSH, HDC, HFONT, HGDIOBJ, MONITORINFO, MONITOR_DEFAULTTONEAREST, NULL_BRUSH,
             NULL_PEN, TRANSPARENT,
@@ -27,7 +27,7 @@ use windows::{
                 GetKeyState, SetFocus, VK_CONTROL, VK_F11, VK_F5, VK_MENU, VK_RETURN,
             },
             WindowsAndMessaging::{
-                self, CREATESTRUCTW, CW_USEDEFAULT, EC_LEFTMARGIN, EC_RIGHTMARGIN, GWLP_USERDATA,
+                self, CREATESTRUCTW, CW_USEDEFAULT, EC_LEFTMARGIN, EC_RIGHTMARGIN, GetCursorPos, GWLP_USERDATA,
                 GWLP_WNDPROC, GWL_STYLE, HMENU, HWND_TOP, ICON_BIG, ICON_SMALL, IDC_ARROW, MSG,
                 WINDOW_EX_STYLE, WINDOW_LONG_PTR_INDEX, WINDOW_STYLE, WM_APP, WM_CHAR, WM_CLOSE,
                 WM_COMMAND, WM_CREATE, WM_CTLCOLORBTN, WM_CTLCOLOREDIT, WM_CTLCOLORSTATIC,
@@ -51,6 +51,7 @@ const TOPBAR_HEIGHT: i32 = 58;
 const TAB_HEIGHT: i32 = 48;
 const TAB_TOP: i32 = 76;
 const SIDEBAR_TIMER_ID: usize = 42;
+const HOVER_LEAVE_TIMER_ID: usize = 43;
 
 const COLOR_BLACK: u32 = 0x000000;
 const COLOR_PANEL: u32 = 0x090909;
@@ -220,6 +221,7 @@ struct App {
     sidebar_width: f32,
     sidebar_target: f32,
     sidebar_mode: SidebarMode,
+    sidebar_expand_mode: SidebarMode,
     animating_sidebar: bool,
     hovering_sidebar: bool,
     site_mode: SiteMode,
@@ -268,6 +270,7 @@ impl App {
             sidebar_width: SIDEBAR_HIDDEN,
             sidebar_target: SIDEBAR_HIDDEN,
             sidebar_mode: SidebarMode::Hidden,
+            sidebar_expand_mode: SidebarMode::Hidden,
             animating_sidebar: false,
             hovering_sidebar: false,
             site_mode: SiteMode::Auto,
@@ -1094,16 +1097,8 @@ impl App {
         self.hover_target = None;
 
         if x < HOVER_ZONE && self.sidebar_mode == SidebarMode::Hidden && !self.animating_sidebar {
+            self.sidebar_expand_mode = SidebarMode::Overlay;
             self.set_sidebar_mode(SidebarMode::Overlay);
-        }
-
-        if self.sidebar_mode == SidebarMode::Overlay
-            && self.sidebar_width > SIDEBAR_EXPANDED * 0.8
-            && (x as f32) > self.sidebar_width + 20.0
-        {
-            self.hovering_sidebar = false;
-            self.set_sidebar_mode(SidebarMode::Hidden);
-            return;
         }
 
         if (x as f32) < self.sidebar_width + 4.0 && self.sidebar_width > 0.5 {
@@ -1167,7 +1162,10 @@ impl App {
 
     fn toggle_sidebar(&mut self) {
         match self.sidebar_mode {
-            SidebarMode::Hidden => self.set_sidebar_mode(SidebarMode::Pushed),
+            SidebarMode::Hidden => {
+                self.sidebar_expand_mode = SidebarMode::Pushed;
+                self.set_sidebar_mode(SidebarMode::Pushed);
+            }
             SidebarMode::Pushed => self.set_sidebar_mode(SidebarMode::Hidden),
             SidebarMode::Overlay => self.set_sidebar_mode(SidebarMode::Hidden),
         }
@@ -1180,6 +1178,7 @@ impl App {
         };
         self.animating_sidebar = true;
         unsafe {
+            let _ = WindowsAndMessaging::KillTimer(Some(self.hwnd), HOVER_LEAVE_TIMER_ID);
             let _ = WindowsAndMessaging::SetTimer(Some(self.hwnd), SIDEBAR_TIMER_ID, 15, None);
         }
     }
@@ -1195,7 +1194,17 @@ impl App {
             if self.sidebar_width < 0.5 {
                 self.sidebar_mode = SidebarMode::Hidden;
             } else if self.sidebar_target >= SIDEBAR_EXPANDED {
-                self.sidebar_mode = SidebarMode::Pushed;
+                self.sidebar_mode = self.sidebar_expand_mode;
+                if self.sidebar_mode == SidebarMode::Overlay {
+                    unsafe {
+                        let _ = WindowsAndMessaging::SetTimer(
+                            Some(self.hwnd),
+                            HOVER_LEAVE_TIMER_ID,
+                            100,
+                            None,
+                        );
+                    }
+                }
             }
         } else {
             self.sidebar_width += distance * 0.22;
@@ -1204,6 +1213,28 @@ impl App {
         unsafe {
             let _ = InvalidateRect(Some(self.hwnd), None, false);
             let _ = Gdi::UpdateWindow(self.hwnd);
+        }
+    }
+
+    fn check_hover_leave(&mut self) {
+        if self.sidebar_mode != SidebarMode::Overlay {
+            unsafe {
+                let _ = WindowsAndMessaging::KillTimer(Some(self.hwnd), HOVER_LEAVE_TIMER_ID);
+            }
+            return;
+        }
+        unsafe {
+            let mut pt = POINT::default();
+            if GetCursorPos(&mut pt).is_ok() {
+                if ScreenToClient(self.hwnd, &mut pt).as_bool() {
+                    let sidebar_w = self.sidebar_width() as i32;
+                    if pt.x > sidebar_w + 20 || pt.x < 0 || pt.y < 0 {
+                        let _ = WindowsAndMessaging::KillTimer(Some(self.hwnd), HOVER_LEAVE_TIMER_ID);
+                        self.sidebar_expand_mode = SidebarMode::Hidden;
+                        self.set_sidebar_mode(SidebarMode::Hidden);
+                    }
+                }
+            }
         }
     }
 
@@ -1532,6 +1563,10 @@ extern "system" fn window_proc(hwnd: HWND, msg: u32, w_param: WPARAM, l_param: L
         WM_TIMER => {
             if w_param.0 == SIDEBAR_TIMER_ID {
                 with_app(hwnd, |app| app.tick_sidebar_animation());
+                return LRESULT(0);
+            }
+            if w_param.0 == HOVER_LEAVE_TIMER_ID {
+                with_app(hwnd, |app| app.check_hover_leave());
                 return LRESULT(0);
             }
             unsafe { WindowsAndMessaging::DefWindowProcW(hwnd, msg, w_param, l_param) }
