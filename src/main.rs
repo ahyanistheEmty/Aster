@@ -538,7 +538,11 @@ impl App {
         match self.sidebar_mode {
             SidebarMode::Hidden => {
                 if self.sidebar_target >= SIDEBAR_EXPANDED {
-                    self.sidebar_width()
+                    match self.sidebar_expand_mode {
+                        SidebarMode::Overlay => 0,
+                        SidebarMode::Pushed => self.sidebar_width(),
+                        _ => 56,
+                    }
                 } else {
                     56
                 }
@@ -671,11 +675,25 @@ impl App {
         let bounds = match self.sidebar_mode {
             SidebarMode::Hidden => {
                 if self.sidebar_target >= SIDEBAR_EXPANDED {
-                    RECT {
-                        left: sidebar_width,
-                        top: TOPBAR_HEIGHT,
-                        right: rect.right,
-                        bottom: rect.bottom,
+                    match self.sidebar_expand_mode {
+                        SidebarMode::Overlay => RECT {
+                            left: 0,
+                            top: TOPBAR_HEIGHT,
+                            right: rect.right,
+                            bottom: rect.bottom,
+                        },
+                        SidebarMode::Pushed => RECT {
+                            left: sidebar_width,
+                            top: TOPBAR_HEIGHT,
+                            right: rect.right,
+                            bottom: rect.bottom,
+                        },
+                        _ => RECT {
+                            left: HOVER_ZONE,
+                            top: TOPBAR_HEIGHT,
+                            right: rect.right,
+                            bottom: rect.bottom,
+                        },
                     }
                 } else {
                     RECT {
