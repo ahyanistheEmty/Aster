@@ -98,11 +98,13 @@ const COLOR_BORDER: u32 = 0x343434;
 const COLOR_TEXT: u32 = 0xf5f5f5;
 const COLOR_MUTED: u32 = 0xa1a1a1;
 const COLOR_ACCENT: u32 = 0xf16f63;
+#[allow(dead_code)]
 const COLOR_SELECTION: u32 = 0xf16f63; // Signature Accent Color (#636ff1)
 const ASTER_BACKGROUND_SVG: &str = include_str!("../assets/aster-background.svg");
 
 static mut OLD_ADDRESS_PROC: WNDPROC = None;
 static mut OLD_COMMAND_POPUP_PROC: WNDPROC = None;
+static mut OLD_RENAME_EDIT_PROC: WNDPROC = None;
 
 type AppResult<T> = std::result::Result<T, AppError>;
 
@@ -425,6 +427,7 @@ struct App {
     renaming_folder_id: Option<usize>,
     rename_buffer: String,
     rename_selected: bool,
+    renaming_edit: Option<HWND>,
     fullscreen: bool,
     saved_style: isize,
     saved_rect: RECT,
@@ -530,6 +533,7 @@ impl App {
             renaming_folder_id: None,
             rename_buffer: String::new(),
             rename_selected: false,
+            renaming_edit: None,
             fullscreen: false,
             saved_style: 0,
             saved_rect: RECT::default(),
@@ -1667,11 +1671,10 @@ impl App {
         self.renaming_folder_id = Some(id);
         self.rename_buffer = "New Folder".to_string();
         self.rename_selected = true;
-        unsafe {
-            let _ = SetFocus(Some(self.hwnd));
-        }
         self.save_state();
+        self.layout();
         self.refresh();
+        self.create_rename_edit(id);
     }
 
     fn rename_folder_inline(&mut self, folder_id: usize) {
@@ -1679,14 +1682,17 @@ impl App {
             self.renaming_folder_id = Some(folder_id);
             self.rename_buffer = folder.name.clone();
             self.rename_selected = true;
-            unsafe {
-                let _ = SetFocus(Some(self.hwnd));
-            }
+            self.layout();
             self.refresh();
+            self.create_rename_edit(folder_id);
         }
     }
 
     fn confirm_rename(&mut self) {
+        if self.renaming_edit.is_some() {
+            self.confirm_rename_from_edit();
+            return;
+        }
         if let Some(id) = self.renaming_folder_id.take() {
             let name = self.rename_buffer.clone();
             if !name.trim().is_empty() {
@@ -1708,10 +1714,147 @@ impl App {
                     self.folders.retain(|f| f.id != id);
                 }
             }
+            if let Some(edit_hwnd) = self.renaming_edit.take() {
+                unsafe {
+                    let _ = WindowsAndMessaging::DestroyWindow(edit_hwnd);
+                    let _ = SetFocus(Some(self.hwnd));
+                }
+            }
             self.rename_buffer.clear();
             self.rename_selected = false;
             self.save_state();
             self.refresh();
+        }
+    }
+
+    fn confirm_rename_from_edit(&mut self) {
+        if let Some(edit_hwnd) = self.renaming_edit.take() {
+            let text = get_window_text(edit_hwnd);
+            if let Some(id) = self.renaming_folder_id.take() {
+                if !text.trim().is_empty() {
+                    if let Some(folder) = self.folders.iter_mut().find(|f| f.id == id) {
+                        folder.name = text.trim().to_string();
+                    }
+                }
+            }
+            unsafe {
+                let _ = WindowsAndMessaging::DestroyWindow(edit_hwnd);
+                let _ = SetFocus(Some(self.hwnd));
+            }
+            self.rename_buffer.clear();
+            self.rename_selected = false;
+            self.save_state();
+            self.refresh();
+        }
+    }
+
+    fn cancel_rename_from_edit(&mut self) {
+        if let Some(edit_hwnd) = self.renaming_edit.take() {
+            if let Some(id) = self.renaming_folder_id.take() {
+                if let Some(folder) = self.folders.iter().find(|f| f.id == id) {
+                    if folder.name == "New Folder" {
+                        self.folders.retain(|f| f.id != id);
+                    }
+                }
+            }
+            unsafe {
+                let _ = WindowsAndMessaging::DestroyWindow(edit_hwnd);
+                let _ = SetFocus(Some(self.hwnd));
+            }
+            self.rename_buffer.clear();
+            self.rename_selected = false;
+            self.save_state();
+            self.refresh();
+        }
+    }
+
+    fn create_rename_edit(&mut self, folder_id: usize) {
+        if let Some(existing) = self.renaming_edit.take() {
+            unsafe {
+                let _ = WindowsAndMessaging::DestroyWindow(existing);
+            }
+        }
+
+        let row_rect = self.sidebar_row_rects()
+            .into_iter()
+            .find_map(|(row, rect)| match row {
+                SidebarRow::Folder(id) if id == folder_id => Some(rect),
+                _ => None,
+            });
+
+        if let Some(rect) = row_rect {
+            unsafe {
+                let hinstance = HINSTANCE(LibraryLoader::GetModuleHandleW(None).unwrap_or_default().0);
+                let edit_hwnd = WindowsAndMessaging::CreateWindowExW(
+                    WINDOW_EX_STYLE::default(),
+                    w!("EDIT"),
+                    w!(""),
+                    WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0 | 0x0080 /* ES_AUTOHSCROLL */),
+                    rect.left + 54,
+                    rect.top + 5,
+                    (rect.right - rect.left - 62).max(50),
+                    22,
+                    Some(self.hwnd),
+                    None,
+                    Some(hinstance),
+                    None,
+                );
+
+                if let Ok(edit) = edit_hwnd {
+                    let _ = WindowsAndMessaging::SendMessageW(
+                        edit,
+                        WM_SETFONT,
+                        Some(WPARAM(self.fonts.body.0 as usize)),
+                        Some(LPARAM(1)),
+                    );
+
+                    if let Some(folder) = self.folders.iter().find(|f| f.id == folder_id) {
+                        set_window_text(edit, &folder.name);
+                    }
+
+                    let _ = WindowsAndMessaging::SendMessageW(
+                        edit,
+                        EM_SETSEL,
+                        Some(WPARAM(0)),
+                        Some(LPARAM(-1)),
+                    );
+
+                    OLD_RENAME_EDIT_PROC = mem::transmute(WindowsAndMessaging::SetWindowLongPtrW(
+                        edit,
+                        GWLP_WNDPROC,
+                        rename_edit_proc as *const () as isize,
+                    ));
+
+                    let _ = SetFocus(Some(edit));
+                    self.renaming_edit = Some(edit);
+                }
+            }
+        }
+    }
+
+    fn position_rename_edit(&self) {
+        if let Some(edit_hwnd) = self.renaming_edit {
+            if let Some(folder_id) = self.renaming_folder_id {
+                let row_rect = self.sidebar_row_rects()
+                    .into_iter()
+                    .find_map(|(row, rect)| match row {
+                        SidebarRow::Folder(id) if id == folder_id => Some(rect),
+                        _ => None,
+                    });
+                if let Some(rect) = row_rect {
+                    unsafe {
+                        let _ = WindowsAndMessaging::SetWindowPos(
+                            edit_hwnd,
+                            None,
+                            rect.left + 54,
+                            rect.top + 5,
+                            (rect.right - rect.left - 62).max(50),
+                            22,
+                            WindowsAndMessaging::SWP_NOZORDER | WindowsAndMessaging::SWP_NOACTIVATE,
+                        );
+                    }
+                }
+            }
         }
     }
 
@@ -2108,6 +2251,7 @@ impl App {
         {
             self.last_bounds_rect.set(bounds);
         }
+        self.position_rename_edit();
     }
 
     fn paint(&self, hdc: HDC) {
@@ -2759,28 +2903,20 @@ impl App {
                     },
                     COLOR_ACCENT,
                 );
-                if is_renaming && self.rename_selected {
-                    let text_width = measure_text_width(hdc, &self.fonts.body, &self.rename_buffer);
-                    let highlight_rect = RECT {
-                        left: item.left + 56,
-                        top: item.top + 5,
-                        right: item.left + 56 + text_width,
-                        bottom: item.bottom - 5,
-                    };
-                    fill_rect(hdc, highlight_rect, COLOR_SELECTION);
+                if !is_renaming {
+                    draw_text(
+                        hdc,
+                        &self.fonts.body,
+                        &display_name,
+                        RECT {
+                            left: item.left + 56,
+                            top: item.top,
+                            right: item.right - 8,
+                            bottom: item.bottom,
+                        },
+                        COLOR_MUTED,
+                    );
                 }
-                draw_text(
-                    hdc,
-                    &self.fonts.body,
-                    &display_name,
-                    RECT {
-                        left: item.left + 56,
-                        top: item.top,
-                        right: item.right - 8,
-                        bottom: item.bottom,
-                    },
-                    if is_renaming { COLOR_TEXT } else { COLOR_MUTED },
-                );
             } else {
                 draw_icon_glyph(
                     hdc,
@@ -2794,28 +2930,20 @@ impl App {
                     },
                     COLOR_MUTED,
                 );
-                if is_renaming && self.rename_selected {
-                    let text_width = measure_text_width(hdc, &self.fonts.body, &self.rename_buffer);
-                    let highlight_rect = RECT {
-                        left: item.left + 56,
-                        top: item.top + 5,
-                        right: item.left + 56 + text_width,
-                        bottom: item.bottom - 5,
-                    };
-                    fill_rect(hdc, highlight_rect, COLOR_SELECTION);
+                if !is_renaming {
+                    draw_text(
+                        hdc,
+                        &self.fonts.body,
+                        &display_name,
+                        RECT {
+                            left: item.left + 56,
+                            top: item.top,
+                            right: item.right - 8,
+                            bottom: item.bottom,
+                        },
+                        COLOR_MUTED,
+                    );
                 }
-                draw_text(
-                    hdc,
-                    &self.fonts.body,
-                    &display_name,
-                    RECT {
-                        left: item.left + 56,
-                        top: item.top,
-                        right: item.right - 8,
-                        bottom: item.bottom,
-                    },
-                    if is_renaming { COLOR_TEXT } else { COLOR_MUTED },
-                );
             }
         }
     }
@@ -3045,19 +3173,6 @@ impl App {
         }
     }
 
-    fn handle_double_click(&mut self, x: i32, y: i32) {
-        if let Some(hit) = self.hit_sidebar(x, y) {
-            if let SidebarHit::Folder(folder_id) = hit {
-                if self.renaming_folder_id == Some(folder_id) {
-                    if !self.rename_selected {
-                        self.rename_selected = true;
-                        self.refresh();
-                    }
-                }
-            }
-        }
-    }
-
     fn handle_click(&mut self, x: i32, y: i32) {
         let clicked_renaming_folder = if let Some(folder_id) = self.renaming_folder_id {
             matches!(self.hit_sidebar(x, y), Some(SidebarHit::Folder(hit_id)) if hit_id == folder_id)
@@ -3067,10 +3182,6 @@ impl App {
 
         if self.renaming_folder_id.is_some() {
             if clicked_renaming_folder {
-                if self.rename_selected {
-                    self.rename_selected = false;
-                    self.refresh();
-                }
                 return;
             } else {
                 self.confirm_rename();
@@ -4490,6 +4601,41 @@ fn create_command_popup(parent: HWND) -> AppResult<HWND> {
     }
 }
 
+unsafe extern "system" fn rename_edit_proc(
+    hwnd: HWND,
+    msg: u32,
+    w_param: WPARAM,
+    l_param: LPARAM,
+) -> LRESULT {
+    if msg == WM_KEYDOWN && w_param.0 as u32 == VK_RETURN.0 as u32 {
+        if let Ok(parent) = WindowsAndMessaging::GetParent(hwnd) {
+            with_app(parent, |app| {
+                app.confirm_rename_from_edit();
+            });
+        }
+        return LRESULT(0);
+    }
+    if msg == WM_KEYDOWN && w_param.0 as u32 == VK_ESCAPE.0 as u32 {
+        if let Ok(parent) = WindowsAndMessaging::GetParent(hwnd) {
+            with_app(parent, |app| {
+                app.cancel_rename_from_edit();
+            });
+        }
+        return LRESULT(0);
+    }
+    if msg == WM_CHAR && w_param.0 as u32 == VK_RETURN.0 as u32 {
+        return LRESULT(0);
+    }
+    if msg == WindowsAndMessaging::WM_KILLFOCUS {
+        if let Ok(parent) = WindowsAndMessaging::GetParent(hwnd) {
+            with_app(parent, |app| {
+                app.confirm_rename_from_edit();
+            });
+        }
+    }
+    WindowsAndMessaging::CallWindowProcW(OLD_RENAME_EDIT_PROC, hwnd, msg, w_param, l_param)
+}
+
 unsafe extern "system" fn address_bar_proc(
     hwnd: HWND,
     msg: u32,
@@ -4733,11 +4879,6 @@ extern "system" fn window_proc(hwnd: HWND, msg: u32, w_param: WPARAM, l_param: L
             LRESULT(0)
         }
         WindowsAndMessaging::WM_LBUTTONDBLCLK => {
-            let x = loword(l_param.0 as u32) as i16 as i32;
-            let y = hiword(l_param.0 as u32) as i16 as i32;
-            with_app(hwnd, |app| {
-                app.handle_double_click(x, y);
-            });
             LRESULT(0)
         }
         WM_LBUTTONUP => {
@@ -5776,6 +5917,7 @@ fn unescape_state(value: &str) -> String {
     out
 }
 
+#[allow(dead_code)]
 fn measure_text_width(hdc: HDC, font: &HFONT, text: &str) -> i32 {
     unsafe {
         let old_font = SelectObject(hdc, HGDIOBJ(font.0));
