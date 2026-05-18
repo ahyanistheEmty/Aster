@@ -2008,11 +2008,7 @@ impl App {
         }
 
         let sidebar_width = self.sidebar_width();
-        let pushed_left = if self.animating_sidebar {
-            0
-        } else {
-            sidebar_width
-        };
+        let pushed_left = sidebar_width;
         let bounds = match self.sidebar_mode {
             SidebarMode::Hidden => {
                 if self.sidebar_target >= SIDEBAR_EXPANDED {
@@ -3924,9 +3920,6 @@ impl App {
             if mode != SidebarMode::Hidden {
                 let _ = WindowsAndMessaging::KillTimer(Some(self.hwnd), HOVER_DETECT_TIMER_ID);
             }
-            if mode == SidebarMode::Hidden {
-                self.clear_webview_clipping();
-            }
             let _ = WindowsAndMessaging::SetTimer(Some(self.hwnd), SIDEBAR_TIMER_ID, 15, None);
         }
     }
@@ -4414,6 +4407,7 @@ extern "system" fn window_proc(hwnd: HWND, msg: u32, w_param: WPARAM, l_param: L
             LRESULT(1)
         }
         WM_CREATE => LRESULT(0),
+        WM_ERASEBKGND => LRESULT(1),
         WM_SIZE => {
             with_app(hwnd, |app| {
                 app.layout();
