@@ -4407,7 +4407,6 @@ extern "system" fn window_proc(hwnd: HWND, msg: u32, w_param: WPARAM, l_param: L
             LRESULT(1)
         }
         WM_CREATE => LRESULT(0),
-        WM_ERASEBKGND => LRESULT(1),
         WM_SIZE => {
             with_app(hwnd, |app| {
                 app.layout();
