@@ -2761,12 +2761,12 @@ impl App {
                 if is_renaming && self.rename_selected {
                     let text_width = measure_text_width(hdc, &self.fonts.body, &self.rename_buffer);
                     let highlight_rect = RECT {
-                        left: item.left + 56 - 4,
-                        top: item.top + 4,
-                        right: item.left + 56 + text_width + 4,
-                        bottom: item.bottom - 4,
+                        left: item.left + 56,
+                        top: item.top + 2,
+                        right: item.left + 56 + text_width,
+                        bottom: item.bottom - 2,
                     };
-                    fill_round_rect(hdc, highlight_rect, COLOR_ACCENT, 4);
+                    fill_rect(hdc, highlight_rect, COLOR_ACCENT);
                 }
                 draw_text(
                     hdc,
@@ -2796,12 +2796,12 @@ impl App {
                 if is_renaming && self.rename_selected {
                     let text_width = measure_text_width(hdc, &self.fonts.body, &self.rename_buffer);
                     let highlight_rect = RECT {
-                        left: item.left + 56 - 4,
-                        top: item.top + 4,
-                        right: item.left + 56 + text_width + 4,
-                        bottom: item.bottom - 4,
+                        left: item.left + 56,
+                        top: item.top + 2,
+                        right: item.left + 56 + text_width,
+                        bottom: item.bottom - 2,
                     };
-                    fill_round_rect(hdc, highlight_rect, COLOR_ACCENT, 4);
+                    fill_rect(hdc, highlight_rect, COLOR_ACCENT);
                 }
                 draw_text(
                     hdc,
