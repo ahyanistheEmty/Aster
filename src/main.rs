@@ -2763,9 +2763,9 @@ impl App {
                     let text_width = measure_text_width(hdc, &self.fonts.body, &self.rename_buffer);
                     let highlight_rect = RECT {
                         left: item.left + 56,
-                        top: item.top + 2,
+                        top: item.top + 5,
                         right: item.left + 56 + text_width,
-                        bottom: item.bottom - 2,
+                        bottom: item.bottom - 5,
                     };
                     fill_rect(hdc, highlight_rect, COLOR_SELECTION);
                 }
@@ -2798,9 +2798,9 @@ impl App {
                     let text_width = measure_text_width(hdc, &self.fonts.body, &self.rename_buffer);
                     let highlight_rect = RECT {
                         left: item.left + 56,
-                        top: item.top + 2,
+                        top: item.top + 5,
                         right: item.left + 56 + text_width,
-                        bottom: item.bottom - 2,
+                        bottom: item.bottom - 5,
                     };
                     fill_rect(hdc, highlight_rect, COLOR_SELECTION);
                 }
@@ -3046,8 +3046,22 @@ impl App {
     }
 
     fn handle_click(&mut self, x: i32, y: i32) {
+        let clicked_renaming_folder = if let Some(folder_id) = self.renaming_folder_id {
+            matches!(self.hit_sidebar(x, y), Some(SidebarHit::Folder(hit_id)) if hit_id == folder_id)
+        } else {
+            false
+        };
+
         if self.renaming_folder_id.is_some() {
-            self.confirm_rename();
+            if clicked_renaming_folder {
+                if self.rename_selected {
+                    self.rename_selected = false;
+                    self.refresh();
+                }
+                return;
+            } else {
+                self.confirm_rename();
+            }
         }
 
         if self.overlay_menu.is_some() && self.handle_overlay_click(x, y) {
