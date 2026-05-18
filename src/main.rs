@@ -2058,33 +2058,37 @@ impl App {
                 bottom: rect.bottom,
             },
         };
+        let needs_clipping = self.sidebar_mode == SidebarMode::Overlay
+            || (self.sidebar_mode == SidebarMode::Hidden
+                && self.sidebar_expand_mode == SidebarMode::Overlay
+                && self.sidebar_target >= SIDEBAR_EXPANDED);
+        let clip_changed = needs_clipping
+            && sidebar_width > 0
+            && (sidebar_width as f32 - self.last_clip_width.get()).abs() > 1.0;
+        let was_clipped = self.last_clip_width.get() != 0.0;
+        let should_clear = (!needs_clipping || sidebar_width <= 0) && was_clipped;
         for (i, tab) in self.tabs.iter().enumerate() {
             unsafe {
                 let _ = tab.controller.SetBounds(bounds);
-                let needs_clipping = self.sidebar_mode == SidebarMode::Overlay
-                    || (self.sidebar_mode == SidebarMode::Hidden
-                        && self.sidebar_expand_mode == SidebarMode::Overlay
-                        && self.sidebar_target >= SIDEBAR_EXPANDED);
-                if needs_clipping && sidebar_width > 0 {
-                    if (sidebar_width as f32 - self.last_clip_width.get()).abs() > 1.0 {
-                        let clip_left = sidebar_width;
-                        let clip_top = 0;
-                        let clip_right = rect.right;
-                        let clip_bottom = rect.bottom - TOPBAR_HEIGHT;
-                        let region = CreateRectRgn(clip_left, clip_top, clip_right, clip_bottom);
-                        let _ = SetWindowRgn(tab.child_hwnd, Some(region), false);
-                        self.last_clip_width.set(sidebar_width as f32);
-                    }
-                } else {
-                    if self.last_clip_width.get() != 0.0 {
-                        let _ = SetWindowRgn(tab.child_hwnd, None, false);
-                        self.last_clip_width.set(0.0);
-                    }
+                if clip_changed {
+                    let clip_left = sidebar_width;
+                    let clip_top = 0;
+                    let clip_right = rect.right;
+                    let clip_bottom = rect.bottom - TOPBAR_HEIGHT;
+                    let region = CreateRectRgn(clip_left, clip_top, clip_right, clip_bottom);
+                    let _ = SetWindowRgn(tab.child_hwnd, Some(region), false);
+                } else if should_clear {
+                    let _ = SetWindowRgn(tab.child_hwnd, None, false);
                 }
                 let _ = tab
                     .controller
                     .SetIsVisible(Some(i) == self.active_tab_index());
             }
+        }
+        if clip_changed {
+            self.last_clip_width.set(sidebar_width as f32);
+        } else if should_clear {
+            self.last_clip_width.set(0.0);
         }
         let last = self.last_bounds_rect.get();
         if bounds.left != last.left
