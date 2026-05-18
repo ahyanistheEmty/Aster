@@ -3045,6 +3045,19 @@ impl App {
         }
     }
 
+    fn handle_double_click(&mut self, x: i32, y: i32) {
+        if let Some(hit) = self.hit_sidebar(x, y) {
+            if let SidebarHit::Folder(folder_id) = hit {
+                if self.renaming_folder_id == Some(folder_id) {
+                    if !self.rename_selected {
+                        self.rename_selected = true;
+                        self.refresh();
+                    }
+                }
+            }
+        }
+    }
+
     fn handle_click(&mut self, x: i32, y: i32) {
         let clicked_renaming_folder = if let Some(folder_id) = self.renaming_folder_id {
             matches!(self.hit_sidebar(x, y), Some(SidebarHit::Folder(hit_id)) if hit_id == folder_id)
@@ -4323,7 +4336,7 @@ fn register_window_class() -> AppResult<()> {
             hInstance: hinstance,
             lpszClassName: CLASS_NAME,
             lpfnWndProc: Some(window_proc),
-            style: WindowsAndMessaging::WNDCLASS_STYLES(0),
+            style: WindowsAndMessaging::CS_DBLCLKS,
             ..Default::default()
         };
         if WindowsAndMessaging::RegisterClassW(&wc) == 0 {
@@ -4716,6 +4729,14 @@ extern "system" fn window_proc(hwnd: HWND, msg: u32, w_param: WPARAM, l_param: L
             with_app(hwnd, |app| {
                 app.start_drag_candidate(x, y);
                 app.handle_click(x, y);
+            });
+            LRESULT(0)
+        }
+        WindowsAndMessaging::WM_LBUTTONDBLCLK => {
+            let x = loword(l_param.0 as u32) as i16 as i32;
+            let y = hiword(l_param.0 as u32) as i16 as i32;
+            with_app(hwnd, |app| {
+                app.handle_double_click(x, y);
             });
             LRESULT(0)
         }
