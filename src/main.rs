@@ -4463,6 +4463,16 @@ unsafe extern "system" fn address_bar_proc(
     if msg == WM_CHAR && w_param.0 as u32 == VK_RETURN.0 as u32 {
         return LRESULT(0);
     }
+    if msg == WindowsAndMessaging::WM_KILLFOCUS {
+        if let Ok(parent) = WindowsAndMessaging::GetParent(hwnd) {
+            with_app(parent, |app| {
+                let next_focus = HWND(w_param.0 as _);
+                if next_focus != app.command_hwnd {
+                    app.close_command();
+                }
+            });
+        }
+    }
     WindowsAndMessaging::CallWindowProcW(OLD_ADDRESS_PROC, hwnd, msg, w_param, l_param)
 }
 
@@ -4513,6 +4523,17 @@ unsafe extern "system" fn command_popup_proc(
                         }
                     }
                     let _ = SetFocus(Some(app.address_hwnd));
+                });
+            }
+            LRESULT(0)
+        }
+        WindowsAndMessaging::WM_KILLFOCUS => {
+            if let Ok(parent) = WindowsAndMessaging::GetParent(hwnd) {
+                with_app(parent, |app| {
+                    let next_focus = HWND(w_param.0 as _);
+                    if next_focus != app.address_hwnd {
+                        app.close_command();
+                    }
                 });
             }
             LRESULT(0)
