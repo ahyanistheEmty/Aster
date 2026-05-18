@@ -82,6 +82,10 @@ const MENU_FOLDER_RENAME: usize = 3401;
 const MENU_FOLDER_DELETE: usize = 3402;
 const MENU_TAB_CLOSE: usize = 3501;
 const MENU_TAB_NEW: usize = 3502;
+const MENU_NEW_SPACE: usize = 3503;
+const MENU_NEW_FOLDER: usize = 3504;
+const MENU_FOLDER_PIN: usize = 3505;
+const MENU_FOLDER_UNPIN: usize = 3506;
 const MENU_HISTORY_BASE: usize = 3600;
 const MENU_WIDTH: i32 = 270;
 const MENU_ROW_HEIGHT: i32 = 34;
@@ -182,6 +186,7 @@ struct Folder {
     workspace_id: usize,
     name: String,
     collapsed: bool,
+    pinned: bool,
 }
 
 struct Tab {
@@ -232,11 +237,19 @@ enum MenuTarget {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
+enum DragSource {
+    Tab(usize),
+    Folder(usize),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
 struct DragState {
-    tab_index: usize,
+    source: DragSource,
     start_x: i32,
     start_y: i32,
     active: bool,
+    current_x: i32,
+    current_y: i32,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -256,7 +269,8 @@ enum SidebarLabel {
 enum SidebarHit {
     WorkspaceHeader,
     WorkspaceButton(usize),
-    AddWorkspace,
+    AddButton,
+    PinnedSection,
     Folder(usize),
     Tab(usize),
 }
@@ -383,6 +397,7 @@ struct App {
     brushes: UiBrushes,
     hover_close: Option<usize>,
     hover_tab: Option<usize>,
+    hover_folder: Option<usize>,
     hover_target: Option<HoverTarget>,
     sidebar_width: f32,
     sidebar_target: f32,
@@ -397,13 +412,39 @@ struct App {
     mode_menu_open: bool,
     overlay_menu: Option<OverlayMenu>,
     drag_state: Option<DragState>,
+    drag_ghost: RefCell<Option<DragGhost>>,
+    drop_target: Option<DropTarget>,
     background_cache: RefCell<Option<BackgroundBitmap>>,
     suggestions: Vec<String>,
     command_open: bool,
     command_mode: CommandMode,
+    renaming_folder_id: Option<usize>,
+    rename_buffer: String,
     fullscreen: bool,
     saved_style: isize,
     saved_rect: RECT,
+}
+
+struct DragGhost {
+    handle: HBITMAP,
+    width: i32,
+    height: i32,
+}
+
+impl Drop for DragGhost {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = DeleteObject(HGDIOBJ(self.handle.0));
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DropTarget {
+    PinnedSection,
+    Folder(usize),
+    Tab(usize),
+    None,
 }
 
 impl App {
@@ -454,6 +495,7 @@ impl App {
             brushes,
             hover_close: None,
             hover_tab: None,
+            hover_folder: None,
             hover_target: None,
             sidebar_width: SIDEBAR_HIDDEN,
             sidebar_target: SIDEBAR_HIDDEN,
@@ -473,10 +515,14 @@ impl App {
             mode_menu_open: false,
             overlay_menu: None,
             drag_state: None,
+            drag_ghost: RefCell::new(None),
+            drop_target: Some(DropTarget::None),
             background_cache: RefCell::new(None),
             suggestions: Vec::new(),
             command_open: false,
             command_mode: CommandMode::Navigate,
+            renaming_folder_id: None,
+            rename_buffer: String::new(),
             fullscreen: false,
             saved_style: 0,
             saved_rect: RECT::default(),
@@ -567,6 +613,18 @@ impl App {
         })
     }
 
+    fn active_tab_visual_index(&self) -> Option<usize> {
+        let active_idx = self.active_tab_index()?;
+        for (pos, row) in self.sidebar_row_rects().into_iter().enumerate() {
+            if let SidebarRow::Tab(idx) = row.0 {
+                if idx == active_idx {
+                    return Some(pos);
+                }
+            }
+        }
+        None
+    }
+
     fn set_workspace_active_tab(&mut self, workspace_id: usize, tab_id: usize) {
         if let Some((_, active_tab)) = self
             .workspace_active_tabs
@@ -648,23 +706,28 @@ impl App {
 
     fn sidebar_rows(&self) -> Vec<SidebarRow> {
         let mut rows = Vec::new();
-        let pinned: Vec<usize> = self
+        let pinned_folders: Vec<usize> = self
+            .folders
+            .iter()
+            .filter(|folder| folder.workspace_id == self.active_workspace && folder.pinned)
+            .map(|folder| folder.id)
+            .collect();
+        let pinned_tabs: Vec<usize> = self
             .tabs
             .iter()
             .enumerate()
             .filter(|(_, tab)| tab.workspace_id == self.active_workspace && tab.pinned)
             .map(|(index, _)| index)
             .collect();
-        if !pinned.is_empty() {
-            rows.push(SidebarRow::Label(SidebarLabel::Pinned));
-            rows.extend(pinned.into_iter().map(SidebarRow::Tab));
-        }
+        rows.push(SidebarRow::Label(SidebarLabel::Pinned));
+        rows.extend(pinned_folders.into_iter().map(SidebarRow::Folder));
+        rows.extend(pinned_tabs.into_iter().map(SidebarRow::Tab));
 
         let mut has_tabs_label = false;
         for folder in self
             .folders
             .iter()
-            .filter(|folder| folder.workspace_id == self.active_workspace)
+            .filter(|folder| folder.workspace_id == self.active_workspace && !folder.pinned)
         {
             let folder_tabs: Vec<usize> = self
                 .tabs
@@ -773,7 +836,7 @@ impl App {
             x += 34;
         }
         items.push((
-            SidebarHit::AddWorkspace,
+            SidebarHit::AddButton,
             RECT {
                 left: (bounds.right - 30).max(bounds.left + 2),
                 top: bounds.top + 4,
@@ -782,6 +845,37 @@ impl App {
             },
         ));
         items
+    }
+
+    fn pinned_section_rect(&self) -> Option<RECT> {
+        let width = self.sidebar_width();
+        if width <= 92 {
+            return None;
+        }
+        let rows = self.sidebar_rows();
+        if rows.len() <= 1 {
+            return None;
+        }
+        let pinned_count = rows.iter().take_while(|row| {
+            matches!(
+                row,
+                SidebarRow::Label(SidebarLabel::Pinned)
+                    | SidebarRow::Folder(_)
+                    | SidebarRow::Tab(_)
+            )
+        }).count();
+        if pinned_count <= 1 {
+            let y = SIDEBAR_ROWS_TOP;
+            let height = 24;
+            Some(RECT {
+                left: 10,
+                top: y,
+                right: width - 10,
+                bottom: y + height,
+            })
+        } else {
+            None
+        }
     }
 
     fn hit_sidebar(&self, x: i32, y: i32) -> Option<SidebarHit> {
@@ -794,6 +888,13 @@ impl App {
         for (hit, rect) in self.workspace_switcher_items() {
             if point_in_rect(x, y, rect) {
                 return Some(hit);
+            }
+        }
+        if self.pinned_section_rect().is_some() {
+            if let Some(rect) = self.pinned_section_rect() {
+                if point_in_rect(x, y, rect) {
+                    return Some(SidebarHit::PinnedSection);
+                }
             }
         }
         for (row, rect) in self.sidebar_row_rects() {
@@ -844,6 +945,7 @@ impl App {
                             workspace_id,
                             name: parts[3].clone(),
                             collapsed: parts.get(4).map(|value| value == "1").unwrap_or(false),
+                            pinned: parts.get(5).map(|value| value == "1").unwrap_or(false),
                         });
                     }
                 }
@@ -958,11 +1060,12 @@ impl App {
         }
         for folder in &self.folders {
             lines.push(format!(
-                "folder\t{}\t{}\t{}\t{}",
+                "folder\t{}\t{}\t{}\t{}\t{}",
                 folder.id,
                 folder.workspace_id,
                 escape_state(&folder.name),
-                if folder.collapsed { "1" } else { "0" }
+                if folder.collapsed { "1" } else { "0" },
+                if folder.pinned { "1" } else { "0" }
             ));
         }
         for tab in &self.tabs {
@@ -1538,6 +1641,7 @@ impl App {
                         name.to_string()
                     },
                     collapsed: false,
+                    pinned: false,
                 });
                 self.save_state();
                 self.refresh();
@@ -1552,6 +1656,49 @@ impl App {
                     self.refresh();
                 }
             }
+        }
+    }
+
+    fn create_folder_inline(&mut self) {
+        let id = self.next_folder_id;
+        self.next_folder_id += 1;
+        self.folders.push(Folder {
+            id,
+            workspace_id: self.active_workspace,
+            name: "New Folder".to_string(),
+            collapsed: false,
+            pinned: false,
+        });
+        self.renaming_folder_id = Some(id);
+        self.rename_buffer = "New Folder".to_string();
+        self.save_state();
+        self.refresh();
+    }
+
+    fn confirm_rename(&mut self) {
+        if let Some(id) = self.renaming_folder_id.take() {
+            let name = self.rename_buffer.clone();
+            if !name.trim().is_empty() {
+                if let Some(folder) = self.folders.iter_mut().find(|f| f.id == id) {
+                    folder.name = name.trim().to_string();
+                }
+            }
+            self.rename_buffer.clear();
+            self.save_state();
+            self.refresh();
+        }
+    }
+
+    fn cancel_rename(&mut self) {
+        if let Some(id) = self.renaming_folder_id.take() {
+            if let Some(folder) = self.folders.iter().find(|f| f.id == id) {
+                if folder.name == "New Folder" {
+                    self.folders.retain(|f| f.id != id);
+                }
+            }
+            self.rename_buffer.clear();
+            self.save_state();
+            self.refresh();
         }
     }
 
@@ -2083,7 +2230,9 @@ impl App {
                         }
                     }
                 }
+                self.paint_drop_target_highlight(hdc);
                 self.paint_workspace_switcher(hdc);
+                self.paint_drag_ghost(hdc);
             }
 
             if self.settings_open {
@@ -2413,23 +2562,11 @@ impl App {
                 RECT {
                     left: rect.left + 12,
                     top: rect.top + 17,
-                    right: rect.right - 42,
+                    right: rect.right - 12,
                     bottom: rect.top + 18,
                 },
                 0x242424,
                 1,
-            );
-            draw_icon_glyph(
-                hdc,
-                &self.fonts.toolbar_icon,
-                glyph(0xE710).as_str(),
-                RECT {
-                    left: rect.right - 32,
-                    top: rect.top,
-                    right: rect.right - 8,
-                    bottom: rect.bottom,
-                },
-                COLOR_MUTED,
             );
         }
     }
@@ -2450,6 +2587,39 @@ impl App {
                 },
                 0x2a2a2a,
             );
+            if label == SidebarLabel::Pinned {
+                let has_pinned_content = self
+                    .sidebar_rows()
+                    .iter()
+                    .skip(1)
+                    .take_while(|row| {
+                        matches!(
+                            row,
+                            SidebarRow::Folder(_) | SidebarRow::Tab(_)
+                        )
+                    })
+                    .count() > 0;
+                if !has_pinned_content {
+                    let workspace_name = self
+                        .workspaces
+                        .iter()
+                        .find(|w| w.id == self.active_workspace)
+                        .map(|w| w.name.as_str())
+                        .unwrap_or("Space");
+                    draw_text(
+                        hdc,
+                        &self.fonts.small,
+                        workspace_name,
+                        RECT {
+                            left: rect.left + 12,
+                            top: rect.top - 2,
+                            right: rect.right - 8,
+                            bottom: rect.top + 12,
+                        },
+                        COLOR_MUTED,
+                    );
+                }
+            }
         }
     }
 
@@ -2457,6 +2627,7 @@ impl App {
         let Some(folder) = self.folders.iter().find(|folder| folder.id == folder_id) else {
             return;
         };
+        let is_renaming = self.renaming_folder_id == Some(folder_id);
         unsafe {
             let item = RECT {
                 left: rect.left + 2,
@@ -2464,50 +2635,80 @@ impl App {
                 right: rect.right - 2,
                 bottom: rect.bottom - 2,
             };
-            if self.hover_tab.is_none() && self.hover_target.is_none() {
-                let _ = item;
+            if is_renaming {
+                fill_round_rect(hdc, item, 0x242424, 8);
+            } else if self.hover_folder == Some(folder_id) {
+                fill_round_rect(hdc, item, 0x151515, 8);
             }
             let folder_arrow = if folder.collapsed {
                 glyph(0xE76C)
             } else {
                 glyph(0xE70D)
             };
+            let icon_left = if folder.pinned { 6 } else { 6 };
             draw_icon_glyph(
                 hdc,
                 &self.fonts.toolbar_icon,
                 folder_arrow.as_str(),
                 RECT {
-                    left: item.left + 6,
+                    left: item.left + icon_left,
                     top: item.top,
-                    right: item.left + 24,
+                    right: item.left + icon_left + 18,
                     bottom: item.bottom,
                 },
                 COLOR_MUTED,
             );
-            draw_icon_glyph(
-                hdc,
-                &self.fonts.toolbar_icon,
-                glyph(0xE8B7).as_str(),
-                RECT {
-                    left: item.left + 28,
-                    top: item.top,
-                    right: item.left + 50,
-                    bottom: item.bottom,
-                },
-                COLOR_MUTED,
-            );
-            draw_text(
-                hdc,
-                &self.fonts.body,
-                &folder.name,
-                RECT {
-                    left: item.left + 56,
-                    top: item.top,
-                    right: item.right - 8,
-                    bottom: item.bottom,
-                },
-                COLOR_MUTED,
-            );
+            if folder.pinned {
+                draw_icon_glyph(
+                    hdc,
+                    &self.fonts.toolbar_icon,
+                    glyph(0xE718).as_str(),
+                    RECT {
+                        left: item.left + 28,
+                        top: item.top,
+                        right: item.left + 50,
+                        bottom: item.bottom,
+                    },
+                    COLOR_ACCENT,
+                );
+                draw_text(
+                    hdc,
+                    &self.fonts.body,
+                    if is_renaming { &self.rename_buffer } else { &folder.name },
+                    RECT {
+                        left: item.left + 56,
+                        top: item.top,
+                        right: item.right - 8,
+                        bottom: item.bottom,
+                    },
+                    if is_renaming { COLOR_TEXT } else { COLOR_MUTED },
+                );
+            } else {
+                draw_icon_glyph(
+                    hdc,
+                    &self.fonts.toolbar_icon,
+                    glyph(0xE8B7).as_str(),
+                    RECT {
+                        left: item.left + 28,
+                        top: item.top,
+                        right: item.left + 50,
+                        bottom: item.bottom,
+                    },
+                    COLOR_MUTED,
+                );
+                draw_text(
+                    hdc,
+                    &self.fonts.body,
+                    if is_renaming { &self.rename_buffer } else { &folder.name },
+                    RECT {
+                        left: item.left + 56,
+                        top: item.top,
+                        right: item.right - 8,
+                        bottom: item.bottom,
+                    },
+                    if is_renaming { COLOR_TEXT } else { COLOR_MUTED },
+                );
+            }
         }
     }
 
@@ -2540,7 +2741,7 @@ impl App {
                             if active { COLOR_TEXT } else { COLOR_MUTED },
                         );
                     }
-                    SidebarHit::AddWorkspace => {
+                    SidebarHit::AddButton => {
                         draw_icon_glyph(
                             hdc,
                             &self.fonts.toolbar_icon,
@@ -2555,13 +2756,101 @@ impl App {
         }
     }
 
+    fn paint_drop_target_highlight(&self, hdc: HDC) {
+        if !self.drag_state.as_ref().map(|d| d.active).unwrap_or(false) {
+            return;
+        }
+        unsafe {
+            match self.drop_target {
+                Some(DropTarget::PinnedSection) => {
+                    if let Some(rect) = self.pinned_section_rect() {
+                        let line_rect = RECT {
+                            left: rect.left + 4,
+                            top: rect.bottom - 2,
+                            right: rect.right - 4,
+                            bottom: rect.bottom,
+                        };
+                        fill_rect(hdc, line_rect, COLOR_ACCENT);
+                    }
+                }
+                Some(DropTarget::Folder(folder_id)) => {
+                    if let Some((_, rect)) = self
+                        .sidebar_row_rects()
+                        .into_iter()
+                        .find(|(row, _)| matches!(row, SidebarRow::Folder(id) if *id == folder_id))
+                    {
+                        let line_rect = RECT {
+                            left: rect.left + 4,
+                            top: rect.bottom - 2,
+                            right: rect.right - 4,
+                            bottom: rect.bottom,
+                        };
+                        fill_rect(hdc, line_rect, COLOR_ACCENT);
+                    }
+                }
+                Some(DropTarget::Tab(index)) => {
+                    if let Some((_, rect)) = self
+                        .sidebar_row_rects()
+                        .into_iter()
+                        .find(|(row, _)| matches!(row, SidebarRow::Tab(idx) if *idx == index))
+                    {
+                        let line_rect = RECT {
+                            left: rect.left + 4,
+                            top: rect.bottom - 2,
+                            right: rect.right - 4,
+                            bottom: rect.bottom,
+                        };
+                        fill_rect(hdc, line_rect, COLOR_ACCENT);
+                    }
+                }
+                Some(DropTarget::None) | None => {}
+            }
+        }
+    }
+
+    fn paint_drag_ghost(&self, hdc: HDC) {
+        if !self.drag_state.as_ref().map(|d| d.active).unwrap_or(false) {
+            return;
+        }
+        let binding = self.drag_ghost.borrow();
+        let Some(ghost) = binding.as_ref() else {
+            return;
+        };
+        let drag = self.drag_state.unwrap();
+        unsafe {
+            let mem_dc = CreateCompatibleDC(Some(hdc));
+            let old = SelectObject(mem_dc, HGDIOBJ(ghost.handle.0));
+            let blend = BLENDFUNCTION {
+                BlendOp: AC_SRC_OVER as u8,
+                BlendFlags: 0,
+                SourceConstantAlpha: 180,
+                AlphaFormat: 0,
+            };
+            let _ = AlphaBlend(
+                hdc,
+                drag.current_x + 10,
+                drag.current_y + 10,
+                ghost.width,
+                ghost.height,
+                mem_dc,
+                0,
+                0,
+                ghost.width,
+                ghost.height,
+                blend,
+            );
+            SelectObject(mem_dc, old);
+            let _ = DeleteDC(mem_dc);
+        }
+    }
+
     fn paint_tab(&self, hdc: HDC, index: usize, tab: &Tab, item: RECT) {
         unsafe {
             let mut item = item;
             if tab.folder_id.is_some() && !tab.pinned {
                 item.left += 14;
             }
-            if self.hover_tab == Some(index) || Some(index) == self.active_tab_index() {
+            if self.hover_tab == Some(index) || Some(index) == self.active_tab_visual_index() {
                 fill_round_rect(hdc, item, 0x151515, 10);
             }
             let mut text_left = item.left + 40;
@@ -2606,7 +2895,7 @@ impl App {
                     },
                     bottom: item.bottom,
                 },
-                if Some(index) == self.active_tab_index() {
+                if Some(index) == self.active_tab_visual_index() {
                     COLOR_TEXT
                 } else {
                     COLOR_MUTED
@@ -2739,14 +3028,14 @@ impl App {
 
         if let Some(hit) = self.hit_sidebar(x, y) {
             match hit {
-                SidebarHit::WorkspaceHeader => {
-                    if x >= self.workspace_header_rect().right - 42 {
-                        self.open_command(CommandMode::NewFolder);
-                    }
-                }
+                SidebarHit::WorkspaceHeader => {}
                 SidebarHit::WorkspaceButton(id) => self.switch_workspace(id),
-                SidebarHit::AddWorkspace => self.open_command(CommandMode::NewWorkspace),
+                SidebarHit::AddButton => self.open_new_item_menu(x, y),
+                SidebarHit::PinnedSection => {}
                 SidebarHit::Folder(folder_id) => {
+                    if self.renaming_folder_id == Some(folder_id) {
+                        return;
+                    }
                     if let Some(folder) = self
                         .folders
                         .iter_mut()
@@ -2803,7 +3092,7 @@ impl App {
             return;
         };
         match hit {
-            SidebarHit::WorkspaceHeader | SidebarHit::WorkspaceButton(_) => {
+            SidebarHit::WorkspaceHeader | SidebarHit::WorkspaceButton(_) | SidebarHit::PinnedSection => {
                 let workspace_id = match hit {
                     SidebarHit::WorkspaceButton(id) => id,
                     _ => self.active_workspace,
@@ -2820,13 +3109,19 @@ impl App {
                     ],
                 );
             }
-            SidebarHit::AddWorkspace => self.open_command(CommandMode::NewWorkspace),
+            SidebarHit::AddButton => self.open_new_item_menu(x, y),
             SidebarHit::Folder(folder_id) => {
+                let folder = self.folders.iter().find(|f| f.id == folder_id);
+                let is_pinned = folder.map(|f| f.pinned).unwrap_or(false);
                 self.open_overlay_menu(
                     x,
                     y,
                     MenuTarget::Sidebar(SidebarHit::Folder(folder_id)),
                     vec![
+                        menu_item(
+                            if is_pinned { MENU_FOLDER_UNPIN } else { MENU_FOLDER_PIN },
+                            if is_pinned { "Unpin Folder" } else { "Pin Folder" },
+                        ),
                         menu_item(MENU_FOLDER_RENAME, "Rename Folder"),
                         menu_item(MENU_FOLDER_DELETE, "Remove Folder"),
                         menu_item(MENU_TAB_NEW, "New Tab"),
@@ -2886,6 +3181,18 @@ impl App {
                 menu_item(MENU_WORKSPACE_NEW_FOLDER, "New Folder"),
                 menu_item(MENU_WORKSPACE_NEW, "New Workspace"),
                 menu_item(MENU_WORKSPACE_RENAME, "Rename Workspace"),
+            ],
+        );
+    }
+
+    fn open_new_item_menu(&mut self, x: i32, y: i32) {
+        self.open_overlay_menu(
+            x,
+            y,
+            MenuTarget::Sidebar(SidebarHit::AddButton),
+            vec![
+                menu_item(MENU_NEW_SPACE, "New Space"),
+                menu_item(MENU_NEW_FOLDER, "New Folder"),
             ],
         );
     }
@@ -3005,6 +3312,8 @@ impl App {
     fn run_sidebar_menu_command(&mut self, hit: SidebarHit, id: usize) {
         match id {
             MENU_TAB_NEW => self.open_command(CommandMode::NewTab),
+            MENU_NEW_SPACE => self.open_command(CommandMode::NewWorkspace),
+            MENU_NEW_FOLDER => self.create_folder_inline(),
             MENU_WORKSPACE_NEW => self.open_command(CommandMode::NewWorkspace),
             MENU_WORKSPACE_NEW_FOLDER => self.open_command(CommandMode::NewFolder),
             MENU_WORKSPACE_RENAME => {
@@ -3016,6 +3325,9 @@ impl App {
             }
             MENU_FOLDER_RENAME => {
                 if let SidebarHit::Folder(folder_id) = hit {
+                    if self.renaming_folder_id.is_some() {
+                        return;
+                    }
                     self.open_command(CommandMode::RenameFolder(folder_id));
                 }
             }
@@ -3026,6 +3338,22 @@ impl App {
                         if tab.folder_id == Some(folder_id) {
                             tab.folder_id = None;
                         }
+                    }
+                    self.save_state();
+                }
+            }
+            MENU_FOLDER_PIN => {
+                if let SidebarHit::Folder(folder_id) = hit {
+                    if let Some(folder) = self.folders.iter_mut().find(|f| f.id == folder_id) {
+                        folder.pinned = true;
+                    }
+                    self.save_state();
+                }
+            }
+            MENU_FOLDER_UNPIN => {
+                if let SidebarHit::Folder(folder_id) = hit {
+                    if let Some(folder) = self.folders.iter_mut().find(|f| f.id == folder_id) {
+                        folder.pinned = false;
                     }
                     self.save_state();
                 }
@@ -3107,33 +3435,40 @@ impl App {
 
     fn handle_mouse_move(&mut self, x: i32, y: i32) {
         if let Some(drag) = self.drag_state.as_mut() {
+            drag.current_x = x;
+            drag.current_y = y;
             if !drag.active && (x - drag.start_x).abs() + (y - drag.start_y).abs() > 6 {
                 drag.active = true;
                 unsafe {
                     let _ = SetCapture(self.hwnd);
                 }
+                self.create_drag_ghost();
             }
         }
 
         let old_close = self.hover_close;
         let old_tab = self.hover_tab;
+        let old_folder = self.hover_folder;
         let old_target = self.hover_target;
         let old_mode_menu = self.mode_menu_open;
         let old_hovering = self.hovering_sidebar;
         self.hover_close = None;
         self.hover_tab = None;
+        self.hover_folder = None;
         self.hover_target = None;
+        self.drop_target = Some(DropTarget::None);
 
-        if x < HOVER_ZONE && self.sidebar_mode == SidebarMode::Hidden && !self.animating_sidebar {
+if x < HOVER_ZONE && self.sidebar_mode == SidebarMode::Hidden && !self.animating_sidebar {
             self.sidebar_expand_mode = SidebarMode::Overlay;
             self.set_sidebar_mode(SidebarMode::Overlay);
         }
 
-        if (x as f32) < self.sidebar_width + 4.0 && self.sidebar_width > 0.5 {
-            self.hovering_sidebar = true;
+        let in_sidebar_hover_zone = if self.sidebar_width > 0.5 {
+            (x as f32) < self.sidebar_width + 4.0
         } else {
-            self.hovering_sidebar = false;
-        }
+            x < HOVER_ZONE
+        };
+        self.hovering_sidebar = in_sidebar_hover_zone;
 
         if point_in_rect(x, y, self.logo_rect()) {
             self.hover_target = Some(HoverTarget::Logo);
@@ -3171,21 +3506,54 @@ impl App {
             }
         }
 
-        if let Some(SidebarHit::Tab(index)) = self.hit_sidebar(x, y) {
-            self.hover_tab = Some(index);
-            if let Some((_, row)) = self
-                .sidebar_row_rects()
-                .into_iter()
-                .find(|(row, _)| matches!(row, SidebarRow::Tab(row_index) if *row_index == index))
-            {
-                if x >= row.right - 34 {
-                    self.hover_close = Some(index);
+        if let Some(SidebarHit::Tab(tab_array_index)) = self.hit_sidebar(x, y) {
+            let mut visual_pos = 0;
+            let mut found = false;
+            for row in self.sidebar_rows() {
+                match row {
+                    SidebarRow::Tab(idx) if idx == tab_array_index => {
+                        found = true;
+                        break;
+                    }
+                    SidebarRow::Tab(_) => {
+                        visual_pos += 1;
+                    }
+                    _ => {}
                 }
             }
+            if found {
+                self.hover_tab = Some(visual_pos);
+                for (_, rect) in self.sidebar_row_rects() {
+                    if point_in_rect(x, y, rect) && x >= rect.right - 34 {
+                        self.hover_close = Some(visual_pos);
+                        break;
+                    }
+                }
+            }
+        } else {
+            self.hover_tab = None;
+            self.hover_close = None;
         }
+        if let Some(SidebarHit::Folder(_)) = self.hit_sidebar(x, y) {
+            self.hover_folder = self.hit_sidebar(x, y).and_then(|h| {
+                if let SidebarHit::Folder(id) = h {
+                    Some(id)
+                } else {
+                    None
+                }
+            });
+        } else {
+            self.hover_folder = None;
+        }
+
+        if self.drag_state.as_ref().map(|d| d.active).unwrap_or(false) {
+            self.drop_target = Some(self.calculate_drop_target(x, y));
+        }
+
         if !self.animating_sidebar
             && (old_close != self.hover_close
                 || old_tab != self.hover_tab
+                || old_folder != self.hover_folder
                 || old_target != self.hover_target
                 || old_mode_menu != self.mode_menu_open
                 || old_hovering != self.hovering_sidebar)
@@ -3195,6 +3563,9 @@ impl App {
     }
 
     fn start_drag_candidate(&mut self, x: i32, y: i32) {
+        if self.renaming_folder_id.is_some() {
+            return;
+        }
         if let Some(SidebarHit::Tab(index)) = self.hit_sidebar(x, y) {
             if let Some((_, row)) = self
                 .sidebar_row_rects()
@@ -3209,12 +3580,29 @@ impl App {
                     && point_in_rect(x, y, self.tab_audio_rect(row));
                 if x < row.right - 34 && !audio_hit {
                     self.drag_state = Some(DragState {
-                        tab_index: index,
+                        source: DragSource::Tab(index),
                         start_x: x,
                         start_y: y,
                         active: false,
+                        current_x: x,
+                        current_y: y,
                     });
                 }
+            }
+        } else if let Some(SidebarHit::Folder(folder_id)) = self.hit_sidebar(x, y) {
+            if let Some((_, _row)) = self
+                .sidebar_row_rects()
+                .into_iter()
+                .find(|(row, _)| matches!(row, SidebarRow::Folder(id) if *id == folder_id))
+            {
+                self.drag_state = Some(DragState {
+                    source: DragSource::Folder(folder_id),
+                    start_x: x,
+                    start_y: y,
+                    active: false,
+                    current_x: x,
+                    current_y: y,
+                });
             }
         }
     }
@@ -3226,62 +3614,276 @@ impl App {
         unsafe {
             let _ = ReleaseCapture();
         }
+        *self.drag_ghost.borrow_mut() = None;
+        self.drop_target = Some(DropTarget::None);
         if !drag.active {
             return false;
         }
-        self.drop_tab(drag.tab_index, x, y);
+        self.handle_drop(drag.source, x, y);
         true
     }
 
-    fn drop_tab(&mut self, from_index: usize, x: i32, y: i32) {
-        if from_index >= self.tabs.len() {
-            return;
-        }
+    fn handle_drop(&mut self, source: DragSource, x: i32, y: i32) {
         let hit = self.hit_sidebar(x, y);
-        let dragged_pinned = self.tabs[from_index].pinned;
-        let dragged_workspace = self.tabs[from_index].workspace_id;
+        match source {
+            DragSource::Tab(from_index) => {
+                if from_index >= self.tabs.len() {
+                    return;
+                }
+                let dragged_pinned = self.tabs[from_index].pinned;
+                let dragged_workspace = self.tabs[from_index].workspace_id;
 
-        match hit {
-            Some(SidebarHit::Folder(folder_id)) => {
-                if let Some(folder) = self.folders.iter().find(|folder| {
-                    folder.id == folder_id && folder.workspace_id == dragged_workspace
-                }) {
-                    if !dragged_pinned {
-                        let _ = folder;
+                match hit {
+                    Some(SidebarHit::PinnedSection) | Some(SidebarHit::WorkspaceHeader) => {
                         if let Some(tab) = self.tabs.get_mut(from_index) {
-                            tab.folder_id = Some(folder_id);
+                            tab.pinned = true;
+                            tab.folder_id = None;
                         }
                     }
+                    Some(SidebarHit::Folder(folder_id)) => {
+                        if let Some(folder) = self.folders.iter().find(|folder| {
+                            folder.id == folder_id && folder.workspace_id == dragged_workspace && !folder.pinned
+                        }) {
+                            if !dragged_pinned {
+                                let _ = folder;
+                                if let Some(tab) = self.tabs.get_mut(from_index) {
+                                    tab.folder_id = Some(folder_id);
+                                }
+                            }
+                        }
+                    }
+                    Some(SidebarHit::Tab(target_index)) if target_index < self.tabs.len() => {
+                        if target_index == from_index {
+                            return;
+                        }
+                        if !dragged_pinned && self.tabs[target_index].pinned {
+                            return;
+                        }
+                        let target_id = self.tabs[target_index].id;
+                        let target_folder = self.tabs[target_index].folder_id;
+                        let target_pinned = self.tabs[target_index].pinned;
+                        let tab_id = self.tabs[from_index].id;
+                        let mut tab = self.tabs.remove(from_index);
+                        tab.pinned = if dragged_pinned { target_pinned } else { false };
+                        tab.folder_id = if tab.pinned { None } else { target_folder };
+                        let insert_at = self
+                            .tabs
+                            .iter()
+                            .position(|candidate| candidate.id == target_id)
+                            .unwrap_or_else(|| target_index.min(self.tabs.len()));
+                        self.tabs.insert(insert_at, tab);
+                        if let Some(new_active) = self.tabs.iter().position(|tab| tab.id == tab_id) {
+                            self.active = new_active;
+                        }
+                    }
+                    _ => {}
                 }
             }
-            Some(SidebarHit::Tab(target_index)) if target_index < self.tabs.len() => {
-                if target_index == from_index {
-                    return;
-                }
-                if !dragged_pinned && self.tabs[target_index].pinned {
-                    return;
-                }
-                let target_id = self.tabs[target_index].id;
-                let target_folder = self.tabs[target_index].folder_id;
-                let target_pinned = self.tabs[target_index].pinned;
-                let tab_id = self.tabs[from_index].id;
-                let mut tab = self.tabs.remove(from_index);
-                tab.pinned = if dragged_pinned { target_pinned } else { false };
-                tab.folder_id = if tab.pinned { None } else { target_folder };
-                let insert_at = self
-                    .tabs
+            DragSource::Folder(from_folder_id) => {
+                let from_workspace = self
+                    .folders
                     .iter()
-                    .position(|candidate| candidate.id == target_id)
-                    .unwrap_or_else(|| target_index.min(self.tabs.len()));
-                self.tabs.insert(insert_at, tab);
-                if let Some(new_active) = self.tabs.iter().position(|tab| tab.id == tab_id) {
-                    self.active = new_active;
+                    .find(|f| f.id == from_folder_id)
+                    .map(|f| f.workspace_id);
+
+                match hit {
+                    Some(SidebarHit::PinnedSection) | Some(SidebarHit::WorkspaceHeader) => {
+                        if let Some(folder) = self.folders.iter_mut().find(|f| f.id == from_folder_id) {
+                            folder.pinned = true;
+                        }
+                    }
+                    Some(SidebarHit::Folder(target_folder_id)) => {
+                        if target_folder_id == from_folder_id {
+                            return;
+                        }
+                        let target_pinned = self
+                            .folders
+                            .iter()
+                            .find(|f| f.id == target_folder_id)
+                            .map(|f| f.pinned);
+                        if let Some(folder) = self.folders.iter_mut().find(|f| f.id == from_folder_id) {
+                            if let Some(target_pinned) = target_pinned {
+                                folder.pinned = target_pinned;
+                            }
+                        }
+                        if let (Some(workspace_id), Some(target_pinned)) = (from_workspace, target_pinned) {
+                            let folder_indices: Vec<usize> = self
+                                .folders
+                                .iter()
+                                .enumerate()
+                                .filter(|(_, f)| f.workspace_id == workspace_id && f.pinned == target_pinned)
+                                .map(|(i, _)| i)
+                                .collect();
+                            let from_idx_pos = folder_indices.iter().position(|&i| {
+                                self.folders[i].id == from_folder_id
+                            });
+                            let target_idx_pos = folder_indices.iter().position(|&i| {
+                                self.folders[i].id == target_folder_id
+                            });
+                            if let (Some(from_idx_pos), Some(target_idx_pos)) = (from_idx_pos, target_idx_pos) {
+                                let from_global_idx = folder_indices[from_idx_pos];
+                                let folder_to_move = self.folders.remove(from_global_idx);
+                                let new_indices: Vec<usize> = self
+                                    .folders
+                                    .iter()
+                                    .enumerate()
+                                    .filter(|(_, f)| f.workspace_id == workspace_id && f.pinned == target_pinned)
+                                    .map(|(i, _)| i)
+                                    .collect();
+                                let insert_pos = if from_idx_pos < target_idx_pos {
+                                    target_idx_pos - 1
+                                } else {
+                                    target_idx_pos
+                                };
+                                let global_insert = new_indices.get(insert_pos)
+                                    .copied()
+                                    .unwrap_or(self.folders.len());
+                                self.folders.insert(global_insert, folder_to_move);
+                            }
+                        }
+                    }
+                    _ => {}
                 }
             }
-            _ => {}
         }
         self.save_state();
         self.refresh();
+    }
+
+    fn calculate_drop_target(&self, x: i32, y: i32) -> DropTarget {
+        let hit = self.hit_sidebar(x, y);
+        match hit {
+            Some(SidebarHit::PinnedSection) => DropTarget::PinnedSection,
+            Some(SidebarHit::Folder(folder_id)) => DropTarget::Folder(folder_id),
+            Some(SidebarHit::Tab(index)) => DropTarget::Tab(index),
+            _ => DropTarget::None,
+        }
+    }
+
+    fn create_drag_ghost(&self) {
+        let Some(drag) = self.drag_state else {
+            return;
+        };
+        let width = self.sidebar_width();
+        if width <= 92 {
+            return;
+        }
+
+        let (ghost_width, ghost_height) = match drag.source {
+            DragSource::Tab(_) => ((width - 20) as i32, 44),
+            DragSource::Folder(_) => ((width - 20) as i32, 36),
+        };
+
+        unsafe {
+            let hdc_screen = Gdi::GetDC(None);
+            let mem_dc = CreateCompatibleDC(Some(hdc_screen));
+            let bitmap = CreateCompatibleBitmap(hdc_screen, ghost_width, ghost_height);
+            let old = SelectObject(mem_dc, HGDIOBJ(bitmap.0));
+            let black = CreateSolidBrush(COLORREF(0x000000));
+            let _ = FillRect(
+                mem_dc,
+                &RECT {
+                    left: 0,
+                    top: 0,
+                    right: ghost_width,
+                    bottom: ghost_height,
+                },
+                black,
+            );
+            let _ = DeleteObject(HGDIOBJ(black.0));
+
+            let item = RECT {
+                left: 0,
+                top: 0,
+                right: ghost_width,
+                bottom: ghost_height,
+            };
+            fill_round_rect(mem_dc, item, 0x1a1a1a, 10);
+
+            match drag.source {
+                DragSource::Tab(index) => {
+                    if let Some(tab) = self.tabs.get(index) {
+                        if tab.pinned {
+                            draw_icon_glyph(
+                                mem_dc,
+                                &self.fonts.toolbar_icon,
+                                glyph(0xE718).as_str(),
+                                RECT {
+                                    left: 8,
+                                    top: 0,
+                                    right: 28,
+                                    bottom: ghost_height,
+                                },
+                                COLOR_ACCENT,
+                            );
+                        }
+                        let favicon_left = if tab.pinned { 34 } else { 12 };
+                        let favicon = RECT {
+                            left: favicon_left,
+                            top: 11,
+                            right: favicon_left + 18,
+                            bottom: 29,
+                        };
+                        draw_tab_favicon(mem_dc, &self.fonts.small, favicon, tab);
+                        draw_text(
+                            mem_dc,
+                            &self.fonts.body,
+                            &tab.title,
+                            RECT {
+                                left: if tab.pinned { 62 } else { 40 },
+                                top: 0,
+                                right: ghost_width - 8,
+                                bottom: ghost_height,
+                            },
+                            COLOR_TEXT,
+                        );
+                    }
+                }
+                DragSource::Folder(folder_id) => {
+                    if let Some(folder) = self.folders.iter().find(|f| f.id == folder_id) {
+                        let folder_arrow = if folder.pinned {
+                            glyph(0xE718)
+                        } else {
+                            glyph(0xE8B7)
+                        };
+                        draw_icon_glyph(
+                            mem_dc,
+                            &self.fonts.toolbar_icon,
+                            folder_arrow.as_str(),
+                            RECT {
+                                left: 8,
+                                top: 0,
+                                right: 30,
+                                bottom: ghost_height,
+                            },
+                            if folder.pinned { COLOR_ACCENT } else { COLOR_MUTED },
+                        );
+                        draw_text(
+                            mem_dc,
+                            &self.fonts.body,
+                            &folder.name,
+                            RECT {
+                                left: 36,
+                                top: 0,
+                                right: ghost_width - 8,
+                                bottom: ghost_height,
+                            },
+                            COLOR_MUTED,
+                        );
+                    }
+                }
+            }
+
+            SelectObject(mem_dc, old);
+            let _ = DeleteDC(mem_dc);
+            Gdi::ReleaseDC(None, hdc_screen);
+
+            *self.drag_ghost.borrow_mut() = Some(DragGhost {
+                handle: bitmap,
+                width: ghost_width,
+                height: ghost_height,
+            });
+        }
     }
 
     fn toggle_sidebar(&mut self) {
@@ -3907,6 +4509,30 @@ extern "system" fn window_proc(hwnd: HWND, msg: u32, w_param: WPARAM, l_param: L
             unsafe { WindowsAndMessaging::DefWindowProcW(hwnd, msg, w_param, l_param) }
         }
         WM_CHAR => {
+            let mut handled = false;
+            with_app(hwnd, |app| {
+                if app.renaming_folder_id.is_some() {
+                    let ch = w_param.0 as u32;
+                    if ch == 13 {
+                        app.confirm_rename();
+                        handled = true;
+                    } else if ch == 27 {
+                        app.cancel_rename();
+                        handled = true;
+                    } else if ch == 8 {
+                        app.rename_buffer.pop();
+                        app.refresh();
+                        handled = true;
+                    } else if ch >= 32 && ch < 127 {
+                        app.rename_buffer.push(ch as u8 as char);
+                        app.refresh();
+                        handled = true;
+                    }
+                }
+            });
+            if handled {
+                return LRESULT(0);
+            }
             if w_param.0 as u32 == VK_RETURN.0 as u32 {
                 with_app(hwnd, |app| app.navigate_active_from_address());
                 return LRESULT(0);
@@ -3914,6 +4540,22 @@ extern "system" fn window_proc(hwnd: HWND, msg: u32, w_param: WPARAM, l_param: L
             unsafe { WindowsAndMessaging::DefWindowProcW(hwnd, msg, w_param, l_param) }
         }
         WM_KEYDOWN => {
+            let mut handled = false;
+            with_app(hwnd, |app| {
+                if app.renaming_folder_id.is_some() {
+                    let key = w_param.0 as u32;
+                    if key == 13 {
+                        app.confirm_rename();
+                        handled = true;
+                    } else if key == 27 {
+                        app.cancel_rename();
+                        handled = true;
+                    }
+                }
+            });
+            if handled {
+                return LRESULT(0);
+            }
             handle_keydown(hwnd, w_param);
             unsafe { WindowsAndMessaging::DefWindowProcW(hwnd, msg, w_param, l_param) }
         }
