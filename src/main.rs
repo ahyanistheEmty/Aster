@@ -547,6 +547,10 @@ impl App {
         activate: bool,
         title: Option<String>,
     ) -> AppResult<()> {
+        // Snapshot all direct children BEFORE creating the WebView2 controller
+        // so we can reliably identify the new child window it creates.
+        let children_before = collect_direct_children(self.hwnd);
+
         let controller = create_webview_controller(&self.environment, self.hwnd)?;
         let webview = unsafe { controller.CoreWebView2()? };
         configure_webview(&webview)?;
@@ -562,7 +566,11 @@ impl App {
             controller.SetIsVisible(false)?;
         }
 
-        let child_hwnd = find_webview_child(self.hwnd, &[self.address_hwnd, self.command_hwnd]);
+        // Find the new child window that was created by this controller
+        let child_hwnd = collect_direct_children(self.hwnd)
+            .into_iter()
+            .find(|h| !children_before.contains(h))
+            .unwrap_or_default();
 
         self.tabs.push(Tab {
             id,
@@ -3886,13 +3894,18 @@ impl App {
     }
 
     fn toggle_sidebar(&mut self) {
-        match self.sidebar_mode {
-            SidebarMode::Hidden => {
-                self.sidebar_expand_mode = SidebarMode::Pushed;
-                self.set_sidebar_mode(SidebarMode::Pushed);
+        if self.sidebar_mode == SidebarMode::Pushed || self.sidebar_expand_mode == SidebarMode::Pushed {
+            self.set_sidebar_mode(SidebarMode::Hidden);
+        } else if self.sidebar_mode == SidebarMode::Overlay || self.sidebar_expand_mode == SidebarMode::Overlay {
+            self.sidebar_expand_mode = SidebarMode::Pushed;
+            if !self.animating_sidebar {
+                self.sidebar_mode = SidebarMode::Pushed;
             }
-            SidebarMode::Pushed => self.set_sidebar_mode(SidebarMode::Hidden),
-            SidebarMode::Overlay => self.set_sidebar_mode(SidebarMode::Hidden),
+            self.layout();
+            self.refresh();
+        } else {
+            self.sidebar_expand_mode = SidebarMode::Pushed;
+            self.set_sidebar_mode(SidebarMode::Pushed);
         }
     }
 
@@ -5296,17 +5309,16 @@ fn client_rect(hwnd: HWND) -> RECT {
     rect
 }
 
-fn find_webview_child(parent: HWND, excluded: &[HWND]) -> HWND {
+fn collect_direct_children(parent: HWND) -> Vec<HWND> {
+    let mut children = Vec::new();
     unsafe {
         let mut child = GetTopWindow(Some(parent)).unwrap_or_default();
         while !child.is_invalid() {
-            if !excluded.iter().any(|hwnd| *hwnd == child) {
-                return child;
-            }
+            children.push(child);
             child = GetWindow(child, GW_HWNDNEXT).unwrap_or_default();
         }
-        HWND::default()
     }
+    children
 }
 
 fn set_process_dpi_awareness() {
