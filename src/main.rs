@@ -663,6 +663,7 @@ impl App {
             self.layout();
             self.refresh();
             self.save_state();
+            self.ensure_hover_detect_timer();
         }
     }
 
@@ -966,6 +967,13 @@ impl App {
                         active_workspace = id;
                     }
                 }
+                "active_tab" if parts.len() >= 3 => {
+                    if let (Ok(workspace_id), Ok(tab_id)) =
+                        (parts[1].parse::<usize>(), parts[2].parse::<usize>())
+                    {
+                        self.workspace_active_tabs.push((workspace_id, tab_id));
+                    }
+                }
                 _ => {}
             }
         }
@@ -1039,6 +1047,9 @@ impl App {
         }
         let mut lines = Vec::new();
         lines.push(format!("active_workspace\t{}", self.active_workspace));
+        for (workspace_id, active_tab_id) in &self.workspace_active_tabs {
+            lines.push(format!("active_tab\t{}\t{}", workspace_id, active_tab_id));
+        }
         for workspace in &self.workspaces {
             lines.push(format!(
                 "workspace\t{}\t{}",
@@ -1404,6 +1415,21 @@ impl App {
         }
         self.save_state();
         self.refresh();
+        self.ensure_hover_detect_timer();
+    }
+
+    fn ensure_hover_detect_timer(&mut self) {
+        if self.sidebar_mode == SidebarMode::Hidden && !self.animating_sidebar {
+            unsafe {
+                let _ = WindowsAndMessaging::KillTimer(Some(self.hwnd), HOVER_DETECT_TIMER_ID);
+                let _ = WindowsAndMessaging::SetTimer(
+                    Some(self.hwnd),
+                    HOVER_DETECT_TIMER_ID,
+                    100,
+                    None,
+                );
+            }
+        }
     }
 
     fn close_tab(&mut self, index: usize) {
@@ -1441,6 +1467,7 @@ impl App {
         } else {
             self.save_state();
             self.refresh();
+            self.ensure_hover_detect_timer();
         }
     }
 
@@ -3053,7 +3080,7 @@ impl App {
                             self.toggle_tab_mute(index);
                         } else if x >= row.right - 34 {
                             self.close_tab(index);
-                        } else {
+                        } else if index != self.active {
                             self.switch_to(index);
                         }
                     }
@@ -3432,6 +3459,10 @@ impl App {
                 }
                 self.create_drag_ghost();
             }
+        }
+
+        if self.sidebar_mode == SidebarMode::Hidden && !self.animating_sidebar {
+            self.ensure_hover_detect_timer();
         }
 
         let old_close = self.hover_close;
@@ -3900,14 +3931,7 @@ if x < HOVER_ZONE && self.sidebar_mode == SidebarMode::Hidden && self.sidebar_ta
                 self.sidebar_expand_mode = SidebarMode::Hidden;
                 self.hovering_sidebar = false;
                 self.clear_webview_clipping();
-                unsafe {
-                    let _ = WindowsAndMessaging::SetTimer(
-                        Some(self.hwnd),
-                        HOVER_DETECT_TIMER_ID,
-                        100,
-                        None,
-                    );
-                }
+                self.ensure_hover_detect_timer();
             } else if self.sidebar_target >= SIDEBAR_EXPANDED {
                 self.sidebar_mode = self.sidebar_expand_mode;
                 if self.sidebar_mode == SidebarMode::Overlay {
@@ -3952,12 +3976,15 @@ if x < HOVER_ZONE && self.sidebar_mode == SidebarMode::Hidden && self.sidebar_ta
             }
             return;
         }
+        if self.animating_sidebar {
+            return;
+        }
         unsafe {
             let mut pt = POINT::default();
             if GetCursorPos(&mut pt).is_ok() {
                 if ScreenToClient(self.hwnd, &mut pt).as_bool() {
                     let sidebar_w = self.sidebar_width() as i32;
-                    if pt.x > sidebar_w + HOVER_ZONE || pt.x < 0 || pt.y < 0 {
+                    if pt.x > sidebar_w + HOVER_ZONE || pt.x < 0 || pt.y < 0 || pt.y > 10000 {
                         let _ =
                             WindowsAndMessaging::KillTimer(Some(self.hwnd), HOVER_LEAVE_TIMER_ID);
                         self.sidebar_expand_mode = SidebarMode::Hidden;
