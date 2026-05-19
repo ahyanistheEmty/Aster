@@ -3420,16 +3420,15 @@ impl App {
                 },
                 COLOR_ACCENT,
             );
-            fill_round_rect(
+            fill_rect(
                 hdc,
                 RECT {
-                    left: rect.left + 12,
+                    left: 22,
                     top: rect.top + 28,
-                    right: rect.right - 12,
+                    right: self.sidebar_width() - 18,
                     bottom: rect.top + 29,
                 },
-                0x242424,
-                1,
+                0x2a2a2a,
             );
         }
     }
