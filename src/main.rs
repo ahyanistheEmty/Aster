@@ -1485,6 +1485,23 @@ impl App {
                 })),
                 &mut token,
             )?;
+
+            let hwnd = self.hwnd;
+            let mut token = 0;
+            webview.add_ContainsFullScreenElementChanged(
+                &ContainsFullScreenElementChangedEventHandler::create(Box::new(move |sender, _args| {
+                    if let Some(sender) = sender {
+                        let mut contains = BOOL::from(false);
+                        if sender.ContainsFullScreenElement(&mut contains).is_ok() {
+                            with_app(hwnd, |app| {
+                                app.set_fullscreen_state(contains.as_bool());
+                            });
+                        }
+                    }
+                    Ok(())
+                })),
+                &mut token,
+            )?;
         }
 
         if index_hint == usize::MAX {
@@ -2594,7 +2611,7 @@ impl App {
         let rect = client_rect(self.hwnd);
         unsafe {
             let flags = WindowsAndMessaging::SWP_NOZORDER;
-            if self.command_open {
+            if self.command_open && !self.fullscreen {
                 let popup = self.command_popup_rect();
                 let input = self.command_input_rect();
                 let _ = WindowsAndMessaging::SetWindowPos(
@@ -2637,50 +2654,59 @@ impl App {
 
         let sidebar_width = self.sidebar_width();
         let pushed_left = sidebar_width;
-        let bounds = match self.sidebar_mode {
-            SidebarMode::Hidden => {
-                if self.sidebar_target >= SIDEBAR_EXPANDED {
-                    match self.sidebar_expand_mode {
-                        SidebarMode::Overlay => RECT {
+        let bounds = if self.fullscreen {
+            RECT {
+                left: 0,
+                top: 0,
+                right: rect.right,
+                bottom: rect.bottom,
+            }
+        } else {
+            match self.sidebar_mode {
+                SidebarMode::Hidden => {
+                    if self.sidebar_target >= SIDEBAR_EXPANDED {
+                        match self.sidebar_expand_mode {
+                            SidebarMode::Overlay => RECT {
+                                left: 0,
+                                top: TOPBAR_HEIGHT,
+                                right: rect.right,
+                                bottom: rect.bottom,
+                            },
+                            SidebarMode::Pushed => RECT {
+                                left: pushed_left,
+                                top: TOPBAR_HEIGHT,
+                                right: rect.right,
+                                bottom: rect.bottom,
+                            },
+                            _ => RECT {
+                                left: HOVER_ZONE,
+                                top: TOPBAR_HEIGHT,
+                                right: rect.right,
+                                bottom: rect.bottom,
+                            },
+                        }
+                    } else {
+                        RECT {
                             left: 0,
                             top: TOPBAR_HEIGHT,
                             right: rect.right,
                             bottom: rect.bottom,
-                        },
-                        SidebarMode::Pushed => RECT {
-                            left: pushed_left,
-                            top: TOPBAR_HEIGHT,
-                            right: rect.right,
-                            bottom: rect.bottom,
-                        },
-                        _ => RECT {
-                            left: HOVER_ZONE,
-                            top: TOPBAR_HEIGHT,
-                            right: rect.right,
-                            bottom: rect.bottom,
-                        },
-                    }
-                } else {
-                    RECT {
-                        left: 0,
-                        top: TOPBAR_HEIGHT,
-                        right: rect.right,
-                        bottom: rect.bottom,
+                        }
                     }
                 }
+                SidebarMode::Overlay => RECT {
+                    left: 0,
+                    top: TOPBAR_HEIGHT,
+                    right: rect.right,
+                    bottom: rect.bottom,
+                },
+                SidebarMode::Pushed => RECT {
+                    left: pushed_left,
+                    top: TOPBAR_HEIGHT,
+                    right: rect.right,
+                    bottom: rect.bottom,
+                },
             }
-            SidebarMode::Overlay => RECT {
-                left: 0,
-                top: TOPBAR_HEIGHT,
-                right: rect.right,
-                bottom: rect.bottom,
-            },
-            SidebarMode::Pushed => RECT {
-                left: pushed_left,
-                top: TOPBAR_HEIGHT,
-                right: rect.right,
-                bottom: rect.bottom,
-            },
         };
         let last = self.last_bounds_rect.get();
         let size_changed = bounds.left != last.left
@@ -2688,10 +2714,11 @@ impl App {
             || bounds.top != last.top
             || bounds.bottom != last.bottom;
 
-        let needs_clipping = self.sidebar_mode == SidebarMode::Overlay
-            || (self.sidebar_mode == SidebarMode::Hidden
-                && self.sidebar_expand_mode == SidebarMode::Overlay
-                && self.sidebar_target >= SIDEBAR_EXPANDED);
+        let needs_clipping = !self.fullscreen
+            && (self.sidebar_mode == SidebarMode::Overlay
+                || (self.sidebar_mode == SidebarMode::Hidden
+                    && self.sidebar_expand_mode == SidebarMode::Overlay
+                    && self.sidebar_target >= SIDEBAR_EXPANDED));
         let clip_changed = needs_clipping
             && sidebar_width > 0
             && ((sidebar_width as f32 - self.last_clip_width.get()).abs() > 1.0 || size_changed);
@@ -2740,11 +2767,15 @@ impl App {
 
     fn paint(&self, hdc: HDC) {
         let rect = client_rect(self.hwnd);
+        unsafe {
+            let _ = FillRect(hdc, &rect, self.brushes.black);
+        }
+        if self.fullscreen {
+            return;
+        }
         let sidebar_width = self.sidebar_width();
         let is_overlay = self.sidebar_mode == SidebarMode::Overlay;
         unsafe {
-            let _ = FillRect(hdc, &rect, self.brushes.black);
-
             let topbar = RECT {
                 left: 0,
                 top: 0,
@@ -4933,9 +4964,12 @@ impl App {
         self.refresh();
     }
 
-    fn toggle_fullscreen(&mut self) {
+    fn set_fullscreen_state(&mut self, enable: bool) {
+        if self.fullscreen == enable {
+            return;
+        }
         unsafe {
-            if !self.fullscreen {
+            if enable {
                 let _ = WindowsAndMessaging::GetWindowRect(self.hwnd, &mut self.saved_rect);
                 self.saved_style = WindowsAndMessaging::GetWindowLongPtrW(self.hwnd, GWL_STYLE);
 
@@ -4977,6 +5011,11 @@ impl App {
         }
         self.layout();
         self.refresh();
+    }
+
+    fn toggle_fullscreen(&mut self) {
+        let next = !self.fullscreen;
+        self.set_fullscreen_state(next);
     }
 
     fn refresh(&self) {
