@@ -5999,8 +5999,13 @@ fn handle_keydown(hwnd: HWND, w_param: WPARAM) {
             0x51 if ctrl => {
                 app.switch_tab_below();
             }
+            0x52 if ctrl => {
+                app.reload();
+            }
             0x25 if alt => app.go_back(),
             0x27 if alt => app.go_forward(),
+            0x41 if alt => app.go_back(),
+            0x44 if alt => app.go_forward(),
             code if code == VK_F5.0 as u32 => app.reload(),
             code if code == VK_F11.0 as u32 => app.toggle_fullscreen(),
             _ => {}
@@ -6012,8 +6017,8 @@ fn is_aster_shortcut(key: u32) -> bool {
     unsafe {
         let ctrl = (GetKeyState(VK_CONTROL.0 as i32) as u16 & 0x8000) != 0;
         let alt = (GetKeyState(VK_MENU.0 as i32) as u16 & 0x8000) != 0;
-        matches!(key, 0x4C | 0x53 | 0x54 | 0x57 | 0x51 if ctrl)
-            || matches!(key, 0x25 | 0x27 if alt)
+        matches!(key, 0x4C | 0x53 | 0x54 | 0x57 | 0x51 | 0x52 if ctrl)
+            || matches!(key, 0x25 | 0x27 | 0x41 | 0x44 if alt)
             || key == VK_F5.0 as u32
             || key == VK_F11.0 as u32
     }
