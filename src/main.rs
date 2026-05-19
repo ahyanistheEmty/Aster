@@ -39,7 +39,7 @@ use windows::{
             HiDpi,
             Input::KeyboardAndMouse::{
                 GetKeyState, ReleaseCapture, SetCapture, SetFocus, VK_CONTROL, VK_ESCAPE, VK_F11,
-                VK_F5, VK_MENU, VK_RETURN,
+                VK_F5, VK_MENU, VK_RETURN, VK_SHIFT,
             },
             WindowsAndMessaging::{
                 self, CreateIconIndirect, GetCursorPos, GetTopWindow, GetWindow, CREATESTRUCTW,
@@ -220,6 +220,13 @@ struct Tab {
     child_hwnd: HWND,
     unloaded: bool,
     is_loading: bool,
+}
+
+struct ClosedTab {
+    url: String,
+    title: String,
+    workspace_id: usize,
+    folder_id: Option<usize>,
 }
 
 #[derive(Clone)]
@@ -484,6 +491,7 @@ struct App {
     is_deleting: bool,
     last_address_text: String,
     has_typed: bool,
+    closed_tabs: Vec<ClosedTab>,
 }
 
 struct DragGhost {
@@ -581,6 +589,7 @@ impl App {
             drop_target: Some(DropTarget::None),
             background_cache: RefCell::new(None),
             visited_sites: Vec::new(),
+            closed_tabs: Vec::new(),
             command_open: false,
             command_mode: CommandMode::Navigate,
             renaming_folder_id: None,
@@ -1723,6 +1732,20 @@ impl App {
         if self.tabs.is_empty() || index >= self.tabs.len() {
             return;
         }
+
+        if !self.tabs[index].pinned {
+            let tab = &self.tabs[index];
+            self.closed_tabs.push(ClosedTab {
+                url: tab.url.clone(),
+                title: tab.title.clone(),
+                workspace_id: tab.workspace_id,
+                folder_id: tab.folder_id,
+            });
+            if self.closed_tabs.len() > 100 {
+                self.closed_tabs.remove(0);
+            }
+        }
+
         let workspace_id = self.tabs[index].workspace_id;
 
         if self.tabs[index].pinned {
@@ -1808,6 +1831,29 @@ impl App {
         }
         self.tabs[index].pinned = false;
         self.close_tab(index);
+    }
+
+    fn reopen_closed_tab(&mut self) {
+        if let Some(closed) = self.closed_tabs.pop() {
+            let mut target_workspace = closed.workspace_id;
+            if !self.workspaces.iter().any(|w| w.id == target_workspace) {
+                target_workspace = self.active_workspace;
+            }
+            let mut target_folder = closed.folder_id;
+            if let Some(f_id) = target_folder {
+                if !self.folders.iter().any(|f| f.id == f_id) {
+                    target_folder = None;
+                }
+            }
+            let _ = self.create_tab_in_workspace(
+                &closed.url,
+                target_workspace,
+                target_folder,
+                false,
+                true,
+                Some(closed.title),
+            );
+        }
     }
 
     fn navigate_active_from_address(&mut self) {
@@ -5985,7 +6031,11 @@ fn handle_keydown(hwnd: HWND, w_param: WPARAM) {
     unsafe {
         let ctrl = (GetKeyState(VK_CONTROL.0 as i32) as u16 & 0x8000) != 0;
         let alt = (GetKeyState(VK_MENU.0 as i32) as u16 & 0x8000) != 0;
+        let shift = (GetKeyState(VK_SHIFT.0 as i32) as u16 & 0x8000) != 0;
         with_app(hwnd, |app| match key {
+            0x5A if ctrl && shift => {
+                app.reopen_closed_tab();
+            }
             0x4C if ctrl => {
                 app.open_command(CommandMode::Navigate);
             }
@@ -6022,7 +6072,9 @@ fn is_aster_shortcut(key: u32) -> bool {
     unsafe {
         let ctrl = (GetKeyState(VK_CONTROL.0 as i32) as u16 & 0x8000) != 0;
         let alt = (GetKeyState(VK_MENU.0 as i32) as u16 & 0x8000) != 0;
+        let shift = (GetKeyState(VK_SHIFT.0 as i32) as u16 & 0x8000) != 0;
         matches!(key, 0x4C | 0x53 | 0x54 | 0x57 | 0x52 if ctrl)
+            || (key == 0x5A && ctrl && shift)
             || matches!(key, 0x25 | 0x27 | 0x41 | 0x44 | 0x57 | 0x53 if alt)
             || key == VK_F5.0 as u32
             || key == VK_F11.0 as u32
