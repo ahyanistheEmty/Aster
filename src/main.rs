@@ -937,7 +937,7 @@ impl App {
         let has_pinned = self.folders.iter().any(|f| f.workspace_id == self.active_workspace && f.pinned)
             || self.tabs.iter().any(|t| t.workspace_id == self.active_workspace && t.pinned);
         let mut y = if has_pinned {
-            SIDEBAR_ROWS_TOP
+            SIDEBAR_ROWS_TOP + 28
         } else {
             SIDEBAR_ROWS_TOP + 72
         };
@@ -3031,6 +3031,19 @@ impl App {
                             let _ = DeleteObject(HGDIOBJ(large_pin_font.0));
                         }
                     }
+                } else {
+                    draw_icon_glyph(
+                        hdc,
+                        &self.fonts.toolbar_icon,
+                        glyph(0xE718).as_str(),
+                        RECT {
+                            left: 22,
+                            top: SIDEBAR_ROWS_TOP + 5,
+                            right: 22 + 20,
+                            bottom: SIDEBAR_ROWS_TOP + 5 + 18,
+                        },
+                        COLOR_ACCENT,
+                    );
                 }
                 for (row, row_rect) in self.sidebar_row_rects() {
                     match row {
