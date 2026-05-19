@@ -4889,7 +4889,6 @@ impl App {
         };
         self.animating_sidebar = true;
         unsafe {
-            let _ = WindowsAndMessaging::KillTimer(Some(self.hwnd), HOVER_LEAVE_TIMER_ID);
             if mode != SidebarMode::Hidden && self.topbar_mode != SidebarMode::Hidden {
                 let _ = WindowsAndMessaging::KillTimer(Some(self.hwnd), HOVER_DETECT_TIMER_ID);
             }
@@ -4904,7 +4903,6 @@ impl App {
         };
         self.animating_topbar = true;
         unsafe {
-            let _ = WindowsAndMessaging::KillTimer(Some(self.hwnd), HOVER_LEAVE_TIMER_ID);
             if mode != SidebarMode::Hidden && self.sidebar_mode != SidebarMode::Hidden {
                 let _ = WindowsAndMessaging::KillTimer(Some(self.hwnd), HOVER_DETECT_TIMER_ID);
             }
