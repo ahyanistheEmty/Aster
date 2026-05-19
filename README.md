@@ -8,7 +8,7 @@
 
 ## 🚀 Quick Installation
 
-For users who want to install Aster automatically, open PowerShell and run this exact one-liner:
+For users who want to install or update Aster automatically, open PowerShell and run this exact one-liner:
 
 ```powershell
 irm https://raw.githubusercontent.com/ahyanistheEmty/Aster/main/install.ps1 | iex
