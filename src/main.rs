@@ -3102,9 +3102,23 @@ impl App {
                     right: row.left + 30,
                     bottom: row.top + 24,
                 };
+                let mut favicon_drawn = false;
                 if let Some(index) = tab_index.and_then(|index| self.tabs.get(index)) {
                     draw_tab_favicon(hdc, &self.fonts.small, favicon, index);
+                    favicon_drawn = true;
                 } else {
+                    let host = display_host(&url);
+                    if !host.is_empty() {
+                        if let Some(matching_tab) = self.tabs.iter().find(|t| {
+                            t.favicon_bitmap.is_some() && display_host(&t.url) == host
+                        }) {
+                            draw_tab_favicon(hdc, &self.fonts.small, favicon, matching_tab);
+                            favicon_drawn = true;
+                        }
+                    }
+                }
+
+                if !favicon_drawn {
                     let is_search = extract_search_query(&url).is_some();
                     let icon_glyph = if is_search {
                         glyph(0xE721)

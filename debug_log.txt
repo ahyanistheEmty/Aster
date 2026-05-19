@@ -1,4 +1,0 @@
-[1779175131] open_command mode: Navigate
-[1779175131] try_autofill raw: "https://github.com/ahyanistheEmty/Aster", has_typed: false, is_deleting: false
-[1779175133] KEYDOWN non-typing key: 0x9
-[1779175133] try_autofill raw: "https://github.com/ahyanistheEmty/Aster", has_typed: false, is_deleting: false
