@@ -2455,7 +2455,7 @@ impl App {
     fn command_popup_rect(&self) -> RECT {
         let rect = client_rect(self.hwnd);
         let width = (rect.right - rect.left - 420).clamp(520, 800);
-        let height = 228;
+        let height = 304;
         let center = (rect.right + rect.left) / 2;
         let top = ((rect.bottom - rect.top) / 2 - height / 2).max(TOPBAR_HEIGHT + 42);
         RECT {
@@ -3278,7 +3278,7 @@ impl App {
             let suggestions = self.command_suggestions();
             let total_rows = suggestions.len();
             for (i, (tab_index, title, url)) in
-                suggestions.into_iter().skip(self.command_scroll_offset).take(5).enumerate()
+                suggestions.into_iter().skip(self.command_scroll_offset).take(6).enumerate()
             {
                 let row_index = i;
                 let mut row = self.command_tab_row_rect(row_index);
@@ -3374,11 +3374,11 @@ impl App {
                 );
             }
 
-            if total_rows > 5 {
-                let visible_ratio = 5.0 / total_rows as f32;
+            if total_rows > 6 {
+                let visible_ratio = 6.0 / total_rows as f32;
                 let scroll_ratio = self.command_scroll_offset as f32 / total_rows as f32;
-                let max_rows = 5;
-                let track_height = (max_rows * 40) as f32;
+                let max_rows = 6;
+                let track_height = (max_rows * 38) as f32;
                 let track_top = 64.0;
                 
                 let thumb_height = (track_height * visible_ratio).max(20.0);
@@ -5551,8 +5551,8 @@ unsafe extern "system" fn address_bar_proc(
                         app.command_selected_index = Some(next);
                         if next < app.command_scroll_offset {
                             app.command_scroll_offset = next;
-                        } else if next >= app.command_scroll_offset + 5 {
-                            app.command_scroll_offset = next - 4;
+                        } else if next >= app.command_scroll_offset + 6 {
+                            app.command_scroll_offset = next - 5;
                         }
                         unsafe {
                             let _ = InvalidateRect(Some(app.command_hwnd), None, false);
@@ -5580,9 +5580,9 @@ unsafe extern "system" fn address_bar_proc(
         if let Ok(parent) = WindowsAndMessaging::GetParent(hwnd) {
             with_app(parent, |app| {
                 let total = app.command_suggestions().len();
-                if total > 5 {
+                if total > 6 {
                     if delta < 0 {
-                        app.command_scroll_offset = (app.command_scroll_offset + 1).min(total - 5);
+                        app.command_scroll_offset = (app.command_scroll_offset + 1).min(total - 6);
                     } else {
                         app.command_scroll_offset = app.command_scroll_offset.saturating_sub(1);
                     }
@@ -5633,7 +5633,7 @@ unsafe extern "system" fn command_popup_proc(
             if let Ok(parent) = WindowsAndMessaging::GetParent(hwnd) {
                 with_app(parent, |app| {
                     for (row_index, (tab_index, _title, url)) in
-                        app.command_suggestions().into_iter().take(5).enumerate()
+                        app.command_suggestions().into_iter().skip(app.command_scroll_offset).take(6).enumerate()
                     {
                         let mut row = app.command_tab_row_rect(row_index);
                         let popup = app.command_popup_rect();
@@ -5677,9 +5677,9 @@ unsafe extern "system" fn command_popup_proc(
             if let Ok(parent) = WindowsAndMessaging::GetParent(hwnd) {
                 with_app(parent, |app| {
                     let total = app.command_suggestions().len();
-                    if total > 5 {
+                    if total > 6 {
                         if delta < 0 {
-                            app.command_scroll_offset = (app.command_scroll_offset + 1).min(total - 5);
+                            app.command_scroll_offset = (app.command_scroll_offset + 1).min(total - 6);
                         } else {
                             app.command_scroll_offset = app.command_scroll_offset.saturating_sub(1);
                         }
