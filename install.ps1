@@ -1,23 +1,31 @@
 # Aster Browser Automated Installer
-# Automatically clones, builds, and installs Aster to %LOCALAPPDATA%\Programs\Aster
+# Downloads pre-compiled Aster.exe directly from GitHub
+# Installs to %LOCALAPPDATA%\Programs\Aster (or user custom directory)
 # Data is saved to %APPDATA%\Aster
 
 $ErrorActionPreference = "Stop"
 
+# Define raw GitHub download URL
+$binaryUrl = "https://raw.githubusercontent.com/ahyanistheEmty/Aster/main/releases/Aster.exe"
+
+# Create a temporary directory for initial download
 $tempDir = Join-Path $env:TEMP "AsterInstall_$([guid]::NewGuid().ToString().Substring(0,8))"
-if (Test-Path $tempDir) { Remove-Item -Recurse -Force $tempDir }
+if (!(Test-Path $tempDir)) {
+    New-Item -ItemType Directory -Path $tempDir | Out-Null
+}
 
-Write-Host "📥 Cloning Aster from GitHub..." -ForegroundColor Cyan
-git clone "https://github.com/ahyanistheEmty/Aster" $tempDir
+$tempExePath = Join-Path $tempDir "Aster.exe"
 
-# Save original location
-$originalLocation = Get-Location
-
-# Move into the cloned repo
-Set-Location $tempDir
-
-Write-Host "🚀 Building Aster in Release mode..." -ForegroundColor Cyan
-cargo build --release
+Write-Host "📥 Downloading Aster Browser..." -ForegroundColor Cyan
+try {
+    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+    Invoke-WebRequest -Uri $binaryUrl -OutFile $tempExePath -UseBasicParsing
+} catch {
+    Write-Host "❌ Failed to download Aster.exe. Please check your internet connection." -ForegroundColor Red
+    Write-Host $_.Exception.Message -ForegroundColor Red
+    Remove-Item -Recurse -Force $tempDir -ErrorAction SilentlyContinue
+    exit 1
+}
 
 # Determine installation directory (Local AppData Programs folder)
 $localAppData = [System.Environment]::GetFolderPath('LocalApplicationData')
@@ -38,34 +46,43 @@ if (!(Test-Path $installDir)) {
     New-Item -ItemType Directory -Force -Path $installDir | Out-Null
 }
 
-$exeSource = Join-Path $tempDir "target\release\Aster.exe"
 $exeDest = Join-Path $installDir "Aster.exe"
 
-Write-Host "📦 Copying executable to $installDir..."
-Copy-Item -Path $exeSource -Destination $exeDest -Force
+Write-Host "📦 Installing Aster..." -ForegroundColor Cyan
+try {
+    Copy-Item -Path $tempExePath -Destination $exeDest -Force
+} catch {
+    Write-Host "❌ Failed to install Aster.exe. If the browser is open, please close it and try again." -ForegroundColor Red
+    Write-Host $_.Exception.Message -ForegroundColor Red
+    Remove-Item -Recurse -Force $tempDir -ErrorAction SilentlyContinue
+    exit 1
+}
 
-Write-Host "🔗 Creating shortcuts..."
-$WshShell = New-Object -comObject WScript.Shell
+Write-Host "🔗 Creating shortcuts..." -ForegroundColor Cyan
+try {
+    $WshShell = New-Object -comObject WScript.Shell
 
-# Desktop Shortcut
-$desktopPath = [System.Environment]::GetFolderPath('Desktop')
-$desktopShortcut = $WshShell.CreateShortcut((Join-Path $desktopPath "Aster.lnk"))
-$desktopShortcut.TargetPath = $exeDest
-$desktopShortcut.WorkingDirectory = $installDir
-$desktopShortcut.Description = "Aster Browser"
-$desktopShortcut.Save()
+    # Desktop Shortcut
+    $desktopPath = [System.Environment]::GetFolderPath('Desktop')
+    $desktopShortcut = $WshShell.CreateShortcut((Join-Path $desktopPath "Aster.lnk"))
+    $desktopShortcut.TargetPath = $exeDest
+    $desktopShortcut.WorkingDirectory = $installDir
+    $desktopShortcut.Description = "Aster Browser"
+    $desktopShortcut.Save()
 
-# Start Menu Shortcut
-$startMenuPrograms = [System.Environment]::GetFolderPath('Programs')
-$startMenuShortcut = $WshShell.CreateShortcut((Join-Path $startMenuPrograms "Aster.lnk"))
-$startMenuShortcut.TargetPath = $exeDest
-$startMenuShortcut.WorkingDirectory = $installDir
-$startMenuShortcut.Description = "Aster Browser"
-$startMenuShortcut.Save()
+    # Start Menu Shortcut
+    $startMenuPrograms = [System.Environment]::GetFolderPath('Programs')
+    $startMenuShortcut = $WshShell.CreateShortcut((Join-Path $startMenuPrograms "Aster.lnk"))
+    $startMenuShortcut.TargetPath = $exeDest
+    $startMenuShortcut.WorkingDirectory = $installDir
+    $startMenuShortcut.Description = "Aster Browser"
+    $startMenuShortcut.Save()
+} catch {
+    Write-Host "⚠️ Warning: Failed to create shortcuts, but installation completed." -ForegroundColor Yellow
+}
 
 Write-Host "🧹 Cleaning up temporary files..."
-Set-Location $originalLocation
-Remove-Item -Recurse -Force $tempDir
+Remove-Item -Recurse -Force $tempDir -ErrorAction SilentlyContinue
 
 Write-Host ""
 Write-Host "✅ Installation Complete!" -ForegroundColor Green
