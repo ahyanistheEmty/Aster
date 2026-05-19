@@ -3483,60 +3483,31 @@ impl App {
                 },
                 COLOR_MUTED,
             );
-            if folder.pinned {
-                draw_icon_glyph(
+            draw_icon_glyph(
+                hdc,
+                &self.fonts.toolbar_icon,
+                glyph(0xE8B7).as_str(),
+                RECT {
+                    left: item.left + 28,
+                    top: item.top,
+                    right: item.left + 50,
+                    bottom: item.bottom,
+                },
+                COLOR_MUTED,
+            );
+            if !is_renaming {
+                draw_text(
                     hdc,
-                    &self.fonts.toolbar_icon,
-                    glyph(0xE718).as_str(),
+                    &self.fonts.body,
+                    &display_name,
                     RECT {
-                        left: item.left + 28,
+                        left: item.left + 56,
                         top: item.top,
-                        right: item.left + 50,
-                        bottom: item.bottom,
-                    },
-                    COLOR_ACCENT,
-                );
-                if !is_renaming {
-                    draw_text(
-                        hdc,
-                        &self.fonts.body,
-                        &display_name,
-                        RECT {
-                            left: item.left + 56,
-                            top: item.top,
-                            right: item.right - 8,
-                            bottom: item.bottom,
-                        },
-                        COLOR_MUTED,
-                    );
-                }
-            } else {
-                draw_icon_glyph(
-                    hdc,
-                    &self.fonts.toolbar_icon,
-                    glyph(0xE8B7).as_str(),
-                    RECT {
-                        left: item.left + 28,
-                        top: item.top,
-                        right: item.left + 50,
+                        right: item.right - 8,
                         bottom: item.bottom,
                     },
                     COLOR_MUTED,
                 );
-                if !is_renaming {
-                    draw_text(
-                        hdc,
-                        &self.fonts.body,
-                        &display_name,
-                        RECT {
-                            left: item.left + 56,
-                            top: item.top,
-                            right: item.right - 8,
-                            bottom: item.bottom,
-                        },
-                        COLOR_MUTED,
-                    );
-                }
             }
         }
     }
@@ -3648,28 +3619,8 @@ impl App {
             if self.hover_tab == Some(index) || Some(index) == self.active_tab_index() {
                 fill_round_rect(hdc, item, 0x151515, 10);
             }
-            let mut text_left = item.left + 40;
-            let show_pin = tab.pinned && tab.folder_id.is_none();
-            if show_pin {
-                draw_icon_glyph(
-                    hdc,
-                    &self.fonts.toolbar_icon,
-                    glyph(0xE718).as_str(),
-                    RECT {
-                        left: item.left + 8,
-                        top: item.top,
-                        right: item.left + 28,
-                        bottom: item.bottom,
-                    },
-                    COLOR_ACCENT,
-                );
-                text_left = item.left + 62;
-            }
-            let favicon_left = if show_pin {
-                item.left + 34
-            } else {
-                item.left + 12
-            };
+            let text_left = item.left + 40;
+            let favicon_left = item.left + 12;
             let favicon = RECT {
                 left: favicon_left,
                 top: item.top + 11,
@@ -4715,21 +4666,7 @@ impl App {
             match drag.source {
                 DragSource::Tab(index) => {
                     if let Some(tab) = self.tabs.get(index) {
-                        if tab.pinned {
-                            draw_icon_glyph(
-                                mem_dc,
-                                &self.fonts.toolbar_icon,
-                                glyph(0xE718).as_str(),
-                                RECT {
-                                    left: 8,
-                                    top: 0,
-                                    right: 28,
-                                    bottom: ghost_height,
-                                },
-                                COLOR_ACCENT,
-                            );
-                        }
-                        let favicon_left = if tab.pinned { 34 } else { 12 };
+                        let favicon_left = 12;
                         let favicon = RECT {
                             left: favicon_left,
                             top: 11,
@@ -4742,7 +4679,7 @@ impl App {
                             &self.fonts.body,
                             &tab.title,
                             RECT {
-                                left: if tab.pinned { 62 } else { 40 },
+                                left: 40,
                                 top: 0,
                                 right: ghost_width - 8,
                                 bottom: ghost_height,
@@ -4753,22 +4690,17 @@ impl App {
                 }
                 DragSource::Folder(folder_id) => {
                     if let Some(folder) = self.folders.iter().find(|f| f.id == folder_id) {
-                        let folder_arrow = if folder.pinned {
-                            glyph(0xE718)
-                        } else {
-                            glyph(0xE8B7)
-                        };
                         draw_icon_glyph(
                             mem_dc,
                             &self.fonts.toolbar_icon,
-                            folder_arrow.as_str(),
+                            glyph(0xE8B7).as_str(),
                             RECT {
                                 left: 8,
                                 top: 0,
                                 right: 30,
                                 bottom: ghost_height,
                             },
-                            if folder.pinned { COLOR_ACCENT } else { COLOR_MUTED },
+                            COLOR_MUTED,
                         );
                         draw_text(
                             mem_dc,
