@@ -204,6 +204,7 @@ struct Tab {
     workspace_id: usize,
     folder_id: Option<usize>,
     pinned: bool,
+    pinned_url: Option<String>,
     title: String,
     url: String,
     favicon_uri: String,
@@ -644,6 +645,7 @@ impl App {
             workspace_id,
             folder_id,
             pinned,
+            pinned_url: if pinned { Some(url.to_string()) } else { None },
             title: "New Tab".to_string(),
             url: url.to_string(),
             favicon_uri: String::new(),
@@ -819,6 +821,7 @@ impl App {
         for tab in self.tabs.iter_mut() {
             if tab.folder_id == Some(folder_id) {
                 tab.pinned = pinned;
+                tab.pinned_url = if pinned { Some(tab.url.clone()) } else { None };
             }
         }
         let child_folder_ids: Vec<usize> = self.folders
@@ -1240,13 +1243,18 @@ impl App {
             if tab.url.trim().is_empty() {
                 continue;
             }
+            let url_to_save = if tab.pinned {
+                tab.pinned_url.as_ref().unwrap_or(&tab.url)
+            } else {
+                &tab.url
+            };
             lines.push(format!(
                 "tab\t{}\t{}\t{}\t{}\t{}\t{}",
                 tab.workspace_id,
                 tab.folder_id.map(|id| id.to_string()).unwrap_or_default(),
                 if tab.pinned { "1" } else { "0" },
                 escape_state(&tab.title),
-                escape_state(&tab.url),
+                escape_state(url_to_save),
                 serialize_history(&tab.history)
             ));
         }
@@ -1652,6 +1660,13 @@ impl App {
         if self.tabs[index].pinned {
             let tab = &mut self.tabs[index];
             tab.unloaded = true;
+            if let Some(pinned_url) = tab.pinned_url.clone() {
+                tab.url = pinned_url.clone();
+                let url_w = to_wide(&pinned_url);
+                unsafe {
+                    let _ = tab.webview.Navigate(PCWSTR(url_w.as_ptr()));
+                }
+            }
             unsafe {
                 let _ = tab.controller.SetIsVisible(false);
                 let _ = WindowsAndMessaging::ShowWindow(tab.child_hwnd, WindowsAndMessaging::SW_HIDE);
@@ -4038,12 +4053,14 @@ impl App {
                         MENU_TAB_PIN => {
                             if let Some(tab) = self.tabs.get_mut(index) {
                                 tab.pinned = true;
+                                tab.pinned_url = Some(tab.url.clone());
                                 tab.folder_id = None;
                             }
                         }
                         MENU_TAB_UNPIN => {
                             if let Some(tab) = self.tabs.get_mut(index) {
                                 tab.pinned = false;
+                                tab.pinned_url = None;
                             }
                         }
                         MENU_TAB_REMOVE_FOLDER => {
@@ -4350,6 +4367,7 @@ impl App {
                     Some(SidebarHit::PinnedSection) | Some(SidebarHit::WorkspaceHeader) => {
                         if let Some(tab) = self.tabs.get_mut(from_index) {
                             tab.pinned = true;
+                            tab.pinned_url = Some(tab.url.clone());
                             tab.folder_id = None;
                         }
                     }
@@ -4360,6 +4378,7 @@ impl App {
                             if let Some(tab) = self.tabs.get_mut(from_index) {
                                 tab.folder_id = Some(folder_id);
                                 tab.pinned = folder.pinned;
+                                tab.pinned_url = if folder.pinned { Some(tab.url.clone()) } else { None };
                             }
                         }
                     }
@@ -4376,6 +4395,7 @@ impl App {
                         let tab_id = self.tabs[from_index].id;
                         let mut tab = self.tabs.remove(from_index);
                         tab.pinned = target_pinned;
+                        tab.pinned_url = if target_pinned { Some(tab.url.clone()) } else { None };
                         tab.folder_id = target_folder;
                         let insert_at = self
                             .tabs
@@ -4391,6 +4411,7 @@ impl App {
                         if is_normal_fallback {
                             let mut tab = self.tabs.remove(from_index);
                             tab.pinned = false;
+                            tab.pinned_url = None;
                             tab.folder_id = None;
                             self.tabs.push(tab);
                         }
