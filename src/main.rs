@@ -6780,7 +6780,7 @@ fn render_aster_background_bitmap(width: i32, height: i32) -> Option<BackgroundB
     }
 
     let dot_step = (48.0 * scale).round().max(28.0) as i32;
-    let dot_radius = (0.9 * scale).max(0.7);
+    let dot_radius = (0.9 * scale).max(0.8);
     let mut y = (24.0 * scale) as i32;
     while y < height {
         let mut x = (24.0 * scale) as i32;
