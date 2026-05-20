@@ -4584,7 +4584,6 @@ impl App {
                 if from_index >= self.tabs.len() {
                     return;
                 }
-                let dragged_pinned = self.tabs[from_index].pinned;
                 let dragged_workspace = self.tabs[from_index].workspace_id;
 
                 match hit {
@@ -4614,9 +4613,6 @@ impl App {
                         if target_index == from_index {
                             return;
                         }
-                        if !dragged_pinned && self.tabs[target_index].pinned {
-                            return;
-                        }
                         let target_id = self.tabs[target_index].id;
                         let target_folder = self.tabs[target_index].folder_id;
                         let target_pinned = self.tabs[target_index].pinned;
@@ -4630,7 +4626,7 @@ impl App {
                             .iter()
                             .position(|candidate| candidate.id == target_id)
                             .unwrap_or_else(|| target_index.min(self.tabs.len()));
-                        self.tabs.insert(insert_at, tab);
+                        self.tabs.insert((insert_at + 1).min(self.tabs.len()), tab);
                         if let Some(new_active) = self.tabs.iter().position(|tab| tab.id == tab_id) {
                             self.active = new_active;
                         }
