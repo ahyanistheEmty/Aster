@@ -220,6 +220,7 @@ struct Tab {
     webview: ICoreWebView2,
     child_hwnd: HWND,
     unloaded: bool,
+    is_sleeping: bool,
     is_loading: bool,
 }
 
@@ -453,6 +454,9 @@ struct App {
     next_workspace_id: usize,
     next_folder_id: usize,
     workspace_active_tabs: Vec<(usize, usize)>,
+    sidebar_anim_progress: f32,
+    topbar_anim_progress: f32,
+    sidebar_scroll_offset: usize,
     loading_state: bool,
     fonts: UiFonts,
     brushes: UiBrushes,
@@ -568,6 +572,9 @@ impl App {
             next_workspace_id: 2,
             next_folder_id: 1,
             workspace_active_tabs: Vec::new(),
+            sidebar_anim_progress: 1.0,
+            topbar_anim_progress: 1.0,
+            sidebar_scroll_offset: 0,
             loading_state: false,
             fonts,
             brushes,
@@ -685,6 +692,7 @@ impl App {
             webview,
             child_hwnd,
             unloaded: false,
+            is_sleeping: false,
             is_loading: false,
         });
         if let Some(title) = title {
@@ -1171,7 +1179,7 @@ impl App {
         } else {
             self.sidebar_rows_top() + 72
         };
-        for row in self.sidebar_rows() {
+        for row in self.sidebar_rows().into_iter().skip(self.sidebar_scroll_offset) {
             let height = match row {
                 SidebarRow::Label(_) => 24,
                 SidebarRow::Folder(_) => 36,
@@ -1762,6 +1770,9 @@ impl App {
 
     fn update_tab_title(&mut self, tab_id: usize, title: String) {
         if let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == tab_id) {
+            if tab.is_sleeping {
+                return;
+            }
             let trimmed = title.trim();
             if !trimmed.is_empty() {
                 tab.title = trimmed.to_string();
@@ -1776,6 +1787,9 @@ impl App {
 
     fn set_tab_loading(&mut self, tab_id: usize, is_loading: bool) {
         if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == tab_id) {
+            if tab.is_sleeping {
+                return;
+            }
             tab.is_loading = is_loading;
             unsafe { let _ = InvalidateRect(Some(self.hwnd), None, false); };
         }
@@ -1790,6 +1804,9 @@ impl App {
     }
 
     fn update_tab_url(&mut self, tab_id: usize, url: String) {
+        if self.tabs.iter().find(|t| t.id == tab_id).map(|t| t.is_sleeping).unwrap_or(false) {
+            return;
+        }
         let active_index = self.active_tab_index();
         let mut suggestion = None;
         if let Some((index, tab)) = self
@@ -1854,6 +1871,9 @@ impl App {
 
     fn update_tab_favicon_uri(&mut self, tab_id: usize, favicon_uri: String) {
         if let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == tab_id) {
+            if tab.is_sleeping {
+                return;
+            }
             tab.favicon_uri = favicon_uri;
         }
         self.refresh();
@@ -1861,6 +1881,9 @@ impl App {
 
     fn update_tab_favicon_bitmap(&mut self, tab_id: usize, favicon: FaviconBitmap) {
         if let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == tab_id) {
+            if tab.is_sleeping {
+                return;
+            }
             tab.favicon_bitmap = Some(favicon);
         }
         self.refresh();
@@ -1910,8 +1933,13 @@ impl App {
         }
         let workspace_id = self.tabs[index].workspace_id;
         self.active_workspace = workspace_id;
+        let mut needs_reload = false;
         if let Some(tab) = self.tabs.get_mut(index) {
             if wake_up {
+                if tab.is_sleeping {
+                    needs_reload = true;
+                    tab.is_sleeping = false;
+                }
                 tab.unloaded = false;
             }
             if !tab.unloaded {
@@ -1944,6 +1972,14 @@ impl App {
                         .controller
                         .MoveFocus(COREWEBVIEW2_MOVE_FOCUS_REASON_PROGRAMMATIC);
                 }
+            }
+        }
+        if needs_reload {
+            let tab = &self.tabs[index];
+            let url_to_load = tab.pinned_url.clone().unwrap_or_else(|| tab.url.clone());
+            let url_w = to_wide(&url_to_load);
+            unsafe {
+                let _ = tab.webview.Navigate(PCWSTR(url_w.as_ptr()));
             }
         }
         self.save_state();
@@ -2019,12 +2055,13 @@ impl App {
         if self.tabs[index].pinned {
             let tab = &mut self.tabs[index];
             tab.unloaded = true;
+            tab.is_sleeping = true;
             if let Some(pinned_url) = tab.pinned_url.clone() {
-                tab.url = pinned_url.clone();
-                let url_w = to_wide(&pinned_url);
-                unsafe {
-                    let _ = tab.webview.Navigate(PCWSTR(url_w.as_ptr()));
-                }
+                tab.url = pinned_url;
+            }
+            let blank_w = to_wide("about:blank");
+            unsafe {
+                let _ = tab.webview.Navigate(PCWSTR(blank_w.as_ptr()));
             }
             unsafe {
                 let _ = tab.controller.SetIsVisible(false);
@@ -6263,7 +6300,16 @@ extern "system" fn window_proc(hwnd: HWND, msg: u32, w_param: WPARAM, l_param: L
             }
             with_app(hwnd, |app| {
                 if (pt.x as f32) < app.sidebar_width && app.sidebar_width() > 92 {
-                    app.switch_workspace_by_delta(if delta < 0 { 1 } else { -1 });
+                    if delta < 0 {
+                        let total_rows = app.sidebar_rows().len();
+                        let max_offset = total_rows.saturating_sub(1);
+                        app.sidebar_scroll_offset = (app.sidebar_scroll_offset + 1).min(max_offset);
+                    } else {
+                        app.sidebar_scroll_offset = app.sidebar_scroll_offset.saturating_sub(1);
+                    }
+                    unsafe {
+                        let _ = InvalidateRect(Some(app.hwnd), None, false);
+                    }
                 }
             });
             LRESULT(0)
