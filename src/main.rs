@@ -1215,11 +1215,11 @@ impl App {
     }
 
     fn sidebar_header_top(&self) -> i32 {
-        self.topbar_pushed_height() + 14
+        self.topbar_pushed_height() + TOPBAR_HEIGHT - 4
     }
 
     fn sidebar_rows_top(&self) -> i32 {
-        self.topbar_pushed_height() + 68
+        self.topbar_pushed_height() + TOPBAR_HEIGHT + 50
     }
 
     fn workspace_header_rect(&self) -> RECT {
