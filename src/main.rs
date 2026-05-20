@@ -48,7 +48,7 @@ use windows::{
                 IDC_ARROW, MSG, WINDOW_EX_STYLE, WINDOW_LONG_PTR_INDEX, WINDOW_STYLE, WM_APP,
                 WM_CHAR, WM_CLOSE, WM_COMMAND, WM_CREATE, WM_CTLCOLORBTN, WM_CTLCOLOREDIT,
                 WM_CTLCOLORSTATIC, WM_DESTROY, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDOWN,
-                WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCREATE, WM_PAINT, WM_RBUTTONDOWN,
+                WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_MOUSEHWHEEL, WM_NCCREATE, WM_PAINT, WM_RBUTTONDOWN,
                 WM_SETCURSOR, WM_SETFOCUS, WM_SETFONT, WM_SETICON, WM_SIZE, WM_TIMER, WNDCLASSW,
                 WNDPROC, WS_CHILD, WS_CLIPSIBLINGS, WS_OVERLAPPEDWINDOW,
                 WS_POPUP, WS_TABSTOP, WS_VISIBLE,
@@ -454,9 +454,9 @@ struct App {
     next_workspace_id: usize,
     next_folder_id: usize,
     workspace_active_tabs: Vec<(usize, usize)>,
-    sidebar_anim_progress: f32,
-    topbar_anim_progress: f32,
     sidebar_scroll_offset: usize,
+    workspace_swipe_accum: i32,
+    last_workspace_swipe: Option<std::time::Instant>,
     loading_state: bool,
     fonts: UiFonts,
     brushes: UiBrushes,
@@ -572,9 +572,9 @@ impl App {
             next_workspace_id: 2,
             next_folder_id: 1,
             workspace_active_tabs: Vec::new(),
-            sidebar_anim_progress: 1.0,
-            topbar_anim_progress: 1.0,
             sidebar_scroll_offset: 0,
+            workspace_swipe_accum: 0,
+            last_workspace_swipe: None,
             loading_state: false,
             fonts,
             brushes,
@@ -6310,6 +6310,28 @@ extern "system" fn window_proc(hwnd: HWND, msg: u32, w_param: WPARAM, l_param: L
                     unsafe {
                         let _ = InvalidateRect(Some(app.hwnd), None, false);
                     }
+                }
+            });
+            LRESULT(0)
+        }
+        WM_MOUSEHWHEEL => {
+            let delta = hiword(w_param.0 as u32) as i16 as i32;
+            with_app(hwnd, |app| {
+                let now = std::time::Instant::now();
+                if let Some(last) = app.last_workspace_swipe {
+                    if now.duration_since(last).as_millis() > 300 {
+                        app.workspace_swipe_accum = 0;
+                    }
+                }
+                app.last_workspace_swipe = Some(now);
+                app.workspace_swipe_accum += delta;
+
+                if app.workspace_swipe_accum > 150 {
+                    app.switch_workspace_by_delta(1);
+                    app.workspace_swipe_accum = 0;
+                } else if app.workspace_swipe_accum < -150 {
+                    app.switch_workspace_by_delta(-1);
+                    app.workspace_swipe_accum = 0;
                 }
             });
             LRESULT(0)
