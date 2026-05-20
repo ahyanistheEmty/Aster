@@ -5,6 +5,22 @@
 
 $ErrorActionPreference = "Stop"
 
+# Check if Aster is running
+$asterProcess = Get-Process -Name "Aster" -ErrorAction SilentlyContinue
+if ($asterProcess) {
+    Write-Host ""
+    Write-Host "WARNING: Aster is currently running." -ForegroundColor Yellow
+    $userChoice = Read-Host "Do you want to close it to proceed with installation? (y/n)"
+    if ($userChoice.ToLower() -eq "y") {
+        Write-Host "Closing Aster..." -ForegroundColor Cyan
+        Stop-Process -Name "Aster" -Force
+        Start-Sleep -Seconds 1
+    } else {
+        Write-Host "Installation cancelled." -ForegroundColor Yellow
+        exit 0
+    }
+}
+
 # Define raw GitHub download URL
 $binaryUrl = "https://raw.githubusercontent.com/ahyanistheEmty/Aster/main/releases/Aster.exe"
 
