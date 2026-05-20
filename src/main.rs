@@ -5247,6 +5247,9 @@ impl App {
         if self.drag_state.is_some() {
             return;
         }
+        if self.overlay_menu.is_some() {
+            return;
+        }
         unsafe {
             let mut pt = POINT::default();
             if GetCursorPos(&mut pt).is_ok() {
