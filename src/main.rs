@@ -4912,12 +4912,17 @@ impl App {
 
         for (target, rect) in self.download_indicator_rects() {
             if point_in_rect(x, y, rect) {
-                self.download_panel = Some(match target {
+                let new_mode = match target {
                     Some(id) => DownloadPanelMode::Single(id),
                     None => DownloadPanelMode::All,
-                });
+                };
+                if self.download_panel == Some(new_mode) && self.download_panel_reveal > 0.99 {
+                    return;
+                }
+                self.download_panel = Some(new_mode);
                 self.download_panel_reveal = 0.0;
                 self.download_panel_reveal_target = 1.0;
+                self.ensure_download_timer();
                 self.refresh();
                 return;
             }
