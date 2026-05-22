@@ -4262,7 +4262,7 @@ impl App {
 
                 draw_icon_glyph(
                     hdc,
-                    &self.fonts.small,
+                    &self.fonts.icon,
                     glyph(0xE711).as_str(),
                     cancel,
                     COLOR_MUTED,
@@ -4275,7 +4275,7 @@ impl App {
                 };
                 draw_icon_glyph(
                     hdc,
-                    &self.fonts.small,
+                    &self.fonts.icon,
                     pause_icon.as_str(),
                     pause,
                     COLOR_MUTED,
@@ -4283,7 +4283,7 @@ impl App {
 
                 draw_icon_glyph(
                     hdc,
-                    &self.fonts.small,
+                    &self.fonts.icon,
                     glyph(0xE838).as_str(),
                     open,
                     COLOR_MUTED,
