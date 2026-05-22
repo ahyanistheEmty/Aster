@@ -7269,7 +7269,7 @@ unsafe extern "system" fn download_popup_proc(
                         let elapsed = toast.start_time.elapsed().as_millis();
                         if elapsed < 3000 || toast.fading {
                             let rect = client_rect(hwnd);
-                            draw_download_toast_gdi(hdc, rect, elapsed as u64, 1.0);
+                            draw_download_popup(hdc, rect, elapsed as u64);
                         }
                     }
                 });
@@ -7896,6 +7896,44 @@ unsafe fn draw_download_indicator(
     }
 }
 
+unsafe fn draw_download_popup(
+    hdc: HDC,
+    rect: RECT,
+    elapsed_ms: u64,
+) {
+    let display_size = (rect.right - rect.left).min(rect.bottom - rect.top).max(1);
+    let render_size = display_size * 3;
+    let pixels = render_download_popup_pixels(render_size, elapsed_ms);
+    if let Some(bitmap) = create_bgra_bitmap(render_size, render_size, &pixels) {
+        let mem_dc = CreateCompatibleDC(Some(hdc));
+        if !mem_dc.is_invalid() {
+            let old = SelectObject(mem_dc, HGDIOBJ(bitmap.0));
+            let blend = BLENDFUNCTION {
+                BlendOp: AC_SRC_OVER as u8,
+                BlendFlags: 0,
+                SourceConstantAlpha: 255,
+                AlphaFormat: AC_SRC_ALPHA as u8,
+            };
+            let _ = AlphaBlend(
+                hdc,
+                rect.left,
+                rect.top,
+                display_size,
+                display_size,
+                mem_dc,
+                0,
+                0,
+                render_size,
+                render_size,
+                blend,
+            );
+            let _ = SelectObject(mem_dc, old);
+            let _ = DeleteDC(mem_dc);
+        }
+        let _ = DeleteObject(HGDIOBJ(bitmap.0));
+    }
+}
+
 unsafe fn draw_download_toast_gdi(
     hdc: HDC,
     rect: RECT,
@@ -8065,6 +8103,31 @@ fn render_download_indicator_pixels(
             tick_alpha,
         );
     }
+    pixels
+}
+
+fn render_download_popup_pixels(
+    size: i32,
+    elapsed_ms: u64,
+) -> Vec<u8> {
+    let mut pixels = vec![0u8; (size * size * 4) as usize];
+    let center = size as f32 / 2.0;
+    let radius = size as f32 * 0.43;
+
+    draw_aa_filled_circle(&mut pixels, size, center, center, radius, COLOR_PANEL_2, 1.0);
+    draw_aa_ring(&mut pixels, size, center, center, radius - 0.7, 1.35, 0x565656, 1.0);
+
+    let t = (elapsed_ms % 1200) as f32 / 1200.0;
+    let rotation = t * std::f32::consts::TAU;
+    draw_aa_arc(&mut pixels, size, center, center, radius - 0.7, 1.8, 0.75, COLOR_ACCENT, 1.0, rotation);
+
+    let color = COLOR_MUTED;
+    let stroke = size as f32 * 0.065;
+    draw_aa_line(&mut pixels, size, center, size as f32 * 0.27, center, size as f32 * 0.62, stroke, color, 1.0);
+    draw_aa_line(&mut pixels, size, size as f32 * 0.36, size as f32 * 0.50, center, size as f32 * 0.64, stroke, color, 1.0);
+    draw_aa_line(&mut pixels, size, size as f32 * 0.64, size as f32 * 0.50, center, size as f32 * 0.64, stroke, color, 1.0);
+    draw_aa_line(&mut pixels, size, size as f32 * 0.34, size as f32 * 0.72, size as f32 * 0.66, size as f32 * 0.72, stroke, color, 0.75);
+
     pixels
 }
 
