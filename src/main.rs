@@ -400,6 +400,17 @@ struct DownloadToastState {
     slide_x: f32,
 }
 
+struct DownloadRemovalAnim {
+    start_time: std::time::Instant,
+    duration: u64,
+    removed_id: usize,
+    removed_index: usize,
+    old_count: usize,
+    removed_progress: f32,
+    removed_completed: bool,
+    removed_completed_at: Option<std::time::Instant>,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SidebarMode {
     Hidden,
@@ -560,6 +571,7 @@ struct App {
     download_panel_reveal: f32,
     download_panel_reveal_target: f32,
     download_popup_hwnd: HWND,
+    download_removal_anim: Option<DownloadRemovalAnim>,
 }
 
 struct DragGhost {
@@ -691,6 +703,7 @@ impl App {
             download_panel_reveal: 0.0,
             download_panel_reveal_target: 0.0,
             download_popup_hwnd,
+            download_removal_anim: None,
         };
         app.load_state()?;
         unsafe {
@@ -2102,11 +2115,21 @@ impl App {
         }
     }
 
+    fn tick_download_removal(&mut self) {
+        if let Some(anim) = &self.download_removal_anim {
+            if anim.start_time.elapsed().as_millis() >= anim.duration as u128 {
+                self.download_removal_anim = None;
+                self.refresh();
+            }
+        }
+    }
+
     fn ensure_download_timer(&self) {
         let panel_animating = self.download_panel.is_some()
             && (self.download_panel_reveal - self.download_panel_reveal_target).abs() > 0.005;
         let needs_timer = panel_animating
             || self.download_toast.is_some()
+            || self.download_removal_anim.is_some()
             || self.downloads.iter().any(|download| {
                 download.state == COREWEBVIEW2_DOWNLOAD_STATE_IN_PROGRESS
                     || download
@@ -2300,14 +2323,37 @@ impl App {
                 }
             }
             DownloadAction::Delete(id) => {
+                let removed_index = self.downloads.iter().position(|item| item.id == id);
+                let old_count = self.downloads.len();
+                let mut cached = None;
                 if let Some(download) = self.downloads.iter().find(|item| item.id == id) {
                     if !download.file_path.is_empty() {
                         let _ = fs::remove_file(&download.file_path);
                     }
+                    cached = Some((
+                        self.download_progress(download),
+                        download.state == COREWEBVIEW2_DOWNLOAD_STATE_COMPLETED,
+                        download.completed_at,
+                    ));
                 }
                 self.downloads.retain(|item| item.id != id);
                 if self.download_panel == Some(DownloadPanelMode::Single(id)) || self.downloads.is_empty() {
                     self.download_panel = None;
+                }
+                if let (Some(idx), Some((prog, compl, compl_at))) = (removed_index, cached) {
+                    if old_count >= 1 && old_count <= 4 {
+                        self.download_removal_anim = Some(DownloadRemovalAnim {
+                            start_time: std::time::Instant::now(),
+                            duration: 180,
+                            removed_id: id,
+                            removed_index: idx,
+                            old_count,
+                            removed_progress: prog,
+                            removed_completed: compl,
+                            removed_completed_at: compl_at,
+                        });
+                        self.ensure_download_timer();
+                    }
                 }
             }
         }
@@ -4278,6 +4324,10 @@ impl App {
     }
 
     fn paint_download_indicators(&self, hdc: HDC) {
+        if self.download_removal_anim.is_some() {
+            self.paint_download_indicators_animating(hdc);
+            return;
+        }
         let rects = self.download_indicator_rects();
         if rects.is_empty() {
             return;
@@ -4304,6 +4354,98 @@ impl App {
                 }
             }
         }
+    }
+
+    fn paint_download_indicators_animating(&self, hdc: HDC) {
+        let anim = match &self.download_removal_anim {
+            Some(a) => a,
+            None => return,
+        };
+        let elapsed = anim.start_time.elapsed().as_millis();
+        let progress = (elapsed as f32 / anim.duration as f32).min(1.0);
+        let settings = self.settings_rect();
+        let start_x = settings.right + 14;
+        let y = settings.top;
+
+        unsafe {
+            if anim.old_count > 3 && anim.old_count == 4 {
+                let overflow_cx = start_x + 20;
+                let _cy = y + 16;
+
+                let ease = 1.0 - (1.0 - progress) * (1.0 - progress) * (1.0 - progress);
+                for (ni, download) in self.downloads.iter().enumerate() {
+                    let target_x = start_x + ni as i32 * 40;
+                    let cur_x = overflow_cx - 16 + ((target_x + 16 - overflow_cx) as f32 * ease) as i32;
+                    let rect = RECT { left: cur_x, top: y, right: cur_x + 32, bottom: y + 32 };
+                    draw_download_indicator(
+                        hdc, rect,
+                        self.download_progress(download),
+                        download.state == COREWEBVIEW2_DOWNLOAD_STATE_COMPLETED,
+                        download.completed_at,
+                        self.hover_target == Some(HoverTarget::DownloadIndicator(download.id)),
+                    );
+                }
+            } else if anim.removed_index == anim.old_count - 1 {
+                for (ni, download) in self.downloads.iter().enumerate() {
+                    let rect = RECT { left: start_x + ni as i32 * 40, top: y, right: start_x + ni as i32 * 40 + 32, bottom: y + 32 };
+                    draw_download_indicator(
+                        hdc, rect,
+                        self.download_progress(download),
+                        download.state == COREWEBVIEW2_DOWNLOAD_STATE_COMPLETED,
+                        download.completed_at,
+                        self.hover_target == Some(HoverTarget::DownloadIndicator(download.id)),
+                    );
+                }
+                let fade_alpha = 1.0 - progress;
+                if fade_alpha > 0.02 {
+                    let old_rect = RECT { left: start_x + anim.removed_index as i32 * 40, top: y, right: start_x + anim.removed_index as i32 * 40 + 32, bottom: y + 32 };
+                    self.paint_download_indicator_faded(hdc, old_rect, fade_alpha, anim);
+                }
+            } else if anim.old_count <= 3 {
+                for (ni, download) in self.downloads.iter().enumerate() {
+                    let old_slot = if ni < anim.removed_index { ni } else { ni + 1 };
+                    let old_x = start_x + old_slot as i32 * 40;
+                    let new_x = start_x + ni as i32 * 40;
+                    let ease = 1.0 - (1.0 - progress) * (1.0 - progress);
+                    let cur_x = old_x + ((new_x - old_x) as f32 * ease) as i32;
+                    let rect = RECT { left: cur_x, top: y, right: cur_x + 32, bottom: y + 32 };
+                    draw_download_indicator(
+                        hdc, rect,
+                        self.download_progress(download),
+                        download.state == COREWEBVIEW2_DOWNLOAD_STATE_COMPLETED,
+                        download.completed_at,
+                        self.hover_target == Some(HoverTarget::DownloadIndicator(download.id)),
+                    );
+                }
+            }
+        }
+    }
+
+    unsafe fn paint_download_indicator_faded(&self, hdc: HDC, rect: RECT, fade_alpha: f32, anim: &DownloadRemovalAnim) {
+        let size = rect.right - rect.left;
+        let mem_dc = CreateCompatibleDC(Some(hdc));
+        let bitmap = CreateCompatibleBitmap(hdc, size, size);
+        let old = SelectObject(mem_dc, HGDIOBJ(bitmap.0));
+        fill_rect(mem_dc, RECT { left: 0, top: 0, right: size, bottom: size }, COLOR_PANEL_2);
+        draw_download_indicator(
+            mem_dc,
+            RECT { left: 0, top: 0, right: size, bottom: size },
+            anim.removed_progress,
+            anim.removed_completed,
+            anim.removed_completed_at,
+            self.hover_target == Some(HoverTarget::DownloadIndicator(anim.removed_id)),
+        );
+        let src_alpha = (fade_alpha * 255.0) as u8;
+        let blend = BLENDFUNCTION {
+            BlendOp: AC_SRC_OVER as u8,
+            BlendFlags: 0,
+            SourceConstantAlpha: src_alpha,
+            AlphaFormat: 0,
+        };
+        let _ = AlphaBlend(hdc, rect.left, rect.top, size, size, mem_dc, 0, 0, size, size, blend);
+        let _ = SelectObject(mem_dc, old);
+        let _ = DeleteObject(HGDIOBJ(bitmap.0));
+        let _ = DeleteDC(mem_dc);
     }
 
     fn paint_download_toast(&self, hdc: HDC, window_rect: RECT) {
@@ -7579,6 +7721,7 @@ extern "system" fn window_proc(hwnd: HWND, msg: u32, w_param: WPARAM, l_param: L
             if w_param.0 == DOWNLOAD_TIMER_ID {
                 with_app(hwnd, |app| {
                     app.tick_download_toast();
+                    app.tick_download_removal();
                     app.tick_download_panel_animation();
                     app.poll_downloads();
                     unsafe {
