@@ -2027,8 +2027,12 @@ impl App {
             .iter_mut()
             .find(|item| item.id == download_id)
         {
-            download.received_bytes = snapshot.received_bytes;
-            download.total_bytes = snapshot.total_bytes;
+            // Only update byte counts if we got valid data from WebView2
+            // (total_bytes > 0 indicates the COM calls succeeded)
+            if snapshot.total_bytes > 0 {
+                download.received_bytes = snapshot.received_bytes;
+                download.total_bytes = snapshot.total_bytes;
+            }
             if !snapshot.file_path.is_empty() {
                 download.file_path = snapshot.file_path;
                 download.file_name = download_file_name(&download.file_path, &download.uri);
