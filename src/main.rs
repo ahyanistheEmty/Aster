@@ -3,8 +3,9 @@
 use std::{
     cell::{Cell, RefCell},
     fs, mem,
-    path::PathBuf,
+    path::{Path, PathBuf},
     ptr,
+    process::Command,
     sync::mpsc,
 };
 
@@ -74,6 +75,7 @@ const HOVER_DETECT_TIMER_ID: usize = 44;
 const BACKGROUND_TIMER_ID: usize = 45;
 const LOADING_TIMER_ID: usize = 46;
 const TOPBAR_TIMER_ID: usize = 47;
+const DOWNLOAD_TIMER_ID: usize = 48;
 const STATE_FILE: &str = ".aster-state";
 const MENU_TAB_PIN: usize = 3101;
 const MENU_TAB_UNPIN: usize = 3102;
@@ -352,6 +354,40 @@ enum HoverTarget {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
+enum DownloadPanelMode {
+    Single(usize),
+    All,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DownloadAction {
+    TogglePause(usize),
+    Cancel(usize),
+    ShowInFolder(usize),
+}
+
+struct DownloadItem {
+    id: usize,
+    file_name: String,
+    file_path: String,
+    uri: String,
+    received_bytes: i64,
+    total_bytes: i64,
+    state: COREWEBVIEW2_DOWNLOAD_STATE,
+    paused: bool,
+    completed_at: Option<std::time::Instant>,
+    operation: Option<ICoreWebView2DownloadOperation>,
+}
+
+struct DownloadSnapshot {
+    uri: String,
+    file_path: String,
+    received_bytes: i64,
+    total_bytes: i64,
+    state: COREWEBVIEW2_DOWNLOAD_STATE,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum SidebarMode {
     Hidden,
     Overlay,
@@ -504,6 +540,9 @@ struct App {
     last_address_text: String,
     has_typed: bool,
     closed_tabs: Vec<ClosedTab>,
+    downloads: Vec<DownloadItem>,
+    next_download_id: usize,
+    download_panel: Option<DownloadPanelMode>,
 }
 
 struct DragGhost {
@@ -627,6 +666,9 @@ impl App {
             is_deleting: false,
             last_address_text: String::new(),
             has_typed: false,
+            downloads: Vec::new(),
+            next_download_id: 1,
+            download_panel: None,
         };
         app.load_state()?;
         unsafe {
@@ -1744,6 +1786,32 @@ impl App {
                 &mut token,
             )?;
 
+            if let Ok(webview4) = webview.cast::<ICoreWebView2_4>() {
+                let hwnd = self.hwnd;
+                let mut token = 0;
+                webview4.add_DownloadStarting(
+                    &DownloadStartingEventHandler::create(Box::new(move |_sender, args| {
+                        if let Some(args) = args {
+                            let _ = args.SetHandled(true);
+                            if let Ok(operation) = args.DownloadOperation() {
+                                let mut result_path = PWSTR::null();
+                                let file_path = if args.ResultFilePath(&mut result_path).is_ok() {
+                                    CoTaskMemPWSTR::from(result_path).to_string()
+                                } else {
+                                    String::new()
+                                };
+                                with_app(hwnd, |app| {
+                                    let id = app.register_download(operation.clone(), file_path);
+                                    app.attach_download_events(id, &operation);
+                                });
+                            }
+                        }
+                        Ok(())
+                    })),
+                    &mut token,
+                )?;
+            }
+
             let hwnd = self.hwnd;
             let mut token = 0;
             webview.add_ContainsFullScreenElementChanged(
@@ -1766,6 +1834,275 @@ impl App {
             unreachable!();
         }
         Ok(())
+    }
+
+    fn register_download(
+        &mut self,
+        operation: ICoreWebView2DownloadOperation,
+        suggested_path: String,
+    ) -> usize {
+        let id = self.next_download_id;
+        self.next_download_id += 1;
+        let snapshot = download_snapshot(&operation);
+        let file_path = if suggested_path.is_empty() {
+            snapshot.file_path
+        } else {
+            suggested_path
+        };
+        let file_name = download_file_name(&file_path, &snapshot.uri);
+        self.downloads.push(DownloadItem {
+            id,
+            file_name,
+            file_path,
+            uri: snapshot.uri,
+            received_bytes: snapshot.received_bytes,
+            total_bytes: snapshot.total_bytes,
+            state: snapshot.state,
+            paused: false,
+            completed_at: None,
+            operation: Some(operation),
+        });
+        self.download_panel = Some(DownloadPanelMode::Single(id));
+        self.ensure_download_timer();
+        self.refresh();
+        id
+    }
+
+    fn attach_download_events(&self, download_id: usize, operation: &ICoreWebView2DownloadOperation) {
+        unsafe {
+            let hwnd = self.hwnd;
+            let mut token = 0;
+            let _ = operation.add_BytesReceivedChanged(
+                &BytesReceivedChangedEventHandler::create(Box::new(move |sender, _args| {
+                    if let Some(sender) = sender {
+                        with_app(hwnd, |app| app.update_download_from_operation(download_id, &sender));
+                    }
+                    Ok(())
+                })),
+                &mut token,
+            );
+
+            let hwnd = self.hwnd;
+            let mut token = 0;
+            let _ = operation.add_StateChanged(
+                &StateChangedEventHandler::create(Box::new(move |sender, _args| {
+                    if let Some(sender) = sender {
+                        with_app(hwnd, |app| app.update_download_from_operation(download_id, &sender));
+                    }
+                    Ok(())
+                })),
+                &mut token,
+            );
+        }
+    }
+
+    fn update_download_from_operation(
+        &mut self,
+        download_id: usize,
+        operation: &ICoreWebView2DownloadOperation,
+    ) {
+        let snapshot = download_snapshot(operation);
+        if let Some(download) = self.downloads.iter_mut().find(|item| item.id == download_id) {
+            download.received_bytes = snapshot.received_bytes;
+            download.total_bytes = snapshot.total_bytes;
+            if !snapshot.file_path.is_empty() {
+                download.file_path = snapshot.file_path;
+                download.file_name = download_file_name(&download.file_path, &download.uri);
+            }
+            if !snapshot.uri.is_empty() {
+                download.uri = snapshot.uri;
+                if download.file_name == "download" {
+                    download.file_name = download_file_name(&download.file_path, &download.uri);
+                }
+            }
+            if download.state != COREWEBVIEW2_DOWNLOAD_STATE_COMPLETED
+                && snapshot.state == COREWEBVIEW2_DOWNLOAD_STATE_COMPLETED
+            {
+                download.completed_at = Some(std::time::Instant::now());
+                download.paused = false;
+            }
+            if snapshot.state == COREWEBVIEW2_DOWNLOAD_STATE_INTERRUPTED {
+                download.paused = false;
+            }
+            download.state = snapshot.state;
+        }
+        self.ensure_download_timer();
+        self.refresh();
+    }
+
+    fn ensure_download_timer(&self) {
+        let needs_timer = self.downloads.iter().any(|download| {
+            download.state == COREWEBVIEW2_DOWNLOAD_STATE_IN_PROGRESS
+                || download
+                    .completed_at
+                    .map(|at| at.elapsed().as_millis() < 900)
+                    .unwrap_or(false)
+        });
+        unsafe {
+            if needs_timer {
+                let _ = WindowsAndMessaging::SetTimer(Some(self.hwnd), DOWNLOAD_TIMER_ID, 16, None);
+            } else {
+                let _ = WindowsAndMessaging::KillTimer(Some(self.hwnd), DOWNLOAD_TIMER_ID);
+            }
+        }
+    }
+
+    fn download_progress(&self, download: &DownloadItem) -> f32 {
+        if download.state == COREWEBVIEW2_DOWNLOAD_STATE_COMPLETED {
+            return 1.0;
+        }
+        if download.total_bytes <= 0 {
+            return 0.0;
+        }
+        (download.received_bytes as f32 / download.total_bytes as f32).clamp(0.0, 1.0)
+    }
+
+    fn download_indicator_rects(&self) -> Vec<(Option<usize>, RECT)> {
+        if self.sidebar_width() <= 92 || self.downloads.is_empty() {
+            return Vec::new();
+        }
+        let settings = self.settings_rect();
+        let mut rects = Vec::new();
+        let mut x = settings.right + 14;
+        let y = settings.top;
+        let visible_count = if self.downloads.len() > 4 { 3 } else { self.downloads.len() };
+        for download in self.downloads.iter().take(visible_count) {
+            rects.push((
+                Some(download.id),
+                RECT {
+                    left: x,
+                    top: y,
+                    right: x + 32,
+                    bottom: y + 32,
+                },
+            ));
+            x += 40;
+        }
+        if self.downloads.len() > 4 {
+            rects.push((
+                None,
+                RECT {
+                    left: x - 2,
+                    top: y,
+                    right: (x + 56).min(self.sidebar_width() - 12),
+                    bottom: y + 32,
+                },
+            ));
+        }
+        rects
+    }
+
+    fn download_panel_rect(&self) -> Option<RECT> {
+        self.download_panel?;
+        if self.downloads.is_empty() || self.sidebar_width() <= 92 {
+            return None;
+        }
+        let settings = self.settings_rect();
+        let rows = match self.download_panel {
+            Some(DownloadPanelMode::Single(_)) => 1,
+            Some(DownloadPanelMode::All) => self.downloads.len(),
+            None => 0,
+        };
+        let height = 26 + rows as i32 * 76;
+        Some(RECT {
+            left: 12,
+            top: (settings.top - height - 12).max(self.topbar_pushed_height() + 70),
+            right: self.sidebar_width() - 12,
+            bottom: settings.top - 12,
+        })
+    }
+
+    fn download_panel_rows(&self) -> Vec<&DownloadItem> {
+        match self.download_panel {
+            Some(DownloadPanelMode::Single(id)) => {
+                self.downloads.iter().filter(|download| download.id == id).collect()
+            }
+            Some(DownloadPanelMode::All) => self.downloads.iter().collect(),
+            None => Vec::new(),
+        }
+    }
+
+    fn download_action_at(&self, x: i32, y: i32) -> Option<DownloadAction> {
+        let panel = self.download_panel_rect()?;
+        if !point_in_rect(x, y, panel) {
+            return None;
+        }
+        let mut top = panel.top + 14;
+        for download in self.download_panel_rows() {
+            let row = RECT {
+                left: panel.left + 10,
+                top,
+                right: panel.right - 10,
+                bottom: top + 64,
+            };
+            let cancel = RECT {
+                left: row.right - 30,
+                top: row.top + 8,
+                right: row.right - 8,
+                bottom: row.top + 30,
+            };
+            let open = RECT {
+                left: row.right - 58,
+                top: row.bottom - 28,
+                right: row.right - 8,
+                bottom: row.bottom - 6,
+            };
+            let pause = RECT {
+                left: row.left + 8,
+                top: row.bottom - 28,
+                right: row.left + 78,
+                bottom: row.bottom - 6,
+            };
+            if point_in_rect(x, y, cancel) {
+                return Some(DownloadAction::Cancel(download.id));
+            }
+            if point_in_rect(x, y, open) {
+                return Some(DownloadAction::ShowInFolder(download.id));
+            }
+            if point_in_rect(x, y, pause) {
+                return Some(DownloadAction::TogglePause(download.id));
+            }
+            top += 76;
+        }
+        None
+    }
+
+    fn run_download_action(&mut self, action: DownloadAction) {
+        match action {
+            DownloadAction::TogglePause(id) => {
+                if let Some(download) = self.downloads.iter_mut().find(|item| item.id == id) {
+                    if let Some(operation) = download.operation.as_ref() {
+                        unsafe {
+                            if download.paused {
+                                let _ = operation.Resume();
+                                download.paused = false;
+                            } else if download.state == COREWEBVIEW2_DOWNLOAD_STATE_IN_PROGRESS {
+                                let _ = operation.Pause();
+                                download.paused = true;
+                            }
+                        }
+                    }
+                }
+            }
+            DownloadAction::Cancel(id) => {
+                if let Some(download) = self.downloads.iter_mut().find(|item| item.id == id) {
+                    if let Some(operation) = download.operation.as_ref() {
+                        unsafe {
+                            let _ = operation.Cancel();
+                        }
+                    }
+                    download.state = COREWEBVIEW2_DOWNLOAD_STATE_INTERRUPTED;
+                    download.paused = false;
+                }
+            }
+            DownloadAction::ShowInFolder(id) => {
+                if let Some(download) = self.downloads.iter().find(|item| item.id == id) {
+                    open_in_file_explorer(&download.file_path);
+                }
+            }
+        }
+        self.ensure_download_timer();
+        self.refresh();
     }
 
     fn update_tab_title(&mut self, tab_id: usize, title: String) {
@@ -3352,10 +3689,14 @@ impl App {
                 }
                 self.paint_drop_target_highlight(hdc);
                 self.paint_workspace_switcher(hdc);
+                self.paint_download_indicators(hdc);
             }
 
             if self.settings_open {
                 self.paint_settings_menu(hdc);
+            }
+            if self.download_panel.is_some() {
+                self.paint_download_panel(hdc);
             }
         }
     }
@@ -3543,6 +3884,199 @@ impl App {
                         COLOR_TEXT,
                     );
                 }
+            }
+        }
+    }
+
+    fn paint_download_indicators(&self, hdc: HDC) {
+        let rects = self.download_indicator_rects();
+        if rects.is_empty() {
+            return;
+        }
+        unsafe {
+            for (target, rect) in rects {
+                match target {
+                    Some(id) => {
+                        if let Some(download) = self.downloads.iter().find(|item| item.id == id) {
+                            draw_download_indicator(
+                                hdc,
+                                rect,
+                                self.download_progress(download),
+                                download.state == COREWEBVIEW2_DOWNLOAD_STATE_COMPLETED,
+                                download.completed_at,
+                                &self.fonts.icon,
+                            );
+                        }
+                    }
+                    None => {
+                        let extra = self.downloads.len().saturating_sub(3);
+                        self.paint_download_overflow(hdc, rect, extra);
+                    }
+                }
+            }
+        }
+    }
+
+    fn paint_download_overflow(&self, hdc: HDC, rect: RECT, extra: usize) {
+        unsafe {
+            for offset in [10, 5, 0] {
+                let circle = RECT {
+                    left: rect.left + offset,
+                    top: rect.top,
+                    right: rect.left + offset + 32,
+                    bottom: rect.bottom,
+                };
+                fill_round_rect(hdc, circle, COLOR_PANEL_2, 32);
+                draw_outline(hdc, circle, COLOR_ACCENT, 32);
+                draw_icon_glyph(
+                    hdc,
+                    &self.fonts.icon,
+                    glyph(0xE896).as_str(),
+                    circle,
+                    COLOR_MUTED,
+                );
+            }
+            draw_text(
+                hdc,
+                &self.fonts.body,
+                &format!("+{}", extra),
+                RECT {
+                    left: rect.left + 40,
+                    top: rect.top,
+                    right: rect.right,
+                    bottom: rect.bottom,
+                },
+                COLOR_TEXT,
+            );
+        }
+    }
+
+    fn paint_download_panel(&self, hdc: HDC) {
+        let Some(panel) = self.download_panel_rect() else {
+            return;
+        };
+        unsafe {
+            fill_round_rect(hdc, panel, 0x151515, 12);
+            draw_outline(hdc, panel, COLOR_BORDER, 12);
+            let mut top = panel.top + 14;
+            for download in self.download_panel_rows() {
+                let row = RECT {
+                    left: panel.left + 10,
+                    top,
+                    right: panel.right - 10,
+                    bottom: top + 64,
+                };
+                fill_round_rect(hdc, row, 0x0d0d0d, 8);
+                draw_outline(hdc, row, 0x2b2b2b, 8);
+
+                draw_text(
+                    hdc,
+                    &self.fonts.body,
+                    &download.file_name,
+                    RECT {
+                        left: row.left + 10,
+                        top: row.top + 6,
+                        right: row.right - 42,
+                        bottom: row.top + 28,
+                    },
+                    COLOR_TEXT,
+                );
+
+                let state_label = download_state_label(download);
+                let size_label = if download.total_bytes > 0 {
+                    format!(
+                        "{} of {}",
+                        format_bytes(download.received_bytes),
+                        format_bytes(download.total_bytes)
+                    )
+                } else {
+                    format!("{} received", format_bytes(download.received_bytes))
+                };
+                draw_text(
+                    hdc,
+                    &self.fonts.small,
+                    &format!("{}  {}", size_label, state_label),
+                    RECT {
+                        left: row.left + 10,
+                        top: row.top + 28,
+                        right: row.right - 10,
+                        bottom: row.top + 48,
+                    },
+                    COLOR_MUTED,
+                );
+
+                let progress_track = RECT {
+                    left: row.left + 10,
+                    top: row.bottom - 5,
+                    right: row.right - 10,
+                    bottom: row.bottom - 3,
+                };
+                fill_rect(hdc, progress_track, 0x262626);
+                let progress = self.download_progress(download);
+                let filled = RECT {
+                    left: progress_track.left,
+                    top: progress_track.top,
+                    right: progress_track.left
+                        + ((progress_track.right - progress_track.left) as f32 * progress) as i32,
+                    bottom: progress_track.bottom,
+                };
+                fill_rect(hdc, filled, COLOR_ACCENT);
+
+                let cancel = RECT {
+                    left: row.right - 30,
+                    top: row.top + 8,
+                    right: row.right - 8,
+                    bottom: row.top + 30,
+                };
+                draw_icon_glyph(hdc, &self.fonts.small, glyph(0xE711).as_str(), cancel, COLOR_MUTED);
+
+                let pause = RECT {
+                    left: row.left + 8,
+                    top: row.bottom - 28,
+                    right: row.left + 78,
+                    bottom: row.bottom - 6,
+                };
+                fill_round_rect(hdc, pause, 0x181818, 7);
+                let pause_icon = if download.paused {
+                    glyph(0xE768)
+                } else {
+                    glyph(0xE769)
+                };
+                draw_icon_glyph(
+                    hdc,
+                    &self.fonts.small,
+                    pause_icon.as_str(),
+                    RECT {
+                        left: pause.left + 2,
+                        top: pause.top,
+                        right: pause.left + 24,
+                        bottom: pause.bottom,
+                    },
+                    COLOR_MUTED,
+                );
+                draw_text(
+                    hdc,
+                    &self.fonts.small,
+                    if download.paused { "Resume" } else { "Pause" },
+                    RECT {
+                        left: pause.left + 24,
+                        top: pause.top,
+                        right: pause.right - 6,
+                        bottom: pause.bottom,
+                    },
+                    COLOR_TEXT,
+                );
+
+                let open = RECT {
+                    left: row.right - 58,
+                    top: row.bottom - 28,
+                    right: row.right - 8,
+                    bottom: row.bottom - 6,
+                };
+                fill_round_rect(hdc, open, 0x181818, 7);
+                draw_icon_glyph(hdc, &self.fonts.small, glyph(0xE838).as_str(), open, COLOR_MUTED);
+
+                top += 76;
             }
         }
     }
@@ -4049,6 +4583,32 @@ impl App {
 
         if self.overlay_menu.is_some() && self.handle_overlay_click(x, y) {
             return;
+        }
+
+        if let Some(action) = self.download_action_at(x, y) {
+            self.run_download_action(action);
+            return;
+        }
+
+        for (target, rect) in self.download_indicator_rects() {
+            if point_in_rect(x, y, rect) {
+                self.download_panel = Some(match target {
+                    Some(id) => DownloadPanelMode::Single(id),
+                    None => DownloadPanelMode::All,
+                });
+                self.refresh();
+                return;
+            }
+        }
+
+        if self.download_panel.is_some()
+            && !self
+                .download_panel_rect()
+                .map(|rect| point_in_rect(x, y, rect))
+                .unwrap_or(false)
+        {
+            self.download_panel = None;
+            self.refresh();
         }
 
         if self.command_open
@@ -6366,6 +6926,15 @@ extern "system" fn window_proc(hwnd: HWND, msg: u32, w_param: WPARAM, l_param: L
                 });
                 return LRESULT(0);
             }
+            if w_param.0 == DOWNLOAD_TIMER_ID {
+                with_app(hwnd, |app| {
+                    app.ensure_download_timer();
+                    unsafe {
+                        let _ = InvalidateRect(Some(app.hwnd), None, false);
+                    }
+                });
+                return LRESULT(0);
+            }
 
             unsafe { WindowsAndMessaging::DefWindowProcW(hwnd, msg, w_param, l_param) }
         }
@@ -6657,6 +7226,77 @@ fn draw_settings_button(hdc: HDC, rect: RECT, hovered: bool, icon_font: &HFONT) 
         }
         draw_icon_glyph(hdc, icon_font, glyph(0xE713).as_str(), rect, COLOR_MUTED);
     }
+}
+
+unsafe fn draw_download_indicator(
+    hdc: HDC,
+    rect: RECT,
+    progress: f32,
+    completed: bool,
+    completed_at: Option<std::time::Instant>,
+    icon_font: &HFONT,
+) {
+    fill_round_rect(hdc, rect, COLOR_PANEL_2, 32);
+    draw_outline(hdc, rect, 0x4a4a4a, 32);
+    draw_progress_arc(hdc, rect, progress, COLOR_ACCENT, 3);
+
+    let morph = completed_at
+        .map(|at| (at.elapsed().as_millis() as f32 / 420.0).clamp(0.0, 1.0))
+        .unwrap_or(if completed { 1.0 } else { 0.0 });
+    let download_color = mix_color(COLOR_MUTED, COLOR_PANEL_2, morph);
+    let tick_color = mix_color(COLOR_PANEL_2, COLOR_MUTED, morph);
+    if morph < 0.96 {
+        draw_icon_glyph(
+            hdc,
+            icon_font,
+            glyph(0xE896).as_str(),
+            RECT {
+                left: rect.left + 1,
+                top: rect.top + 1,
+                right: rect.right - 1,
+                bottom: rect.bottom - 1,
+            },
+            download_color,
+        );
+    }
+    if morph > 0.04 {
+        draw_icon_glyph(
+            hdc,
+            icon_font,
+            glyph(0xE8FB).as_str(),
+            RECT {
+                left: rect.left + 1,
+                top: rect.top + 1,
+                right: rect.right - 1,
+                bottom: rect.bottom - 1,
+            },
+            tick_color,
+        );
+    }
+}
+
+unsafe fn draw_progress_arc(hdc: HDC, rect: RECT, progress: f32, color: u32, width: i32) {
+    let progress = progress.clamp(0.0, 1.0);
+    if progress <= 0.0 {
+        return;
+    }
+    let cx = (rect.left + rect.right) as f32 / 2.0;
+    let cy = (rect.top + rect.bottom) as f32 / 2.0;
+    let radius = ((rect.right - rect.left).min(rect.bottom - rect.top) as f32 / 2.0) - 2.5;
+    let steps = (64.0 * progress).ceil().max(2.0) as i32;
+    with_pen(hdc, color, width, || {
+        for step in 0..=steps {
+            let t = step as f32 / steps as f32;
+            let angle = -std::f32::consts::FRAC_PI_2 + std::f32::consts::TAU * progress * t;
+            let x = (cx + radius * angle.cos()).round() as i32;
+            let y = (cy + radius * angle.sin()).round() as i32;
+            if step == 0 {
+                let _ = MoveToEx(hdc, x, y, None);
+            } else {
+                let _ = LineTo(hdc, x, y);
+            }
+        }
+    });
 }
 
 impl IconKind {
@@ -7188,6 +7828,89 @@ fn blend_disc(
 
 fn glyph(codepoint: u32) -> String {
     char::from_u32(codepoint).unwrap_or(' ').to_string()
+}
+
+fn download_snapshot(operation: &ICoreWebView2DownloadOperation) -> DownloadSnapshot {
+    unsafe {
+        let mut uri = PWSTR::null();
+        let uri = if operation.Uri(&mut uri).is_ok() {
+            CoTaskMemPWSTR::from(uri).to_string()
+        } else {
+            String::new()
+        };
+        let mut file_path = PWSTR::null();
+        let file_path = if operation.ResultFilePath(&mut file_path).is_ok() {
+            CoTaskMemPWSTR::from(file_path).to_string()
+        } else {
+            String::new()
+        };
+        let mut received_bytes = 0;
+        let _ = operation.BytesReceived(&mut received_bytes);
+        let mut total_bytes = 0;
+        let _ = operation.TotalBytesToReceive(&mut total_bytes);
+        let mut state = COREWEBVIEW2_DOWNLOAD_STATE_IN_PROGRESS;
+        let _ = operation.State(&mut state);
+        DownloadSnapshot {
+            uri,
+            file_path,
+            received_bytes,
+            total_bytes,
+            state,
+        }
+    }
+}
+
+fn download_file_name(file_path: &str, uri: &str) -> String {
+    Path::new(file_path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .map(|name| name.to_string())
+        .or_else(|| {
+            uri.rsplit('/')
+                .find(|part| !part.is_empty())
+                .map(|part| part.split('?').next().unwrap_or(part).to_string())
+        })
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| "download".to_string())
+}
+
+fn format_bytes(bytes: i64) -> String {
+    let bytes = bytes.max(0) as f64;
+    let units = ["B", "KB", "MB", "GB", "TB"];
+    let mut size = bytes;
+    let mut unit = 0;
+    while size >= 1024.0 && unit < units.len() - 1 {
+        size /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{} {}", size.round() as i64, units[unit])
+    } else {
+        format!("{:.1} {}", size, units[unit])
+    }
+}
+
+fn download_state_label(download: &DownloadItem) -> &'static str {
+    if download.paused {
+        return "Paused";
+    }
+    if download.state == COREWEBVIEW2_DOWNLOAD_STATE_COMPLETED {
+        "Complete"
+    } else if download.state == COREWEBVIEW2_DOWNLOAD_STATE_INTERRUPTED {
+        "Stopped"
+    } else {
+        "Downloading"
+    }
+}
+
+fn open_in_file_explorer(file_path: &str) {
+    if file_path.is_empty() {
+        return;
+    }
+    let _ = Command::new("explorer.exe")
+        .arg(format!("/select,{}", file_path))
+        .spawn();
 }
 
 fn menu_item(id: usize, label: &str) -> OverlayMenuItem {
