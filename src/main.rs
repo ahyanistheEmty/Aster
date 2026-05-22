@@ -8493,9 +8493,27 @@ fn open_in_file_explorer(file_path: &str) {
     if file_path.is_empty() {
         return;
     }
-    let _ = Command::new("explorer.exe")
-        .arg(format!("/select,{}", file_path))
-        .spawn();
+    let path = Path::new(file_path);
+
+    let full_path = if path.is_relative() {
+        if let Ok(cwd) = std::env::current_dir() {
+            cwd.join(path)
+        } else {
+            path.to_path_buf()
+        }
+    } else {
+        path.to_path_buf()
+    };
+
+    if full_path.exists() {
+        let _ = Command::new("explorer.exe")
+            .arg(format!("/select,{}", full_path.display()))
+            .spawn();
+    } else if let Some(parent) = full_path.parent() {
+        let _ = Command::new("explorer.exe")
+            .arg(parent.as_os_str())
+            .spawn();
+    }
 }
 
 fn menu_item(id: usize, label: &str) -> OverlayMenuItem {
