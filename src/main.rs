@@ -23,7 +23,8 @@ use windows::{
             CreateCompatibleDC, CreateDIBSection, CreateFontW, CreatePen, CreateRectRgn,
             CreateSolidBrush, DeleteDC, DeleteObject, DrawTextW, EndPaint, FillRect,
             GetMonitorInfoW, GetStockObject, InvalidateRect, LineTo, MonitorFromWindow, MoveToEx,
-            RoundRect, ScreenToClient, SelectObject, SetBkMode, SetTextColor, SetWindowRgn,
+            RoundRect, ScreenToClient, SelectObject, SetBkMode, SetTextColor, SetViewportOrgEx,
+            SetWindowRgn,
             StretchBlt, AC_SRC_ALPHA, AC_SRC_OVER, BITMAPINFO, BITMAPINFOHEADER, BI_RGB,
             BLENDFUNCTION, DIB_RGB_COLORS, DT_CENTER, DT_END_ELLIPSIS, DT_LEFT, DT_SINGLELINE,
             DT_VCENTER, HBITMAP, HBRUSH, HDC, HFONT, HGDIOBJ, MONITORINFO,
@@ -547,6 +548,8 @@ struct App {
     downloads: Vec<DownloadItem>,
     next_download_id: usize,
     download_panel: Option<DownloadPanelMode>,
+    download_panel_reveal: f32,
+    download_panel_reveal_target: f32,
 }
 
 struct DragGhost {
@@ -673,6 +676,8 @@ impl App {
             downloads: Vec::new(),
             next_download_id: 1,
             download_panel: None,
+            download_panel_reveal: 0.0,
+            download_panel_reveal_target: 0.0,
         };
         app.load_state()?;
         unsafe {
@@ -2002,14 +2007,33 @@ impl App {
         self.refresh();
     }
 
+    fn tick_download_panel_animation(&mut self) {
+        if self.download_panel.is_none() {
+            return;
+        }
+        let distance = self.download_panel_reveal_target - self.download_panel_reveal;
+        if distance.abs() < 0.005 {
+            self.download_panel_reveal = self.download_panel_reveal_target;
+            if self.download_panel_reveal < 0.01 {
+                self.download_panel = None;
+                self.download_panel_reveal = 0.0;
+            }
+        } else {
+            self.download_panel_reveal += distance * 0.35;
+        }
+    }
+
     fn ensure_download_timer(&self) {
-        let needs_timer = self.downloads.iter().any(|download| {
-            download.state == COREWEBVIEW2_DOWNLOAD_STATE_IN_PROGRESS
-                || download
-                    .completed_at
-                    .map(|at| at.elapsed().as_millis() < 900)
-                    .unwrap_or(false)
-        });
+        let panel_animating = self.download_panel.is_some()
+            && (self.download_panel_reveal - self.download_panel_reveal_target).abs() > 0.005;
+        let needs_timer = panel_animating
+            || self.downloads.iter().any(|download| {
+                download.state == COREWEBVIEW2_DOWNLOAD_STATE_IN_PROGRESS
+                    || download
+                        .completed_at
+                        .map(|at| at.elapsed().as_millis() < 900)
+                        .unwrap_or(false)
+            });
         unsafe {
             if needs_timer {
                 let _ = WindowsAndMessaging::SetTimer(Some(self.hwnd), DOWNLOAD_TIMER_ID, 16, None);
@@ -3928,7 +3952,36 @@ impl App {
                 self.paint_settings_menu(hdc);
             }
             if self.download_panel.is_some() {
-                self.paint_download_panel(hdc);
+                if self.download_panel_reveal >= 0.995 {
+                    self.paint_download_panel(hdc);
+                } else if self.download_panel_reveal > 0.005 {
+                    if let Some(panel) = self.download_panel_rect() {
+                        let pw = panel.right - panel.left;
+                        let ph = panel.bottom - panel.top;
+                        if pw > 0 && ph > 0 {
+                            let mem_dc = CreateCompatibleDC(Some(hdc));
+                            if !mem_dc.is_invalid() {
+                                let bitmap = CreateCompatibleBitmap(hdc, pw, ph);
+                                let old = SelectObject(mem_dc, HGDIOBJ(bitmap.0));
+                                fill_rect(mem_dc, RECT { left: panel.left, top: panel.top, right: panel.right, bottom: panel.bottom }, 0x151515);
+                                let _ = SetViewportOrgEx(mem_dc, -panel.left, -panel.top, None);
+                                self.paint_download_panel(mem_dc);
+                                let _ = SetViewportOrgEx(mem_dc, 0, 0, None);
+                                let alpha = (self.download_panel_reveal * 255.0) as u8;
+                                let blend = BLENDFUNCTION {
+                                    BlendOp: AC_SRC_OVER as u8,
+                                    BlendFlags: 0,
+                                    SourceConstantAlpha: alpha,
+                                    AlphaFormat: 0,
+                                };
+                                let _ = AlphaBlend(hdc, panel.left, panel.top, pw, ph, mem_dc, 0, 0, pw, ph, blend);
+                                let _ = SelectObject(mem_dc, old);
+                                let _ = DeleteObject(HGDIOBJ(bitmap.0));
+                                let _ = DeleteDC(mem_dc);
+                            }
+                        }
+                    }
+                }
             }
         }
     }
@@ -4863,18 +4916,22 @@ impl App {
                     Some(id) => DownloadPanelMode::Single(id),
                     None => DownloadPanelMode::All,
                 });
+                self.download_panel_reveal = 0.0;
+                self.download_panel_reveal_target = 1.0;
                 self.refresh();
                 return;
             }
         }
 
         if self.download_panel.is_some()
+            && self.download_panel_reveal > 0.01
             && !self
                 .download_panel_rect()
                 .map(|rect| point_in_rect(x, y, rect))
                 .unwrap_or(false)
         {
-            self.download_panel = None;
+            self.download_panel_reveal_target = 0.0;
+            self.ensure_download_timer();
             self.refresh();
         }
 
@@ -7326,6 +7383,7 @@ extern "system" fn window_proc(hwnd: HWND, msg: u32, w_param: WPARAM, l_param: L
             }
             if w_param.0 == DOWNLOAD_TIMER_ID {
                 with_app(hwnd, |app| {
+                    app.tick_download_panel_animation();
                     app.poll_downloads();
                     unsafe {
                         let _ = InvalidateRect(Some(app.hwnd), None, false);
