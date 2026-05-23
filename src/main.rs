@@ -191,6 +191,24 @@ impl Drop for BackgroundBitmap {
     }
 }
 
+struct PaintCache {
+    bitmap: HBITMAP,
+    dc: HDC,
+    width: i32,
+    height: i32,
+    old_bitmap: HGDIOBJ,
+}
+
+impl Drop for PaintCache {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = SelectObject(self.dc, self.old_bitmap);
+            let _ = DeleteObject(HGDIOBJ(self.bitmap.0));
+            let _ = DeleteDC(self.dc);
+        }
+    }
+}
+
 struct Workspace {
     id: usize,
     name: String,
@@ -581,6 +599,7 @@ struct App {
     download_popup_hwnd: HWND,
     download_removal_anim: Option<DownloadRemovalAnim>,
     download_collapse_anim: Option<DownloadCollapseAnim>,
+    paint_cache: RefCell<Option<PaintCache>>,
 }
 
 struct DragGhost {
@@ -714,6 +733,7 @@ impl App {
             download_popup_hwnd,
             download_removal_anim: None,
             download_collapse_anim: None,
+            paint_cache: RefCell::new(None),
         };
         app.load_state()?;
         unsafe {
@@ -7696,19 +7716,44 @@ extern "system" fn window_proc(hwnd: HWND, msg: u32, w_param: WPARAM, l_param: L
                 let rect = client_rect(hwnd);
                 let width = rect.right - rect.left;
                 let height = rect.bottom - rect.top;
-                let mem_dc = CreateCompatibleDC(Some(hdc));
-                let bitmap = CreateCompatibleBitmap(hdc, width, height);
-                let old_bitmap = SelectObject(mem_dc, HGDIOBJ(bitmap.0));
-                let _ = FillRect(
-                    mem_dc,
-                    &rect,
-                    with_app_return(hwnd, |app| app.brushes.black).unwrap_or(solid_brush(0)),
-                );
-                with_app(hwnd, |app| app.paint(mem_dc));
-                let _ = BitBlt(hdc, 0, 0, width, height, Some(mem_dc), 0, 0, SRCCOPY);
-                let _ = SelectObject(mem_dc, old_bitmap);
-                let _ = DeleteObject(HGDIOBJ(bitmap.0));
-                let _ = DeleteDC(mem_dc);
+                if width > 0 && height > 0 {
+                    with_app(hwnd, |app| {
+                        let mem_dc = {
+                            let mut cache = app.paint_cache.borrow_mut();
+                            let cached = cache.get_or_insert_with(|| {
+                                let dc = CreateCompatibleDC(Some(hdc));
+                                let bitmap = CreateCompatibleBitmap(hdc, width, height);
+                                let old_bitmap = SelectObject(dc, HGDIOBJ(bitmap.0));
+                                PaintCache {
+                                    bitmap,
+                                    dc,
+                                    width,
+                                    height,
+                                    old_bitmap,
+                                }
+                            });
+                            if cached.width != width || cached.height != height {
+                                let _ = SelectObject(cached.dc, cached.old_bitmap);
+                                let _ = DeleteObject(HGDIOBJ(cached.bitmap.0));
+                                let _ = DeleteDC(cached.dc);
+                                let dc = CreateCompatibleDC(Some(hdc));
+                                let bitmap = CreateCompatibleBitmap(hdc, width, height);
+                                let old_bitmap = SelectObject(dc, HGDIOBJ(bitmap.0));
+                                *cached = PaintCache {
+                                    bitmap,
+                                    dc,
+                                    width,
+                                    height,
+                                    old_bitmap,
+                                };
+                            }
+                            cached.dc
+                        };
+                        let _ = FillRect(mem_dc, &rect, app.brushes.black);
+                        app.paint(mem_dc);
+                        let _ = BitBlt(hdc, 0, 0, width, height, Some(mem_dc), 0, 0, SRCCOPY);
+                    });
+                }
                 let _ = EndPaint(hwnd, &ps);
             }
             LRESULT(0)
