@@ -401,6 +401,11 @@ struct DownloadToastState {
     slide_x: f32,
 }
 
+struct DownloadCollapseAnim {
+    start_time: std::time::Instant,
+    duration: u64,
+}
+
 struct DownloadRemovalAnim {
     start_time: std::time::Instant,
     duration: u64,
@@ -575,6 +580,7 @@ struct App {
     download_panel_reveal_target: f32,
     download_popup_hwnd: HWND,
     download_removal_anim: Option<DownloadRemovalAnim>,
+    download_collapse_anim: Option<DownloadCollapseAnim>,
 }
 
 struct DragGhost {
@@ -707,6 +713,7 @@ impl App {
             download_panel_reveal_target: 0.0,
             download_popup_hwnd,
             download_removal_anim: None,
+            download_collapse_anim: None,
         };
         app.load_state()?;
         unsafe {
@@ -1945,6 +1952,7 @@ impl App {
             suggested_path
         };
         let file_name = download_file_name(&file_path, &snapshot.uri);
+        let old_count = self.downloads.len();
         self.downloads.push(DownloadItem {
             id,
             file_name,
@@ -1958,6 +1966,12 @@ impl App {
             cancelled_at: None,
             operation: Some(operation),
         });
+        if self.downloads.len() == 4 && old_count == 3 {
+            self.download_collapse_anim = Some(DownloadCollapseAnim {
+                start_time: std::time::Instant::now(),
+                duration: 180,
+            });
+        }
         if self.sidebar_width() <= 92 {
             self.download_toast = Some(DownloadToastState {
                 start_time: std::time::Instant::now(),
@@ -2133,6 +2147,12 @@ impl App {
                 self.refresh();
             }
         }
+        if let Some(anim) = &self.download_collapse_anim {
+            if anim.start_time.elapsed().as_millis() >= anim.duration as u128 {
+                self.download_collapse_anim = None;
+                self.refresh();
+            }
+        }
     }
 
     fn ensure_download_timer(&self) {
@@ -2141,6 +2161,7 @@ impl App {
         let needs_timer = panel_animating
             || self.download_toast.is_some()
             || self.download_removal_anim.is_some()
+            || self.download_collapse_anim.is_some()
             || self.downloads.iter().any(|download| {
                 download.state == COREWEBVIEW2_DOWNLOAD_STATE_IN_PROGRESS
                     || download
@@ -4343,6 +4364,10 @@ impl App {
     }
 
     fn paint_download_indicators(&self, hdc: HDC) {
+        if self.download_collapse_anim.is_some() {
+            self.paint_download_collapse(hdc);
+            return;
+        }
         if self.download_removal_anim.is_some() {
             self.paint_download_indicators_animating(hdc);
             return;
@@ -4448,6 +4473,39 @@ impl App {
         }
     }
 
+    fn paint_download_collapse(&self, hdc: HDC) {
+        let anim = match &self.download_collapse_anim {
+            Some(a) => a,
+            None => return,
+        };
+        let elapsed = anim.start_time.elapsed().as_millis();
+        let progress = (elapsed as f32 / anim.duration as f32).min(1.0);
+        let ease = 1.0 - (1.0 - progress) * (1.0 - progress);
+        let settings = self.settings_rect();
+        let start_x = settings.right + 14;
+        let y = settings.top;
+        unsafe {
+            for i in 0..self.downloads.len().min(3) {
+                if let Some(download) = self.downloads.get(i) {
+                    let start_xi = start_x + i as i32 * 40;
+                    let end_offset = match i { 0 => 10, 1 => 5, _ => 0 };
+                    let end_xi = start_x + end_offset;
+                    let cur_x = start_xi + ((end_xi - start_xi) as f32 * ease) as i32;
+                    let rect = RECT { left: cur_x, top: y, right: cur_x + 32, bottom: y + 32 };
+                    draw_download_indicator(
+                        hdc, rect,
+                        self.download_progress(download),
+                        download.state == COREWEBVIEW2_DOWNLOAD_STATE_COMPLETED,
+                        download.completed_at,
+                        download.state == COREWEBVIEW2_DOWNLOAD_STATE_INTERRUPTED,
+                        download.cancelled_at,
+                        false,
+                    );
+                }
+            }
+        }
+    }
+
     unsafe fn paint_download_indicator_faded(&self, hdc: HDC, rect: RECT, fade_alpha: f32, anim: &DownloadRemovalAnim) {
         let size = rect.right - rect.left;
         let mem_dc = CreateCompatibleDC(Some(hdc));
@@ -4508,23 +4566,24 @@ impl App {
             if self.hover_target == Some(HoverTarget::DownloadOverflow) {
                 fill_round_rect(hdc, rect, COLOR_SURFACE_HOVER, 16);
             }
-            for offset in [10, 5, 0] {
-                let circle = RECT {
-                    left: rect.left + offset,
-                    top: rect.top,
-                    right: rect.left + offset + 32,
-                    bottom: rect.bottom,
-                };
-                draw_download_indicator(
-                    hdc,
-                    circle,
-                    1.0,
-                    false,
-                    None,
-                    false,
-                    None,
-                    self.hover_target == Some(HoverTarget::DownloadOverflow),
-                );
+            for (i, offset) in [10, 5, 0].iter().enumerate() {
+                if let Some(download) = self.downloads.get(i) {
+                    let circle = RECT {
+                        left: rect.left + offset,
+                        top: rect.top,
+                        right: rect.left + offset + 32,
+                        bottom: rect.bottom,
+                    };
+                    draw_download_indicator(
+                        hdc, circle,
+                        self.download_progress(download),
+                        download.state == COREWEBVIEW2_DOWNLOAD_STATE_COMPLETED,
+                        download.completed_at,
+                        download.state == COREWEBVIEW2_DOWNLOAD_STATE_INTERRUPTED,
+                        download.cancelled_at,
+                        self.hover_target == Some(HoverTarget::DownloadOverflow),
+                    );
+                }
             }
             draw_text(
                 hdc,
