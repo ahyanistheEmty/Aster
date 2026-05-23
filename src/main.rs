@@ -8311,8 +8311,9 @@ fn render_download_indicator_pixels(
     } else {
         COLOR_PANEL_2
     };
+    let morph_amount = if cancelled { morph.clamp(0.0, 1.0) } else { 0.0 };
     let circle_bg = if cancelled {
-        mix_color(bg, x_color, 0.15)
+        mix_color(bg, x_color, 0.15 * morph_amount)
     } else {
         bg
     };
@@ -8324,7 +8325,7 @@ fn render_download_indicator_pixels(
         center,
         radius - 0.7,
         1.35,
-        if cancelled { x_color } else { 0x565656 },
+        if cancelled { mix_color(0x565656, x_color, morph_amount) } else { 0x565656 },
         1.0,
     );
     if !cancelled {
