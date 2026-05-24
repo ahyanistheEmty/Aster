@@ -9006,6 +9006,12 @@ unsafe extern "system" fn find_edit_proc(
             }
             return LRESULT(0);
         }
+        if key == 0x46 && (GetKeyState(VK_CONTROL.0 as i32) as u16 & 0x8000) != 0 {
+            if let Ok(parent) = WindowsAndMessaging::GetParent(hwnd) {
+                with_app(parent, |app| app.hide_find_bar());
+            }
+            return LRESULT(0);
+        }
     }
     if msg == WM_CHAR && w_param.0 as u32 == VK_RETURN.0 as u32 {
         return LRESULT(0);
