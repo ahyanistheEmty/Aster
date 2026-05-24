@@ -469,6 +469,7 @@ struct DownloadToastState {
 
 struct BookmarkToastState {
     start_time: std::time::Instant,
+    is_unbookmark: bool,
 }
 
 struct DownloadCollapseAnim {
@@ -925,8 +926,11 @@ impl App {
         self.save_state();
         if added {
             self.show_bookmark_toast();
+            self.refresh();
+        } else {
+            self.show_unbookmark_toast();
+            self.refresh();
         }
-        self.refresh();
     }
 
     fn address_menu_rect(&self) -> RECT {
@@ -1025,6 +1029,15 @@ impl App {
         self.refresh();
     }
 
+    fn hide_find_bar(&mut self) {
+        self.find_open = false;
+        self.find_match_count = 0;
+        self.find_current_match = 0;
+        self.run_find_script(0);
+        self.layout();
+        self.refresh();
+    }
+
     fn run_find_script(&mut self, delta: i32) {
         if !self.find_open && self.find_query.is_empty() {
             self.execute_find_script("", 0);
@@ -1101,6 +1114,27 @@ impl App {
     fn show_bookmark_toast(&mut self) {
         self.bookmark_toast = Some(BookmarkToastState {
             start_time: std::time::Instant::now(),
+            is_unbookmark: false,
+        });
+        let rect = client_rect(self.hwnd);
+        unsafe {
+            let _ = WindowsAndMessaging::SetWindowPos(
+                self.bookmark_popup_hwnd,
+                Some(HWND_TOP),
+                18,
+                rect.bottom - 74,
+                210,
+                48,
+                WindowsAndMessaging::SWP_NOACTIVATE | WindowsAndMessaging::SWP_SHOWWINDOW,
+            );
+        }
+        self.ensure_download_timer();
+    }
+
+    fn show_unbookmark_toast(&mut self) {
+        self.bookmark_toast = Some(BookmarkToastState {
+            start_time: std::time::Instant::now(),
+            is_unbookmark: true,
         });
         let rect = client_rect(self.hwnd);
         unsafe {
@@ -6719,8 +6753,6 @@ impl App {
             }
 
             if point_in_rect(x, y, self.mode_row_rect()) {
-                self.mode_menu_open = !self.mode_menu_open;
-                self.refresh();
                 return;
             }
             if point_in_rect(x, y, self.settings_page_row_rect()) {
@@ -7515,7 +7547,6 @@ impl App {
                     self.hover_target = Some(HoverTarget::SettingsPage);
                     self.mode_menu_open = false;
                 } else if self.settings_open
-                    && self.mode_menu_open
                     && point_in_rect(x, y, self.mode_options_rect())
                 {
                     let options = self.mode_options_rect();
@@ -7530,6 +7561,14 @@ impl App {
                     }
                 }
             }
+        }
+
+        if self.settings_open
+            && self.mode_menu_open
+            && !point_in_rect(x, y, self.mode_row_rect())
+            && !point_in_rect(x, y, self.mode_options_rect())
+        {
+            self.mode_menu_open = false;
         }
 
         if let Some(SidebarHit::Tab(tab_array_index)) = self.hit_sidebar(x, y) {
@@ -9240,6 +9279,7 @@ unsafe extern "system" fn bookmark_popup_proc(
                             hdc,
                             rect,
                             toast.start_time.elapsed().as_millis() as u64,
+                            toast.is_unbookmark,
                         );
                     }
                 });
@@ -9741,7 +9781,11 @@ fn handle_keydown(hwnd: HWND, w_param: WPARAM) {
                 app.toggle_active_bookmark();
             }
             0x46 if ctrl => {
-                app.open_find_bar();
+                if app.find_open {
+                    app.hide_find_bar();
+                } else {
+                    app.open_find_bar();
+                }
             }
             0x4C if ctrl => {
                 app.open_command(CommandMode::Navigate);
@@ -10110,7 +10154,7 @@ unsafe fn draw_download_popup_gdi(hdc: HDC, rect: RECT, elapsed_ms: u64) {
     }
 }
 
-unsafe fn draw_bookmark_popup_gdi(hdc: HDC, rect: RECT, elapsed_ms: u64) {
+unsafe fn draw_bookmark_popup_gdi(hdc: HDC, rect: RECT, elapsed_ms: u64, is_unbookmark: bool) {
     let slide = if elapsed_ms < 180 {
         1.0 - (elapsed_ms as f32 / 180.0)
     } else {
@@ -10128,7 +10172,13 @@ unsafe fn draw_bookmark_popup_gdi(hdc: HDC, rect: RECT, elapsed_ms: u64) {
     };
     let icon_font = create_font_with_face(20, 600, w!("Segoe UI Symbol"))
         .unwrap_or(HFONT(std::ptr::null_mut()));
-    draw_centered_text(hdc, &icon_font, "*", star_rect, 0x27d8ff);
+    draw_centered_text(
+        hdc,
+        &icon_font,
+        if is_unbookmark { "☆" } else { "*" },
+        star_rect,
+        if is_unbookmark { 0x888888 } else { 0x27d8ff },
+    );
     if icon_font != HFONT(std::ptr::null_mut()) {
         let _ = DeleteObject(HGDIOBJ(icon_font.0));
     }
@@ -10136,7 +10186,7 @@ unsafe fn draw_bookmark_popup_gdi(hdc: HDC, rect: RECT, elapsed_ms: u64) {
     draw_text(
         hdc,
         &text_font,
-        "Bookmarked Site!",
+        if is_unbookmark { "Unbookmarked" } else { "Bookmarked Site!" },
         RECT {
             left: body.left + 52,
             top: body.top,
