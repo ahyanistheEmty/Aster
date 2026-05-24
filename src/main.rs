@@ -25,10 +25,9 @@ use windows::{
             CreateSolidBrush, DeleteDC, DeleteObject, DrawTextW, EndPaint, FillRect,
             GetMonitorInfoW, GetStockObject, InvalidateRect, LineTo, MonitorFromWindow, MoveToEx,
             RoundRect, ScreenToClient, SelectObject, SetBkMode, SetTextColor, SetViewportOrgEx,
-            SetWindowRgn,
-            StretchBlt, AC_SRC_ALPHA, AC_SRC_OVER, BITMAPINFO, BITMAPINFOHEADER, BI_RGB,
-            BLENDFUNCTION, DIB_RGB_COLORS, DT_CENTER, DT_END_ELLIPSIS, DT_LEFT, DT_SINGLELINE,
-            DT_VCENTER, HBITMAP, HBRUSH, HDC, HFONT, HGDIOBJ, MONITORINFO,
+            SetWindowRgn, StretchBlt, AC_SRC_ALPHA, AC_SRC_OVER, BITMAPINFO, BITMAPINFOHEADER,
+            BI_RGB, BLENDFUNCTION, DIB_RGB_COLORS, DT_CENTER, DT_END_ELLIPSIS, DT_LEFT,
+            DT_SINGLELINE, DT_VCENTER, HBITMAP, HBRUSH, HDC, HFONT, HGDIOBJ, MONITORINFO,
             MONITOR_DEFAULTTONEAREST, NULL_BRUSH, NULL_PEN, SRCCOPY, TRANSPARENT,
         },
         Graphics::Imaging::{
@@ -227,6 +226,7 @@ struct Folder {
     name: String,
     collapsed: bool,
     pinned: bool,
+    sidebar_order: u64,
 }
 
 struct Tab {
@@ -235,6 +235,7 @@ struct Tab {
     folder_id: Option<usize>,
     pinned: bool,
     pinned_url: Option<String>,
+    sidebar_order: u64,
     title: String,
     url: String,
     favicon_uri: String,
@@ -545,6 +546,7 @@ struct App {
     next_id: usize,
     next_workspace_id: usize,
     next_folder_id: usize,
+    next_sidebar_order: u64,
     workspace_active_tabs: Vec<(usize, usize)>,
     sidebar_scroll_offset: usize,
     workspace_swipe_accum: i32,
@@ -675,6 +677,7 @@ impl App {
             next_id: 1,
             next_workspace_id: 2,
             next_folder_id: 1,
+            next_sidebar_order: 1024,
             workspace_active_tabs: Vec::new(),
             sidebar_scroll_offset: 0,
             workspace_swipe_accum: 0,
@@ -754,6 +757,12 @@ impl App {
         self.create_tab_in_workspace(url, self.active_workspace, None, false, true, None)
     }
 
+    fn allocate_sidebar_order(&mut self) -> u64 {
+        let order = self.next_sidebar_order;
+        self.next_sidebar_order = self.next_sidebar_order.saturating_add(1024);
+        order
+    }
+
     fn create_tab_in_workspace(
         &mut self,
         url: &str,
@@ -775,6 +784,7 @@ impl App {
         let id = self.next_id;
         self.next_id += 1;
         let index = self.tabs.len();
+        let sidebar_order = self.allocate_sidebar_order();
         self.attach_events(index, id, &webview)?;
         self.attach_controller_events(&controller)?;
 
@@ -794,6 +804,7 @@ impl App {
             folder_id,
             pinned,
             pinned_url: if pinned { Some(url.to_string()) } else { None },
+            sidebar_order,
             title: "New Tab".to_string(),
             url: url.to_string(),
             favicon_uri: String::new(),
@@ -1118,18 +1129,115 @@ impl App {
         }
     }
 
+    fn row_sidebar_order(&self, row: SidebarRow) -> u64 {
+        match row {
+            SidebarRow::Folder(folder_id) => self
+                .folders
+                .iter()
+                .find(|folder| folder.id == folder_id)
+                .map(|folder| folder.sidebar_order)
+                .unwrap_or(u64::MAX),
+            SidebarRow::Tab(tab_index) => self
+                .tabs
+                .get(tab_index)
+                .map(|tab| tab.sidebar_order)
+                .unwrap_or(u64::MAX),
+            SidebarRow::Label(_) => 0,
+        }
+    }
+
+    fn sorted_sidebar_rows(&self, mut rows: Vec<SidebarRow>) -> Vec<SidebarRow> {
+        rows.sort_by_key(|row| self.row_sidebar_order(*row));
+        rows
+    }
+
+    fn root_section_rows(&self, pinned: bool) -> Vec<SidebarRow> {
+        let folders = self
+            .folders
+            .iter()
+            .filter(|folder| {
+                folder.workspace_id == self.active_workspace
+                    && folder.pinned == pinned
+                    && folder.parent_id.is_none()
+            })
+            .map(|folder| SidebarRow::Folder(folder.id));
+        let tabs = self
+            .tabs
+            .iter()
+            .enumerate()
+            .filter(|(_, tab)| {
+                tab.workspace_id == self.active_workspace
+                    && tab.pinned == pinned
+                    && tab.folder_id.is_none()
+            })
+            .map(|(index, _)| SidebarRow::Tab(index));
+        self.sorted_sidebar_rows(folders.chain(tabs).collect())
+    }
+
+    fn assign_row_sidebar_order(&mut self, row: SidebarRow, sidebar_order: u64) {
+        match row {
+            SidebarRow::Folder(folder_id) => {
+                if let Some(folder) = self
+                    .folders
+                    .iter_mut()
+                    .find(|folder| folder.id == folder_id)
+                {
+                    folder.sidebar_order = sidebar_order;
+                }
+            }
+            SidebarRow::Tab(tab_index) => {
+                if let Some(tab) = self.tabs.get_mut(tab_index) {
+                    tab.sidebar_order = sidebar_order;
+                }
+            }
+            SidebarRow::Label(_) => {}
+        }
+    }
+
+    fn assign_root_section_orders(&mut self, rows: Vec<SidebarRow>) {
+        for (index, row) in rows.into_iter().enumerate() {
+            self.assign_row_sidebar_order(row, ((index as u64) + 1) * 1024);
+        }
+    }
+
+    fn place_root_row_after(
+        &mut self,
+        moved: SidebarRow,
+        pinned: bool,
+        target: Option<SidebarRow>,
+    ) {
+        let mut rows: Vec<SidebarRow> = self
+            .root_section_rows(pinned)
+            .into_iter()
+            .filter(|row| *row != moved)
+            .collect();
+        let insert_at = target
+            .and_then(|target| {
+                rows.iter()
+                    .position(|row| *row == target)
+                    .map(|pos| pos + 1)
+            })
+            .unwrap_or(rows.len());
+        rows.insert(insert_at.min(rows.len()), moved);
+        self.assign_root_section_orders(rows);
+    }
+
+    fn place_root_row_at_start(&mut self, moved: SidebarRow, pinned: bool) {
+        let mut rows: Vec<SidebarRow> = self
+            .root_section_rows(pinned)
+            .into_iter()
+            .filter(|row| *row != moved)
+            .collect();
+        rows.insert(0, moved);
+        self.assign_root_section_orders(rows);
+    }
+
     fn add_folder_rows_recursive(&self, folder_id: usize, rows: &mut Vec<SidebarRow>) {
-        let child_folders: Vec<&Folder> = self
+        let child_folders = self
             .folders
             .iter()
             .filter(|f| f.workspace_id == self.active_workspace && f.parent_id == Some(folder_id))
-            .collect();
-        for cf in child_folders {
-            rows.push(SidebarRow::Folder(cf.id));
-            if !cf.collapsed {
-                self.add_folder_rows_recursive(cf.id, rows);
-            }
-        }
+            .map(|folder| SidebarRow::Folder(folder.id));
         let child_tabs: Vec<usize> = self
             .tabs
             .iter()
@@ -1139,7 +1247,17 @@ impl App {
             })
             .map(|(index, _)| index)
             .collect();
-        rows.extend(child_tabs.into_iter().map(SidebarRow::Tab));
+        let child_tabs = child_tabs.into_iter().map(SidebarRow::Tab);
+        for row in self.sorted_sidebar_rows(child_folders.chain(child_tabs).collect()) {
+            rows.push(row);
+            if let SidebarRow::Folder(child_folder_id) = row {
+                if let Some(folder) = self.folders.iter().find(|f| f.id == child_folder_id) {
+                    if !folder.collapsed {
+                        self.add_folder_rows_recursive(child_folder_id, rows);
+                    }
+                }
+            }
+        }
     }
 
     fn sidebar_rows(&self) -> Vec<SidebarRow> {
@@ -1147,19 +1265,13 @@ impl App {
 
         // Pinned Section
         let mut pinned_rows = Vec::new();
-        let root_pinned_folders: Vec<&Folder> = self
+        let root_pinned_folders = self
             .folders
             .iter()
             .filter(|f| {
                 f.workspace_id == self.active_workspace && f.pinned && f.parent_id.is_none()
             })
-            .collect();
-        for folder in root_pinned_folders {
-            pinned_rows.push(SidebarRow::Folder(folder.id));
-            if !folder.collapsed {
-                self.add_folder_rows_recursive(folder.id, &mut pinned_rows);
-            }
-        }
+            .map(|folder| SidebarRow::Folder(folder.id));
         let loose_pinned_tabs: Vec<usize> = self
             .tabs
             .iter()
@@ -1169,7 +1281,18 @@ impl App {
             })
             .map(|(index, _)| index)
             .collect();
-        pinned_rows.extend(loose_pinned_tabs.into_iter().map(SidebarRow::Tab));
+        let loose_pinned_tabs = loose_pinned_tabs.into_iter().map(SidebarRow::Tab);
+        for row in self.sorted_sidebar_rows(root_pinned_folders.chain(loose_pinned_tabs).collect())
+        {
+            pinned_rows.push(row);
+            if let SidebarRow::Folder(folder_id) = row {
+                if let Some(folder) = self.folders.iter().find(|f| f.id == folder_id) {
+                    if !folder.collapsed {
+                        self.add_folder_rows_recursive(folder_id, &mut pinned_rows);
+                    }
+                }
+            }
+        }
         rows.extend(pinned_rows);
 
         // Always push the divider line!
@@ -1177,19 +1300,13 @@ impl App {
 
         // Unpinned Section
         let mut unpinned_rows = Vec::new();
-        let root_unpinned_folders: Vec<&Folder> = self
+        let root_unpinned_folders = self
             .folders
             .iter()
             .filter(|f| {
                 f.workspace_id == self.active_workspace && !f.pinned && f.parent_id.is_none()
             })
-            .collect();
-        for folder in root_unpinned_folders {
-            unpinned_rows.push(SidebarRow::Folder(folder.id));
-            if !folder.collapsed {
-                self.add_folder_rows_recursive(folder.id, &mut unpinned_rows);
-            }
-        }
+            .map(|folder| SidebarRow::Folder(folder.id));
         let loose_tabs: Vec<usize> = self
             .tabs
             .iter()
@@ -1199,7 +1316,17 @@ impl App {
             })
             .map(|(index, _)| index)
             .collect();
-        unpinned_rows.extend(loose_tabs.into_iter().map(SidebarRow::Tab));
+        let loose_tabs = loose_tabs.into_iter().map(SidebarRow::Tab);
+        for row in self.sorted_sidebar_rows(root_unpinned_folders.chain(loose_tabs).collect()) {
+            unpinned_rows.push(row);
+            if let SidebarRow::Folder(folder_id) = row {
+                if let Some(folder) = self.folders.iter().find(|f| f.id == folder_id) {
+                    if !folder.collapsed {
+                        self.add_folder_rows_recursive(folder_id, &mut unpinned_rows);
+                    }
+                }
+            }
+        }
         rows.extend(unpinned_rows);
 
         // If dragging a folder or a tab, modify rows list to show ghost preview at target position
@@ -1239,27 +1366,9 @@ impl App {
                                 // Insert after the last root folder of the same pinned type —
                                 // this matches handle_drop, which always places root folders
                                 // in the folders-first, tabs-second section layout.
-                                let tab_pinned = self.tabs.get(target_tab_index).map(|t| t.pinned).unwrap_or(false);
-                                base_rows.iter()
-                                    .enumerate()
-                                    .rev()
-                                    .find(|(_, r)| match r {
-                                        SidebarRow::Folder(fid) => self.folders.iter().any(|f|
-                                            f.id == *fid && f.pinned == tab_pinned && f.parent_id.is_none()
-                                        ),
-                                        _ => false,
-                                    })
-                                    .map(|(i, _)| i + 1)
-                                    .unwrap_or_else(|| {
-                                        if tab_pinned {
-                                            0
-                                        } else {
-                                            base_rows.iter()
-                                                .position(|r| matches!(r, SidebarRow::Label(SidebarLabel::Tabs)))
-                                                .map(|pos| pos + 1)
-                                                .unwrap_or(base_rows.len())
-                                        }
-                                    })
+                                base_rows.iter().position(|r| matches!(r, SidebarRow::Tab(idx) if *idx == target_tab_index))
+                                    .map(|pos| pos + 1)
+                                    .unwrap_or(0)
                             }
                             _ => {
                                 // Unpinned section fallback: after the divider (SidebarLabel::Tabs)
@@ -1353,9 +1462,9 @@ impl App {
             self.sidebar_rows_top() + 72
         };
         let all_rows = self.sidebar_rows();
-        let effective_offset = self.sidebar_scroll_offset.min(
-            all_rows.len().saturating_sub(1),
-        );
+        let effective_offset = self
+            .sidebar_scroll_offset
+            .min(all_rows.len().saturating_sub(1));
         for skipped in all_rows.iter().take(effective_offset) {
             y += match skipped {
                 SidebarRow::Label(_) => 24,
@@ -1527,7 +1636,8 @@ impl App {
 
         let mut tab_records = Vec::new();
         let mut active_workspace = 1usize;
-        for line in raw.lines() {
+        for (line_index, line) in raw.lines().enumerate() {
+            let fallback_sidebar_order = ((line_index as u64) + 1) * 1024;
             let parts: Vec<String> = line.split('\t').map(unescape_state).collect();
             if parts.is_empty() {
                 continue;
@@ -1559,6 +1669,10 @@ impl App {
                             name: parts[3].clone(),
                             collapsed: parts.get(4).map(|value| value == "1").unwrap_or(false),
                             pinned: parts.get(5).map(|value| value == "1").unwrap_or(false),
+                            sidebar_order: parts
+                                .get(7)
+                                .and_then(|value| value.parse::<u64>().ok())
+                                .unwrap_or(fallback_sidebar_order),
                         });
                     }
                 }
@@ -1580,6 +1694,10 @@ impl App {
                                 .get(6)
                                 .map(|raw| parse_history(raw))
                                 .unwrap_or_default(),
+                            parts
+                                .get(7)
+                                .and_then(|value| value.parse::<u64>().ok())
+                                .unwrap_or(fallback_sidebar_order),
                         ));
                     }
                 }
@@ -1635,6 +1753,13 @@ impl App {
             .max()
             .unwrap_or(0)
             + 1;
+        self.next_sidebar_order = self
+            .folders
+            .iter()
+            .map(|folder| folder.sidebar_order)
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1024);
         self.active_workspace = if self
             .workspaces
             .iter()
@@ -1645,7 +1770,7 @@ impl App {
             self.workspaces[0].id
         };
 
-        for (workspace_id, folder_id, pinned, title, url, history) in tab_records {
+        for (workspace_id, folder_id, pinned, title, url, history, sidebar_order) in tab_records {
             if !url.trim().is_empty()
                 && self
                     .workspaces
@@ -1666,6 +1791,7 @@ impl App {
                     Some(title),
                 )?;
                 if let Some(tab) = self.tabs.last_mut() {
+                    tab.sidebar_order = sidebar_order;
                     tab.unloaded = true;
                     if !history.is_empty() {
                         tab.history = history;
@@ -1674,6 +1800,14 @@ impl App {
                 }
             }
         }
+        self.next_sidebar_order = self
+            .folders
+            .iter()
+            .map(|folder| folder.sidebar_order)
+            .chain(self.tabs.iter().map(|tab| tab.sidebar_order))
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1024);
         self.loading_state = false;
         self.switch_workspace(self.active_workspace);
         Ok(())
@@ -1697,7 +1831,7 @@ impl App {
         }
         for folder in &self.folders {
             lines.push(format!(
-                "folder\t{}\t{}\t{}\t{}\t{}\t{}",
+                "folder\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
                 folder.id,
                 folder.workspace_id,
                 escape_state(&folder.name),
@@ -1706,7 +1840,8 @@ impl App {
                 folder
                     .parent_id
                     .map(|id| id.to_string())
-                    .unwrap_or_default()
+                    .unwrap_or_default(),
+                folder.sidebar_order
             ));
         }
         for tab in &self.tabs {
@@ -1719,13 +1854,14 @@ impl App {
                 &tab.url
             };
             lines.push(format!(
-                "tab\t{}\t{}\t{}\t{}\t{}\t{}",
+                "tab\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
                 tab.workspace_id,
                 tab.folder_id.map(|id| id.to_string()).unwrap_or_default(),
                 if tab.pinned { "1" } else { "0" },
                 escape_state(&tab.title),
                 escape_state(url_to_save),
-                serialize_history(&tab.history)
+                serialize_history(&tab.history),
+                tab.sidebar_order
             ));
         }
         for site in self.visited_sites.iter().take(500) {
@@ -2143,7 +2279,10 @@ impl App {
                 if self.sidebar_width >= SIDEBAR_EXPANDED {
                     if self.download_popup_hwnd != HWND(std::ptr::null_mut()) {
                         unsafe {
-                            let _ = WindowsAndMessaging::ShowWindow(self.download_popup_hwnd, WindowsAndMessaging::SW_HIDE);
+                            let _ = WindowsAndMessaging::ShowWindow(
+                                self.download_popup_hwnd,
+                                WindowsAndMessaging::SW_HIDE,
+                            );
                         }
                     }
                     self.download_toast = None;
@@ -2156,7 +2295,10 @@ impl App {
                     if slide_elapsed >= slide_duration {
                         if self.download_popup_hwnd != HWND(std::ptr::null_mut()) {
                             unsafe {
-                                let _ = WindowsAndMessaging::ShowWindow(self.download_popup_hwnd, WindowsAndMessaging::SW_HIDE);
+                                let _ = WindowsAndMessaging::ShowWindow(
+                                    self.download_popup_hwnd,
+                                    WindowsAndMessaging::SW_HIDE,
+                                );
                             }
                         }
                         self.download_toast = None;
@@ -2374,10 +2516,14 @@ impl App {
                 }
                 return Some(DownloadAction::Cancel(download.id));
             }
-            if download.state != COREWEBVIEW2_DOWNLOAD_STATE_INTERRUPTED && point_in_rect(x, y, open) {
+            if download.state != COREWEBVIEW2_DOWNLOAD_STATE_INTERRUPTED
+                && point_in_rect(x, y, open)
+            {
                 return Some(DownloadAction::ShowInFolder(download.id));
             }
-            if download.state == COREWEBVIEW2_DOWNLOAD_STATE_IN_PROGRESS && point_in_rect(x, y, pause) {
+            if download.state == COREWEBVIEW2_DOWNLOAD_STATE_IN_PROGRESS
+                && point_in_rect(x, y, pause)
+            {
                 return Some(DownloadAction::TogglePause(download.id));
             }
             top += 58;
@@ -2405,7 +2551,9 @@ impl App {
             DownloadAction::Cancel(id) => {
                 if let Some(download) = self.downloads.iter_mut().find(|item| item.id == id) {
                     if let Some(operation) = download.operation.as_ref() {
-                        unsafe { let _ = operation.Cancel(); }
+                        unsafe {
+                            let _ = operation.Cancel();
+                        }
                     }
                     if !download.file_path.is_empty() {
                         let _ = fs::remove_file(&download.file_path);
@@ -2437,10 +2585,14 @@ impl App {
                     ));
                 }
                 self.downloads.retain(|item| item.id != id);
-                if self.download_panel == Some(DownloadPanelMode::Single(id)) || self.downloads.is_empty() {
+                if self.download_panel == Some(DownloadPanelMode::Single(id))
+                    || self.downloads.is_empty()
+                {
                     self.download_panel = None;
                 }
-                if let (Some(idx), Some((prog, compl, compl_at, cancelled, cancelled_at))) = (removed_index, cached) {
+                if let (Some(idx), Some((prog, compl, compl_at, cancelled, cancelled_at))) =
+                    (removed_index, cached)
+                {
                     if old_count >= 1 && old_count <= 4 {
                         self.download_removal_anim = Some(DownloadRemovalAnim {
                             start_time: std::time::Instant::now(),
@@ -3057,6 +3209,7 @@ impl App {
     fn create_folder_inline(&mut self) {
         let id = self.next_folder_id;
         self.next_folder_id += 1;
+        let sidebar_order = self.allocate_sidebar_order();
         self.folders.push(Folder {
             id,
             workspace_id: self.active_workspace,
@@ -3064,6 +3217,7 @@ impl App {
             name: "New Folder".to_string(),
             collapsed: false,
             pinned: false,
+            sidebar_order,
         });
         self.renaming_folder_id = Some(id);
         self.rename_buffer = "New Folder".to_string();
@@ -4213,7 +4367,13 @@ impl App {
                                     let dc = CreateCompatibleDC(Some(hdc));
                                     let bitmap = CreateCompatibleBitmap(hdc, pw, ph);
                                     let old = SelectObject(dc, HGDIOBJ(bitmap.0));
-                                    PaintCache { bitmap, dc, width: pw, height: ph, old_bitmap: old }
+                                    PaintCache {
+                                        bitmap,
+                                        dc,
+                                        width: pw,
+                                        height: ph,
+                                        old_bitmap: old,
+                                    }
                                 });
                                 if cached.width != pw || cached.height != ph {
                                     let _ = SelectObject(cached.dc, cached.old_bitmap);
@@ -4222,12 +4382,27 @@ impl App {
                                     let dc = CreateCompatibleDC(Some(hdc));
                                     let bitmap = CreateCompatibleBitmap(hdc, pw, ph);
                                     let old = SelectObject(dc, HGDIOBJ(bitmap.0));
-                                    *cached = PaintCache { bitmap, dc, width: pw, height: ph, old_bitmap: old };
+                                    *cached = PaintCache {
+                                        bitmap,
+                                        dc,
+                                        width: pw,
+                                        height: ph,
+                                        old_bitmap: old,
+                                    };
                                 }
                                 cached.dc
                             };
                             if !mem_dc.is_invalid() {
-                                fill_rect(mem_dc, RECT { left: panel.left, top: panel.top, right: panel.right, bottom: panel.bottom }, 0x151515);
+                                fill_rect(
+                                    mem_dc,
+                                    RECT {
+                                        left: panel.left,
+                                        top: panel.top,
+                                        right: panel.right,
+                                        bottom: panel.bottom,
+                                    },
+                                    0x151515,
+                                );
                                 let _ = SetViewportOrgEx(mem_dc, -panel.left, -panel.top, None);
                                 self.paint_download_panel(mem_dc);
                                 let _ = SetViewportOrgEx(mem_dc, 0, 0, None);
@@ -4238,7 +4413,9 @@ impl App {
                                     SourceConstantAlpha: alpha,
                                     AlphaFormat: 0,
                                 };
-                                let _ = AlphaBlend(hdc, panel.left, panel.top, pw, ph, mem_dc, 0, 0, pw, ph, blend);
+                                let _ = AlphaBlend(
+                                    hdc, panel.left, panel.top, pw, ph, mem_dc, 0, 0, pw, ph, blend,
+                                );
                             }
                         }
                     }
@@ -4501,10 +4678,17 @@ impl App {
                 let ease = 1.0 - (1.0 - progress) * (1.0 - progress) * (1.0 - progress);
                 for (ni, download) in self.downloads.iter().enumerate() {
                     let target_x = start_x + ni as i32 * 40;
-                    let cur_x = overflow_cx - 16 + ((target_x + 16 - overflow_cx) as f32 * ease) as i32;
-                    let rect = RECT { left: cur_x, top: y, right: cur_x + 32, bottom: y + 32 };
+                    let cur_x =
+                        overflow_cx - 16 + ((target_x + 16 - overflow_cx) as f32 * ease) as i32;
+                    let rect = RECT {
+                        left: cur_x,
+                        top: y,
+                        right: cur_x + 32,
+                        bottom: y + 32,
+                    };
                     draw_download_indicator(
-                        hdc, rect,
+                        hdc,
+                        rect,
                         self.download_progress(download),
                         download.state == COREWEBVIEW2_DOWNLOAD_STATE_COMPLETED,
                         download.completed_at,
@@ -4515,9 +4699,15 @@ impl App {
                 }
             } else if anim.removed_index == anim.old_count - 1 {
                 for (ni, download) in self.downloads.iter().enumerate() {
-                    let rect = RECT { left: start_x + ni as i32 * 40, top: y, right: start_x + ni as i32 * 40 + 32, bottom: y + 32 };
+                    let rect = RECT {
+                        left: start_x + ni as i32 * 40,
+                        top: y,
+                        right: start_x + ni as i32 * 40 + 32,
+                        bottom: y + 32,
+                    };
                     draw_download_indicator(
-                        hdc, rect,
+                        hdc,
+                        rect,
                         self.download_progress(download),
                         download.state == COREWEBVIEW2_DOWNLOAD_STATE_COMPLETED,
                         download.completed_at,
@@ -4528,7 +4718,12 @@ impl App {
                 }
                 let fade_alpha = 1.0 - progress;
                 if fade_alpha > 0.02 {
-                    let old_rect = RECT { left: start_x + anim.removed_index as i32 * 40, top: y, right: start_x + anim.removed_index as i32 * 40 + 32, bottom: y + 32 };
+                    let old_rect = RECT {
+                        left: start_x + anim.removed_index as i32 * 40,
+                        top: y,
+                        right: start_x + anim.removed_index as i32 * 40 + 32,
+                        bottom: y + 32,
+                    };
                     self.paint_download_indicator_faded(hdc, old_rect, fade_alpha, anim);
                 }
             } else if anim.old_count <= 3 {
@@ -4538,9 +4733,15 @@ impl App {
                     let new_x = start_x + ni as i32 * 40;
                     let ease = 1.0 - (1.0 - progress) * (1.0 - progress);
                     let cur_x = old_x + ((new_x - old_x) as f32 * ease) as i32;
-                    let rect = RECT { left: cur_x, top: y, right: cur_x + 32, bottom: y + 32 };
+                    let rect = RECT {
+                        left: cur_x,
+                        top: y,
+                        right: cur_x + 32,
+                        bottom: y + 32,
+                    };
                     draw_download_indicator(
-                        hdc, rect,
+                        hdc,
+                        rect,
                         self.download_progress(download),
                         download.state == COREWEBVIEW2_DOWNLOAD_STATE_COMPLETED,
                         download.completed_at,
@@ -4568,12 +4769,22 @@ impl App {
             for i in 0..self.downloads.len().min(3) {
                 if let Some(download) = self.downloads.get(i) {
                     let start_xi = start_x + i as i32 * 40;
-                    let end_offset = match i { 0 => 10, 1 => 5, _ => 0 };
+                    let end_offset = match i {
+                        0 => 10,
+                        1 => 5,
+                        _ => 0,
+                    };
                     let end_xi = start_x + end_offset;
                     let cur_x = start_xi + ((end_xi - start_xi) as f32 * ease) as i32;
-                    let rect = RECT { left: cur_x, top: y, right: cur_x + 32, bottom: y + 32 };
+                    let rect = RECT {
+                        left: cur_x,
+                        top: y,
+                        right: cur_x + 32,
+                        bottom: y + 32,
+                    };
                     draw_download_indicator(
-                        hdc, rect,
+                        hdc,
+                        rect,
                         self.download_progress(download),
                         download.state == COREWEBVIEW2_DOWNLOAD_STATE_COMPLETED,
                         download.completed_at,
@@ -4586,15 +4797,35 @@ impl App {
         }
     }
 
-    unsafe fn paint_download_indicator_faded(&self, hdc: HDC, rect: RECT, fade_alpha: f32, anim: &DownloadRemovalAnim) {
+    unsafe fn paint_download_indicator_faded(
+        &self,
+        hdc: HDC,
+        rect: RECT,
+        fade_alpha: f32,
+        anim: &DownloadRemovalAnim,
+    ) {
         let size = rect.right - rect.left;
         let mem_dc = CreateCompatibleDC(Some(hdc));
         let bitmap = CreateCompatibleBitmap(hdc, size, size);
         let old = SelectObject(mem_dc, HGDIOBJ(bitmap.0));
-        fill_rect(mem_dc, RECT { left: 0, top: 0, right: size, bottom: size }, COLOR_PANEL_2);
+        fill_rect(
+            mem_dc,
+            RECT {
+                left: 0,
+                top: 0,
+                right: size,
+                bottom: size,
+            },
+            COLOR_PANEL_2,
+        );
         draw_download_indicator(
             mem_dc,
-            RECT { left: 0, top: 0, right: size, bottom: size },
+            RECT {
+                left: 0,
+                top: 0,
+                right: size,
+                bottom: size,
+            },
             anim.removed_progress,
             anim.removed_completed,
             anim.removed_completed_at,
@@ -4609,17 +4840,25 @@ impl App {
             SourceConstantAlpha: src_alpha,
             AlphaFormat: 0,
         };
-        let _ = AlphaBlend(hdc, rect.left, rect.top, size, size, mem_dc, 0, 0, size, size, blend);
+        let _ = AlphaBlend(
+            hdc, rect.left, rect.top, size, size, mem_dc, 0, 0, size, size, blend,
+        );
         let _ = SelectObject(mem_dc, old);
         let _ = DeleteObject(HGDIOBJ(bitmap.0));
         let _ = DeleteDC(mem_dc);
     }
 
     fn paint_download_toast(&self, hdc: HDC, window_rect: RECT) {
-        let Some(toast) = &self.download_toast else { return };
-        if self.sidebar_width() > 92 { return; }
+        let Some(toast) = &self.download_toast else {
+            return;
+        };
+        if self.sidebar_width() > 92 {
+            return;
+        }
         let elapsed = toast.start_time.elapsed().as_millis();
-        if elapsed >= 3000 && !toast.fading { return; }
+        if elapsed >= 3000 && !toast.fading {
+            return;
+        }
         let rect = RECT {
             left: 62,
             top: window_rect.bottom - 52,
@@ -4635,7 +4874,9 @@ impl App {
         } else {
             1.0
         };
-        if alpha <= 0.02 { return; }
+        if alpha <= 0.02 {
+            return;
+        }
         unsafe {
             draw_download_toast_gdi(hdc, rect, elapsed as u64, alpha);
         }
@@ -4655,7 +4896,8 @@ impl App {
                         bottom: rect.bottom,
                     };
                     draw_download_indicator(
-                        hdc, circle,
+                        hdc,
+                        circle,
                         self.download_progress(download),
                         download.state == COREWEBVIEW2_DOWNLOAD_STATE_COMPLETED,
                         download.completed_at,
@@ -4723,7 +4965,11 @@ impl App {
                     RECT {
                         left: row.left + 2,
                         top: row.top,
-                        right: if show_pause { pause.left - 8 } else { open.left - 8 },
+                        right: if show_pause {
+                            pause.left - 8
+                        } else {
+                            open.left - 8
+                        },
                         bottom: row.top + 24,
                     },
                     COLOR_TEXT,
@@ -4777,7 +5023,8 @@ impl App {
                 } else {
                     glyph(0xE711)
                 };
-                let cancel_hover = self.hover_target == Some(HoverTarget::DownloadCancel(download.id));
+                let cancel_hover =
+                    self.hover_target == Some(HoverTarget::DownloadCancel(download.id));
                 if cancel_hover {
                     fill_round_rect(hdc, cancel, COLOR_SURFACE_HOVER, 6);
                 }
@@ -4786,11 +5033,16 @@ impl App {
                     &self.fonts.icon,
                     cancel_glyph.as_str(),
                     cancel,
-                    if cancel_hover { COLOR_TEXT } else { COLOR_MUTED },
+                    if cancel_hover {
+                        COLOR_TEXT
+                    } else {
+                        COLOR_MUTED
+                    },
                 );
 
                 if show_pause {
-                    let pause_hover = self.hover_target == Some(HoverTarget::DownloadPause(download.id));
+                    let pause_hover =
+                        self.hover_target == Some(HoverTarget::DownloadPause(download.id));
                     if pause_hover {
                         fill_round_rect(hdc, pause, COLOR_SURFACE_HOVER, 6);
                     }
@@ -4809,7 +5061,8 @@ impl App {
                 }
 
                 if download.state != COREWEBVIEW2_DOWNLOAD_STATE_INTERRUPTED {
-                    let open_hover = self.hover_target == Some(HoverTarget::DownloadOpen(download.id));
+                    let open_hover =
+                        self.hover_target == Some(HoverTarget::DownloadOpen(download.id));
                     if open_hover {
                         fill_round_rect(hdc, open, COLOR_SURFACE_HOVER, 6);
                     }
@@ -6080,7 +6333,9 @@ impl App {
                         self.hover_target = Some(HoverTarget::DownloadCancel(download.id));
                         break;
                     }
-                    if download.state != COREWEBVIEW2_DOWNLOAD_STATE_INTERRUPTED && point_in_rect(x, y, open) {
+                    if download.state != COREWEBVIEW2_DOWNLOAD_STATE_INTERRUPTED
+                        && point_in_rect(x, y, open)
+                    {
                         self.hover_target = Some(HoverTarget::DownloadOpen(download.id));
                         break;
                     }
@@ -6287,6 +6542,7 @@ impl App {
                         self.tabs.insert(0, tab);
                         if let Some(new_active) = self.tabs.iter().position(|t| t.id == tab_id) {
                             self.active = new_active;
+                            self.place_root_row_at_start(SidebarRow::Tab(new_active), true);
                         }
                     }
                     DropTarget::Folder(folder_id) => {
@@ -6329,6 +6585,16 @@ impl App {
                         if let Some(new_active) = self.tabs.iter().position(|tab| tab.id == tab_id)
                         {
                             self.active = new_active;
+                            let target_row = self
+                                .tabs
+                                .iter()
+                                .position(|tab| tab.id == target_id)
+                                .map(SidebarRow::Tab);
+                            self.place_root_row_after(
+                                SidebarRow::Tab(new_active),
+                                target_pinned,
+                                target_row,
+                            );
                         }
                     }
                     DropTarget::None if in_sidebar => {
@@ -6337,6 +6603,8 @@ impl App {
                         tab.pinned_url = None;
                         tab.folder_id = None;
                         self.tabs.push(tab);
+                        let new_index = self.tabs.len().saturating_sub(1);
+                        self.place_root_row_after(SidebarRow::Tab(new_index), false, None);
                     }
                     _ => {}
                 }
@@ -6347,11 +6615,8 @@ impl App {
                         let mut folder = self.folders.remove(pos);
                         folder.pinned = true;
                         folder.parent_id = None;
-                        let insert_pos = self.folders.iter().enumerate().rev()
-                            .find(|(_, f)| f.workspace_id == self.active_workspace && f.pinned && f.parent_id.is_none())
-                            .map(|(i, _)| i + 1)
-                            .unwrap_or(0);
-                        self.folders.insert(insert_pos.min(self.folders.len()), folder);
+                        self.folders.insert(pos.min(self.folders.len()), folder);
+                        self.place_root_row_at_start(SidebarRow::Folder(from_folder_id), true);
                     }
                     self.propagate_folder_pinning(from_folder_id, true);
                 }
@@ -6378,34 +6643,31 @@ impl App {
                     }
                 }
                 DropTarget::Tab(target_tab_index) => {
-                    let tab_pinned = self.tabs.get(target_tab_index).map(|t| t.pinned).unwrap_or(false);
+                    let tab_pinned = self
+                        .tabs
+                        .get(target_tab_index)
+                        .map(|t| t.pinned)
+                        .unwrap_or(false);
                     if let Some(pos) = self.folders.iter().position(|f| f.id == from_folder_id) {
                         let mut folder = self.folders.remove(pos);
                         folder.pinned = tab_pinned;
                         folder.parent_id = None;
-                        let insert_pos = if tab_pinned {
-                            self.folders.iter().enumerate().rev()
-                                .find(|(_, f)| f.workspace_id == self.active_workspace && f.pinned && f.parent_id.is_none())
-                                .map(|(i, _)| i + 1)
-                                .unwrap_or(0)
-                        } else {
-                            self.folders.iter().enumerate().rev()
-                                .find(|(_, f)| f.workspace_id == self.active_workspace && !f.pinned && f.parent_id.is_none())
-                                .map(|(i, _)| i + 1)
-                                .unwrap_or(self.folders.len())
-                        };
-                        self.folders.insert(insert_pos.min(self.folders.len()), folder);
+                        self.folders.insert(pos.min(self.folders.len()), folder);
+                        self.place_root_row_after(
+                            SidebarRow::Folder(from_folder_id),
+                            tab_pinned,
+                            Some(SidebarRow::Tab(target_tab_index)),
+                        );
                     }
                     self.propagate_folder_pinning(from_folder_id, tab_pinned);
                 }
                 DropTarget::None if in_sidebar => {
-                    if let Some(folder) =
-                        self.folders.iter_mut().find(|f| f.id == from_folder_id)
-                    {
+                    if let Some(folder) = self.folders.iter_mut().find(|f| f.id == from_folder_id) {
                         folder.pinned = false;
                         folder.parent_id = None;
                     }
                     self.propagate_folder_pinning(from_folder_id, false);
+                    self.place_root_row_after(SidebarRow::Folder(from_folder_id), false, None);
                 }
                 _ => {}
             },
@@ -6428,7 +6690,9 @@ impl App {
                 Some(SidebarHit::PinnedSection)
             } else {
                 let rects = self.sidebar_row_rects();
-                let last_row = rects.iter().rev()
+                let last_row = rects
+                    .iter()
+                    .rev()
                     .find(|(row, _)| !matches!(row, SidebarRow::Label(_)));
                 match last_row {
                     Some((SidebarRow::Folder(id), _)) => Some(SidebarHit::Folder(*id)),
@@ -6570,7 +6834,9 @@ impl App {
                 ghost_height,
                 Some(self.hwnd),
                 None,
-                Some(HINSTANCE(LibraryLoader::GetModuleHandleW(None).unwrap_or_default().0)),
+                Some(HINSTANCE(
+                    LibraryLoader::GetModuleHandleW(None).unwrap_or_default().0,
+                )),
                 None,
             )
             .ok();
@@ -8309,13 +8575,11 @@ unsafe fn draw_download_indicator(
     }
 }
 
-unsafe fn draw_download_popup_gdi(
-    hdc: HDC,
-    rect: RECT,
-    elapsed_ms: u64,
-) {
+unsafe fn draw_download_popup_gdi(hdc: HDC, rect: RECT, elapsed_ms: u64) {
     let size = (rect.right - rect.left).min(rect.bottom - rect.top);
-    if size <= 0 { return; }
+    if size <= 0 {
+        return;
+    }
     let radius = size / 2;
 
     fill_round_rect(hdc, rect, COLOR_PANEL_2, radius);
@@ -8351,10 +8615,50 @@ unsafe fn draw_download_popup_gdi(
     let mut pixels = vec![0u8; (size * size * 4) as usize];
     let center = size as f32 / 2.0;
     let stroke = size as f32 * 0.065;
-    draw_aa_line(&mut pixels, size, center, size as f32 * 0.27, center, size as f32 * 0.62, stroke, COLOR_MUTED, 1.0);
-    draw_aa_line(&mut pixels, size, size as f32 * 0.36, size as f32 * 0.50, center, size as f32 * 0.64, stroke, COLOR_MUTED, 1.0);
-    draw_aa_line(&mut pixels, size, size as f32 * 0.64, size as f32 * 0.50, center, size as f32 * 0.64, stroke, COLOR_MUTED, 1.0);
-    draw_aa_line(&mut pixels, size, size as f32 * 0.34, size as f32 * 0.72, size as f32 * 0.66, size as f32 * 0.72, stroke, COLOR_MUTED, 0.75);
+    draw_aa_line(
+        &mut pixels,
+        size,
+        center,
+        size as f32 * 0.27,
+        center,
+        size as f32 * 0.62,
+        stroke,
+        COLOR_MUTED,
+        1.0,
+    );
+    draw_aa_line(
+        &mut pixels,
+        size,
+        size as f32 * 0.36,
+        size as f32 * 0.50,
+        center,
+        size as f32 * 0.64,
+        stroke,
+        COLOR_MUTED,
+        1.0,
+    );
+    draw_aa_line(
+        &mut pixels,
+        size,
+        size as f32 * 0.64,
+        size as f32 * 0.50,
+        center,
+        size as f32 * 0.64,
+        stroke,
+        COLOR_MUTED,
+        1.0,
+    );
+    draw_aa_line(
+        &mut pixels,
+        size,
+        size as f32 * 0.34,
+        size as f32 * 0.72,
+        size as f32 * 0.66,
+        size as f32 * 0.72,
+        stroke,
+        COLOR_MUTED,
+        0.75,
+    );
     if let Some(bitmap) = create_bgra_bitmap(size, size, &pixels) {
         let mem_dc = CreateCompatibleDC(Some(hdc));
         if !mem_dc.is_invalid() {
@@ -8365,7 +8669,9 @@ unsafe fn draw_download_popup_gdi(
                 SourceConstantAlpha: 255,
                 AlphaFormat: AC_SRC_ALPHA as u8,
             };
-            let _ = AlphaBlend(hdc, rect.left, rect.top, size, size, mem_dc, 0, 0, size, size, blend);
+            let _ = AlphaBlend(
+                hdc, rect.left, rect.top, size, size, mem_dc, 0, 0, size, size, blend,
+            );
             let _ = SelectObject(mem_dc, old);
             let _ = DeleteDC(mem_dc);
         }
@@ -8373,14 +8679,11 @@ unsafe fn draw_download_popup_gdi(
     }
 }
 
-unsafe fn draw_download_toast_gdi(
-    hdc: HDC,
-    rect: RECT,
-    _elapsed_ms: u64,
-    _alpha: f32,
-) {
+unsafe fn draw_download_toast_gdi(hdc: HDC, rect: RECT, _elapsed_ms: u64, _alpha: f32) {
     let size = (rect.right - rect.left).min(rect.bottom - rect.top);
-    if size <= 0 { return; }
+    if size <= 0 {
+        return;
+    }
     let radius = size / 2;
 
     fill_round_rect(hdc, rect, COLOR_PANEL_2, radius);
@@ -8422,10 +8725,46 @@ unsafe fn draw_download_toast_gdi(
     let arrow_base = rt + (size as f32 * 0.72) as i32;
     let arrow_color = COLOR_MUTED;
 
-    fill_rect(hdc, RECT { left: cx - half_i, top: arrow_top, right: cx + half_i + 1, bottom: arrow_bot }, arrow_color);
-    fill_rect(hdc, RECT { left: cx - arrow_wid - half_i, top: arrow_mid - half_i, right: cx + half_i + 1, bottom: arrow_mid + half_i + 1 }, arrow_color);
-    fill_rect(hdc, RECT { left: cx - half_i, top: arrow_mid - half_i, right: cx + arrow_wid + half_i + 1, bottom: arrow_mid + half_i + 1 }, arrow_color);
-    fill_rect(hdc, RECT { left: cx - arrow_wid, top: arrow_base - half_i, right: cx + arrow_wid + 1, bottom: arrow_base + half_i + 1 }, arrow_color);
+    fill_rect(
+        hdc,
+        RECT {
+            left: cx - half_i,
+            top: arrow_top,
+            right: cx + half_i + 1,
+            bottom: arrow_bot,
+        },
+        arrow_color,
+    );
+    fill_rect(
+        hdc,
+        RECT {
+            left: cx - arrow_wid - half_i,
+            top: arrow_mid - half_i,
+            right: cx + half_i + 1,
+            bottom: arrow_mid + half_i + 1,
+        },
+        arrow_color,
+    );
+    fill_rect(
+        hdc,
+        RECT {
+            left: cx - half_i,
+            top: arrow_mid - half_i,
+            right: cx + arrow_wid + half_i + 1,
+            bottom: arrow_mid + half_i + 1,
+        },
+        arrow_color,
+    );
+    fill_rect(
+        hdc,
+        RECT {
+            left: cx - arrow_wid,
+            top: arrow_base - half_i,
+            right: cx + arrow_wid + 1,
+            bottom: arrow_base + half_i + 1,
+        },
+        arrow_color,
+    );
 }
 
 fn render_download_indicator_pixels(
@@ -8444,7 +8783,11 @@ fn render_download_indicator_pixels(
     } else {
         COLOR_PANEL_2
     };
-    let morph_amount = if cancelled { morph.clamp(0.0, 1.0) } else { 0.0 };
+    let morph_amount = if cancelled {
+        morph.clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
     let circle_bg = if cancelled {
         mix_color(bg, x_color, 0.15 * morph_amount)
     } else {
@@ -8458,7 +8801,11 @@ fn render_download_indicator_pixels(
         center,
         radius - 0.7,
         1.35,
-        if cancelled { mix_color(0x565656, x_color, morph_amount) } else { 0x565656 },
+        if cancelled {
+            mix_color(0x565656, x_color, morph_amount)
+        } else {
+            0x565656
+        },
         1.0,
     );
     if !cancelled {
@@ -9398,9 +9745,7 @@ fn open_in_file_explorer(file_path: &str) {
             .arg(format!("/select,{}", full_path.display()))
             .spawn();
     } else if let Some(parent) = full_path.parent() {
-        let _ = Command::new("explorer.exe")
-            .arg(parent.as_os_str())
-            .spawn();
+        let _ = Command::new("explorer.exe").arg(parent.as_os_str()).spawn();
     }
 }
 
