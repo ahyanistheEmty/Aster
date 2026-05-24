@@ -64,6 +64,7 @@ const ADDRESS_ID: i32 = 1001;
 const COMMAND_POPUP_ID: i32 = 1002;
 const DOWNLOAD_POPUP_ID: i32 = 1003;
 const FIND_ID: i32 = 1004;
+const BOOKMARK_POPUP_ID: i32 = 1005;
 const DEFAULT_URL: &str = "https://www.google.com";
 const SIDEBAR_EXPANDED: f32 = 248.0;
 const SIDEBAR_HIDDEN: f32 = 0.0;
@@ -104,6 +105,13 @@ const MENU_TAB_DUPLICATE: usize = 3508;
 const MENU_HISTORY_BASE: usize = 3600;
 const MENU_REOPEN_CLOSED: usize = 3700;
 const MENU_RECENTLY_CLOSED_BASE: usize = 3710;
+const MENU_ADDRESS_BOOKMARK: usize = 3800;
+const MENU_ADDRESS_BOOKMARKS: usize = 3801;
+const MENU_ADDRESS_ZOOM_OUT: usize = 3802;
+const MENU_ADDRESS_ZOOM_RESET: usize = 3803;
+const MENU_ADDRESS_ZOOM_IN: usize = 3804;
+const MENU_ADDRESS_CLEAR_RELOAD: usize = 3805;
+const MENU_BOOKMARK_OPEN_BASE: usize = 3900;
 const MENU_WIDTH: i32 = 270;
 const MENU_ROW_HEIGHT: i32 = 34;
 
@@ -125,6 +133,7 @@ static mut OLD_COMMAND_POPUP_PROC: WNDPROC = None;
 static mut OLD_RENAME_EDIT_PROC: WNDPROC = None;
 static mut OLD_OVERLAY_MENU_PROC: WNDPROC = None;
 static mut OLD_DOWNLOAD_POPUP_PROC: WNDPROC = None;
+static mut OLD_BOOKMARK_POPUP_PROC: WNDPROC = None;
 static mut OLD_DRAG_GHOST_PROC: WNDPROC = None;
 static mut CURRENT_DRAG_GHOST_BITMAP: Option<HBITMAP> = None;
 
@@ -342,6 +351,8 @@ enum MenuTarget {
     BackHistory(usize),
     ForwardHistory(usize),
     SidebarBlank,
+    AddressMenu,
+    Bookmarks,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -365,6 +376,7 @@ enum SidebarRow {
     Label(SidebarLabel),
     Folder(usize),
     Tab(usize),
+    TabGhost(usize),
 }
 
 #[allow(dead_code)]
@@ -389,7 +401,7 @@ enum HoverTarget {
     Logo,
     NewTab,
     Address,
-    Bookmark,
+    AddressMenu,
     Back,
     Forward,
     Reload,
@@ -451,6 +463,10 @@ struct DownloadToastState {
     start_time: std::time::Instant,
     fading: bool,
     slide_x: f32,
+}
+
+struct BookmarkToastState {
+    start_time: std::time::Instant,
 }
 
 struct DownloadCollapseAnim {
@@ -565,6 +581,7 @@ struct App {
     find_hwnd: HWND,
     command_hwnd: HWND,
     overlay_menu_hwnd: HWND,
+    bookmark_popup_hwnd: HWND,
     environment: ICoreWebView2Environment,
     workspaces: Vec<Workspace>,
     folders: Vec<Folder>,
@@ -641,6 +658,7 @@ struct App {
     download_panel_reveal: f32,
     download_panel_reveal_target: f32,
     download_popup_hwnd: HWND,
+    bookmark_toast: Option<BookmarkToastState>,
     download_removal_anim: Option<DownloadRemovalAnim>,
     download_collapse_anim: Option<DownloadCollapseAnim>,
     paint_cache: RefCell<Option<PaintCache>>,
@@ -660,9 +678,14 @@ impl Drop for DragGhost {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
 enum DropTarget {
     PinnedSection,
     UnpinnedSection,
+    RootAfter {
+        pinned: bool,
+        row: Option<SidebarRow>,
+    },
     Folder(usize),
     Tab(usize),
     None,
@@ -690,6 +713,7 @@ impl App {
         let command_hwnd = create_command_popup(hwnd)?;
         let overlay_menu_hwnd = create_overlay_menu(hwnd)?;
         let download_popup_hwnd = create_download_popup(hwnd)?;
+        let bookmark_popup_hwnd = create_bookmark_popup(hwnd)?;
         unsafe {
             let _ = WindowsAndMessaging::SendMessageW(
                 address_hwnd,
@@ -710,6 +734,7 @@ impl App {
             find_hwnd,
             command_hwnd,
             overlay_menu_hwnd,
+            bookmark_popup_hwnd,
             environment,
             workspaces: vec![Workspace {
                 id: 1,
@@ -794,6 +819,7 @@ impl App {
             download_panel_reveal: 0.0,
             download_panel_reveal_target: 0.0,
             download_popup_hwnd,
+            bookmark_toast: None,
             download_removal_anim: None,
             download_collapse_anim: None,
             paint_cache: RefCell::new(None),
@@ -858,6 +884,7 @@ impl App {
         let Some((title, url)) = self.active_page_snapshot() else {
             return;
         };
+        let mut added = false;
         if let Some(index) = self.bookmark_index_for_url(&url) {
             self.bookmarks.remove(index);
         } else {
@@ -885,12 +912,16 @@ impl App {
                 created_at: current_timestamp(),
                 sidebar_order: order,
             });
+            added = true;
         }
         self.save_state();
+        if added {
+            self.show_bookmark_toast();
+        }
         self.refresh();
     }
 
-    fn bookmark_button_rect(&self) -> RECT {
+    fn address_menu_rect(&self) -> RECT {
         let pill = self.address_pill_rect();
         RECT {
             left: pill.right - 34,
@@ -902,7 +933,14 @@ impl App {
 
     fn find_bar_rect(&self) -> RECT {
         let rect = client_rect(self.hwnd);
-        let y = self.topbar_y() + 8;
+        let pushed_top = self.topbar_pushed_height();
+        let y = if self.topbar_mode == SidebarMode::Pushed
+            || self.topbar_expand_mode == SidebarMode::Pushed
+        {
+            self.topbar_y() + 8
+        } else {
+            pushed_top + 72
+        };
         let right = (rect.right - 150).max(360);
         RECT {
             left: (right - 360).max(160),
@@ -917,7 +955,7 @@ impl App {
         RECT {
             left: bar.left + 14,
             top: bar.top + 10,
-            right: bar.right - 128,
+            right: bar.right - 178,
             bottom: bar.bottom - 10,
         }
     }
@@ -954,13 +992,6 @@ impl App {
 
     fn open_find_bar(&mut self) {
         self.find_open = true;
-        if self.topbar_mode == SidebarMode::Hidden {
-            self.topbar_mode = SidebarMode::Overlay;
-            self.topbar_expand_mode = SidebarMode::Overlay;
-            self.topbar_height = TOPBAR_EXPANDED;
-            self.topbar_target = TOPBAR_EXPANDED;
-            self.animating_topbar = false;
-        }
         set_window_text(self.find_hwnd, &self.find_query);
         self.layout();
         unsafe {
@@ -1002,7 +1033,7 @@ impl App {
         else {
             return;
         };
-        let script = build_find_script(query, delta);
+        let script = build_find_script(query, delta, colorref_to_css(COLOR_ACCENT));
         let hwnd = self.hwnd;
         unsafe {
             let js = CoTaskMemPWSTR::from(script.as_str());
@@ -1045,6 +1076,7 @@ impl App {
             unsafe {
                 let _ = tab.controller.SetZoomFactor(factor);
             }
+            self.open_zoom_menu();
             self.refresh();
         }
     }
@@ -1056,6 +1088,129 @@ impl App {
 
     fn reset_active_zoom(&mut self) {
         self.set_active_zoom(1.0);
+    }
+
+    fn show_bookmark_toast(&mut self) {
+        self.bookmark_toast = Some(BookmarkToastState {
+            start_time: std::time::Instant::now(),
+        });
+        let rect = client_rect(self.hwnd);
+        unsafe {
+            let _ = WindowsAndMessaging::SetWindowPos(
+                self.bookmark_popup_hwnd,
+                Some(HWND_TOP),
+                18,
+                rect.bottom - 74,
+                210,
+                48,
+                WindowsAndMessaging::SWP_NOACTIVATE | WindowsAndMessaging::SWP_SHOWWINDOW,
+            );
+        }
+        self.ensure_download_timer();
+    }
+
+    fn tick_bookmark_toast(&mut self) {
+        if let Some(toast) = &self.bookmark_toast {
+            if toast.start_time.elapsed().as_millis() >= 2200 {
+                self.bookmark_toast = None;
+                unsafe {
+                    let _ = WindowsAndMessaging::ShowWindow(
+                        self.bookmark_popup_hwnd,
+                        WindowsAndMessaging::SW_HIDE,
+                    );
+                }
+            } else {
+                unsafe {
+                    let _ = InvalidateRect(Some(self.bookmark_popup_hwnd), None, false);
+                }
+            }
+        }
+    }
+
+    fn open_address_menu(&mut self, x: i32, y: i32) {
+        let bookmark_label = if self.is_active_bookmarked() {
+            "Remove Bookmark"
+        } else {
+            "Bookmark Site"
+        };
+        self.open_overlay_menu(
+            x,
+            y,
+            MenuTarget::AddressMenu,
+            vec![
+                menu_item(MENU_ADDRESS_BOOKMARK, bookmark_label),
+                menu_item(MENU_ADDRESS_BOOKMARKS, "Show Bookmarks"),
+                menu_item(MENU_ADDRESS_ZOOM_OUT, "Zoom Out"),
+                menu_item(
+                    MENU_ADDRESS_ZOOM_RESET,
+                    &format!("Reset Zoom ({}%)", self.active_zoom_percent()),
+                ),
+                menu_item(MENU_ADDRESS_ZOOM_IN, "Zoom In"),
+                menu_item(MENU_ADDRESS_CLEAR_RELOAD, "Clear Cookies/Cache and Reload"),
+            ],
+        );
+    }
+
+    fn open_zoom_menu(&mut self) {
+        let rect = client_rect(self.hwnd);
+        let y = self.topbar_pushed_height() + 58;
+        self.open_overlay_menu(
+            rect.right - MENU_WIDTH - 18,
+            y,
+            MenuTarget::AddressMenu,
+            vec![
+                menu_item(MENU_ADDRESS_ZOOM_OUT, "Zoom Out"),
+                menu_item(
+                    MENU_ADDRESS_ZOOM_RESET,
+                    &format!("{}%", self.active_zoom_percent()),
+                ),
+                menu_item(MENU_ADDRESS_ZOOM_IN, "Zoom In"),
+            ],
+        );
+    }
+
+    fn open_bookmarks_menu(&mut self, x: i32, y: i32) {
+        let mut items = Vec::new();
+        if self.bookmarks.is_empty() {
+            items.push(menu_item(MENU_ADDRESS_BOOKMARK, "No Bookmarks Yet"));
+        } else {
+            for (offset, bookmark) in self.bookmarks.iter().take(20).enumerate() {
+                let mut item = menu_item(MENU_BOOKMARK_OPEN_BASE + offset, &bookmark.title);
+                item.sublabel = bookmark.url.clone();
+                items.push(item);
+            }
+        }
+        self.open_overlay_menu(x, y, MenuTarget::Bookmarks, items);
+    }
+
+    fn clear_site_data_and_reload(&mut self) {
+        if let Some(tab) = self
+            .active_tab_index()
+            .and_then(|index| self.tabs.get(index))
+        {
+            let script = r#"(async function() {
+  try {
+    document.cookie.split(";").forEach((cookie) => {
+      const name = cookie.split("=")[0].trim();
+      if (name) document.cookie = name + "=; expires=Thu, 01 Jan 1970 00:00:00 GMT; path=/";
+    });
+    localStorage.clear();
+    sessionStorage.clear();
+    if ("caches" in window) {
+      const keys = await caches.keys();
+      await Promise.all(keys.map((key) => caches.delete(key)));
+    }
+  } catch (_) {}
+  location.reload();
+})();"#;
+            unsafe {
+                let js = CoTaskMemPWSTR::from(script);
+                let _ = tab.webview.ExecuteScript(
+                    *js.as_ref().as_pcwstr(),
+                    &ExecuteScriptCompletedHandler::create(Box::new(|_, _| Ok(()))),
+                );
+            }
+        }
     }
 
     fn create_tab_in_workspace(
@@ -1249,6 +1404,7 @@ impl App {
             .into_iter()
             .filter_map(|row| match row {
                 SidebarRow::Tab(index) => Some(index),
+                SidebarRow::TabGhost(_) => None,
                 _ => None,
             })
             .collect()
@@ -1289,6 +1445,7 @@ impl App {
                                     .unwrap_or(false);
                                 (None, is_tab_pinned)
                             }
+                            Some(DropTarget::RootAfter { pinned, .. }) => (None, pinned),
                             Some(DropTarget::UnpinnedSection) | _ => (None, false),
                         };
                         return (parent_id, pinned);
@@ -1338,10 +1495,17 @@ impl App {
                         SidebarRow::Tab(idx) => {
                             return self.is_tab_in_folder_subtree(idx, from_folder_id);
                         }
+                        SidebarRow::TabGhost(_) => {}
                         _ => {}
                     },
                     DragSource::Tab(from_tab_index) => match row {
                         SidebarRow::Tab(idx) => {
+                            if self.is_alt_duplicate_drag() {
+                                return false;
+                            }
+                            return idx == from_tab_index;
+                        }
+                        SidebarRow::TabGhost(idx) => {
                             return idx == from_tab_index;
                         }
                         _ => {}
@@ -1350,6 +1514,13 @@ impl App {
             }
         }
         false
+    }
+
+    fn is_alt_duplicate_drag(&self) -> bool {
+        self.drag_state
+            .map(|drag| drag.active && matches!(drag.source, DragSource::Tab(_)))
+            .unwrap_or(false)
+            && unsafe { (GetKeyState(VK_MENU.0 as i32) as u16 & 0x8000) != 0 }
     }
 
     fn folder_depth(&self, folder_id: usize) -> usize {
@@ -1386,6 +1557,7 @@ impl App {
                                     return self.tab_depth(target_tab_index);
                                 }
                             }
+                            Some(DropTarget::RootAfter { .. }) => return 0,
                             Some(DropTarget::UnpinnedSection) | _ => return 0,
                         }
                     }
@@ -1453,6 +1625,11 @@ impl App {
                 .get(tab_index)
                 .map(|tab| tab.sidebar_order)
                 .unwrap_or(u64::MAX),
+            SidebarRow::TabGhost(tab_index) => self
+                .tabs
+                .get(tab_index)
+                .map(|tab| tab.sidebar_order)
+                .unwrap_or(u64::MAX),
             SidebarRow::Label(_) => 0,
         }
     }
@@ -1501,6 +1678,7 @@ impl App {
                     tab.sidebar_order = sidebar_order;
                 }
             }
+            SidebarRow::TabGhost(_) => {}
             SidebarRow::Label(_) => {}
         }
     }
@@ -1568,6 +1746,20 @@ impl App {
                     }
                 }
             }
+        }
+    }
+
+    fn preview_insert_index(
+        &self,
+        rows: &[SidebarRow],
+        after: Option<SidebarRow>,
+    ) -> Option<usize> {
+        match after {
+            Some(target) => rows
+                .iter()
+                .position(|row| *row == target)
+                .map(|pos| pos + 1),
+            None => Some(rows.len()),
         }
     }
 
@@ -1657,6 +1849,7 @@ impl App {
                                 SidebarRow::Tab(idx) => {
                                     !self.is_tab_in_folder_subtree(idx, from_folder_id)
                                 }
+                                SidebarRow::TabGhost(_) => false,
                                 SidebarRow::Label(_) => true,
                             })
                             .collect();
@@ -1668,6 +1861,9 @@ impl App {
                                 Some(0)
                             }
                             Some(DropTarget::UnpinnedSection) => Some(base_rows.len()),
+                            Some(DropTarget::RootAfter { row, .. }) => {
+                                self.preview_insert_index(&base_rows, row)
+                            }
                             Some(DropTarget::Folder(target_folder_id)) => {
                                 // Inside target folder: put it right after the folder header row
                                 base_rows.iter().position(|r| matches!(r, SidebarRow::Folder(fid) if *fid == target_folder_id))
@@ -1695,11 +1891,12 @@ impl App {
                         rows = base_rows;
                     }
                     DragSource::Tab(from_tab_index) => {
-                        // 1. Filter out the dragged tab
+                        let duplicate_drag = self.is_alt_duplicate_drag();
                         let mut base_rows: Vec<SidebarRow> = rows
                             .into_iter()
                             .filter(|row| match *row {
-                                SidebarRow::Tab(idx) => idx != from_tab_index,
+                                SidebarRow::Tab(idx) => duplicate_drag || idx != from_tab_index,
+                                SidebarRow::TabGhost(_) => false,
                                 _ => true,
                             })
                             .collect();
@@ -1711,6 +1908,9 @@ impl App {
                                 Some(0)
                             }
                             Some(DropTarget::UnpinnedSection) => Some(base_rows.len()),
+                            Some(DropTarget::RootAfter { row, .. }) => {
+                                self.preview_insert_index(&base_rows, row)
+                            }
                             Some(DropTarget::Folder(target_folder_id)) => {
                                 // Inside target folder: put it right after the folder header row
                                 base_rows.iter().position(|r| matches!(r, SidebarRow::Folder(fid) if *fid == target_folder_id))
@@ -1729,7 +1929,12 @@ impl App {
                         // 3. Insert the tab at the computed index
                         if let Some(insert_index) = insert_index {
                             let insert_index = insert_index.min(base_rows.len());
-                            base_rows.insert(insert_index, SidebarRow::Tab(from_tab_index));
+                            let row = if duplicate_drag {
+                                SidebarRow::TabGhost(from_tab_index)
+                            } else {
+                                SidebarRow::Tab(from_tab_index)
+                            };
+                            base_rows.insert(insert_index, row);
                         }
                         rows = base_rows;
                     }
@@ -1768,14 +1973,14 @@ impl App {
             y += match skipped {
                 SidebarRow::Label(_) => 24,
                 SidebarRow::Folder(_) => 36,
-                SidebarRow::Tab(_) => 44,
+                SidebarRow::Tab(_) | SidebarRow::TabGhost(_) => 44,
             };
         }
         for row in all_rows.into_iter().skip(effective_offset) {
             let height = match row {
                 SidebarRow::Label(_) => 24,
                 SidebarRow::Folder(_) => 36,
-                SidebarRow::Tab(_) => 44,
+                SidebarRow::Tab(_) | SidebarRow::TabGhost(_) => 44,
             };
             if y + height > bottom_limit {
                 break;
@@ -1914,7 +2119,7 @@ impl App {
                 return match row {
                     SidebarRow::Folder(id) => Some(SidebarHit::Folder(id)),
                     SidebarRow::Tab(index) => Some(SidebarHit::Tab(index)),
-                    SidebarRow::Label(_) => None,
+                    SidebarRow::TabGhost(_) | SidebarRow::Label(_) => None,
                 };
             }
         }
@@ -2754,6 +2959,7 @@ impl App {
             && (self.download_panel_reveal - self.download_panel_reveal_target).abs() > 0.005;
         let needs_timer = panel_animating
             || self.download_toast.is_some()
+            || self.bookmark_toast.is_some()
             || self.download_removal_anim.is_some()
             || self.download_collapse_anim.is_some()
             || self.downloads.iter().any(|download| {
@@ -4645,46 +4851,24 @@ impl App {
                 RECT {
                     left: edit_rect.left + 14,
                     top: edit_rect.top,
-                    right: edit_rect.right - 92,
+                    right: edit_rect.right - 44,
                     bottom: edit_rect.bottom,
                 },
                 COLOR_TEXT,
             );
-            let zoom_rect = RECT {
-                left: edit_rect.right - 88,
-                top: edit_rect.top,
-                right: edit_rect.right - 38,
-                bottom: edit_rect.bottom,
-            };
-            draw_centered_text(
-                hdc,
-                &self.fonts.small,
-                &format!("{}%", self.active_zoom_percent()),
-                zoom_rect,
-                COLOR_MUTED,
-            );
-            let bookmark_rect = self.bookmark_button_rect();
-            let bookmark_hover = self.hover_target == Some(HoverTarget::Bookmark);
-            let bookmarked = self.is_active_bookmarked();
-            if bookmark_hover {
-                fill_round_rect(hdc, bookmark_rect, COLOR_SURFACE_HOVER, 8);
+            if self.hover_target == Some(HoverTarget::Address)
+                || self.hover_target == Some(HoverTarget::AddressMenu)
+                || matches!(
+                    self.overlay_menu.as_ref().map(|menu| menu.target),
+                    Some(MenuTarget::AddressMenu)
+                )
+            {
+                let menu_rect = self.address_menu_rect();
+                if self.hover_target == Some(HoverTarget::AddressMenu) {
+                    fill_round_rect(hdc, menu_rect, COLOR_SURFACE_HOVER, 8);
+                }
+                draw_centered_text(hdc, &self.fonts.body, "...", menu_rect, COLOR_MUTED);
             }
-            let bookmark_glyph = if bookmarked {
-                glyph(0xE735)
-            } else {
-                glyph(0xE734)
-            };
-            draw_icon_glyph(
-                hdc,
-                &self.fonts.toolbar_icon,
-                bookmark_glyph.as_str(),
-                bookmark_rect,
-                if bookmarked || bookmark_hover {
-                    COLOR_ACCENT
-                } else {
-                    COLOR_MUTED
-                },
-            );
 
             draw_settings_button(
                 hdc,
@@ -4837,7 +5021,12 @@ impl App {
                         }
                         SidebarRow::Tab(index) => {
                             if let Some(tab) = self.tabs.get(index) {
-                                self.paint_tab(hdc, index, tab, row_rect);
+                                self.paint_tab(hdc, index, tab, row_rect, false);
+                            }
+                        }
+                        SidebarRow::TabGhost(index) => {
+                            if let Some(tab) = self.tabs.get(index) {
+                                self.paint_tab(hdc, index, tab, row_rect, true);
                             }
                         }
                     }
@@ -6050,6 +6239,35 @@ impl App {
                         );
                     }
                 }
+                Some(DropTarget::RootAfter { row, .. }) => {
+                    let rects = self.sidebar_row_rects();
+                    let target_y = row
+                        .and_then(|target| {
+                            rects
+                                .iter()
+                                .find(|(candidate, _)| *candidate == target)
+                                .map(|(_, rect)| rect.bottom)
+                        })
+                        .unwrap_or_else(|| {
+                            rects
+                                .iter()
+                                .rev()
+                                .find(|(candidate, _)| !matches!(candidate, SidebarRow::Label(_)))
+                                .map(|(_, rect)| rect.bottom)
+                                .unwrap_or(self.sidebar_rows_top())
+                        });
+                    let width = self.sidebar_width();
+                    fill_rect(
+                        hdc,
+                        RECT {
+                            left: 14,
+                            top: target_y - 2,
+                            right: width - 14,
+                            bottom: target_y,
+                        },
+                        COLOR_ACCENT,
+                    );
+                }
                 Some(DropTarget::Folder(folder_id)) => {
                     if let Some((_, rect)) = self
                         .sidebar_row_rects()
@@ -6085,10 +6303,10 @@ impl App {
         }
     }
 
-    fn paint_tab(&self, hdc: HDC, index: usize, tab: &Tab, item: RECT) {
+    fn paint_tab(&self, hdc: HDC, index: usize, tab: &Tab, item: RECT, force_ghost: bool) {
         unsafe {
             let mut item = item;
-            let is_ghost = self.is_preview_item(SidebarRow::Tab(index));
+            let is_ghost = force_ghost || self.is_preview_item(SidebarRow::Tab(index));
             let depth = self.tab_depth(index);
             if depth > 0 {
                 item.left += (depth * 16) as i32;
@@ -6338,8 +6556,9 @@ impl App {
             return;
         }
 
-        if point_in_rect(x, y, self.bookmark_button_rect()) {
-            self.toggle_active_bookmark();
+        if point_in_rect(x, y, self.address_menu_rect()) {
+            let rect = self.address_menu_rect();
+            self.open_address_menu(rect.left, rect.bottom + 4);
             return;
         }
 
@@ -6717,8 +6936,31 @@ impl App {
             }
             MenuTarget::BackHistory(index) => self.navigate_to_history_item(index, id, true),
             MenuTarget::ForwardHistory(index) => self.navigate_to_history_item(index, id, false),
+            MenuTarget::AddressMenu => self.run_address_menu_command(id),
+            MenuTarget::Bookmarks => {
+                let offset = id.saturating_sub(MENU_BOOKMARK_OPEN_BASE);
+                if let Some(bookmark) = self.bookmarks.get(offset) {
+                    let url = bookmark.url.clone();
+                    self.navigate_active(&url);
+                }
+            }
         }
         self.refresh();
+    }
+
+    fn run_address_menu_command(&mut self, id: usize) {
+        match id {
+            MENU_ADDRESS_BOOKMARK => self.toggle_active_bookmark(),
+            MENU_ADDRESS_BOOKMARKS => {
+                let rect = self.address_pill_rect();
+                self.open_bookmarks_menu(rect.right - MENU_WIDTH, rect.bottom + 8);
+            }
+            MENU_ADDRESS_ZOOM_OUT => self.adjust_active_zoom(-0.1),
+            MENU_ADDRESS_ZOOM_RESET => self.reset_active_zoom(),
+            MENU_ADDRESS_ZOOM_IN => self.adjust_active_zoom(0.1),
+            MENU_ADDRESS_CLEAR_RELOAD => self.clear_site_data_and_reload(),
+            _ => {}
+        }
     }
 
     fn run_sidebar_menu_command(&mut self, hit: SidebarHit, id: usize) {
@@ -7010,8 +7252,8 @@ impl App {
                     self.hover_target = Some(HoverTarget::Forward);
                 } else if point_in_rect(x, y, reload) {
                     self.hover_target = Some(HoverTarget::Reload);
-                } else if point_in_rect(x, y, self.bookmark_button_rect()) {
-                    self.hover_target = Some(HoverTarget::Bookmark);
+                } else if point_in_rect(x, y, self.address_menu_rect()) {
+                    self.hover_target = Some(HoverTarget::AddressMenu);
                 } else if point_in_rect(x, y, self.address_pill_rect()) {
                     self.hover_target = Some(HoverTarget::Address);
                 } else if point_in_rect(x, y, self.settings_rect()) {
@@ -7257,6 +7499,19 @@ impl App {
                         let new_index = self.tabs.len().saturating_sub(1);
                         self.place_root_row_after(SidebarRow::Tab(new_index), false, None);
                     }
+                    DropTarget::RootAfter { pinned, row } => {
+                        let tab_id = self.tabs[from_index].id;
+                        let mut tab = self.tabs.remove(from_index);
+                        tab.pinned = pinned;
+                        tab.pinned_url = if pinned { Some(tab.url.clone()) } else { None };
+                        tab.folder_id = None;
+                        self.tabs.push(tab);
+                        if let Some(new_active) = self.tabs.iter().position(|tab| tab.id == tab_id)
+                        {
+                            self.active = new_active;
+                            self.place_root_row_after(SidebarRow::Tab(new_active), pinned, row);
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -7320,6 +7575,14 @@ impl App {
                     self.propagate_folder_pinning(from_folder_id, false);
                     self.place_root_row_after(SidebarRow::Folder(from_folder_id), false, None);
                 }
+                DropTarget::RootAfter { pinned, row } => {
+                    if let Some(folder) = self.folders.iter_mut().find(|f| f.id == from_folder_id) {
+                        folder.pinned = pinned;
+                        folder.parent_id = None;
+                    }
+                    self.propagate_folder_pinning(from_folder_id, pinned);
+                    self.place_root_row_after(SidebarRow::Folder(from_folder_id), pinned, row);
+                }
                 _ => {}
             },
         }
@@ -7351,11 +7614,44 @@ impl App {
         }
 
         let rows = self.sidebar_row_rects();
-        for (row, rect) in &rows {
+        for (idx, (row, rect)) in rows.iter().enumerate() {
             if point_in_rect(x, y, *rect) {
                 return match *row {
-                    SidebarRow::Folder(folder_id) => DropTarget::Folder(folder_id),
-                    SidebarRow::Tab(index) => DropTarget::Tab(index),
+                    SidebarRow::Folder(folder_id) => {
+                        let third = ((rect.bottom - rect.top) / 3).max(1);
+                        let folder_pinned = self
+                            .folders
+                            .iter()
+                            .find(|folder| folder.id == folder_id)
+                            .map(|folder| folder.pinned)
+                            .unwrap_or(false);
+                        if y < rect.top + third {
+                            DropTarget::RootAfter {
+                                pinned: folder_pinned,
+                                row: previous_root_row(&rows, idx, folder_pinned),
+                            }
+                        } else if y > rect.bottom - third {
+                            DropTarget::RootAfter {
+                                pinned: folder_pinned,
+                                row: Some(SidebarRow::Folder(folder_id)),
+                            }
+                        } else {
+                            DropTarget::Folder(folder_id)
+                        }
+                    }
+                    SidebarRow::Tab(index) => {
+                        let tab_pinned =
+                            self.tabs.get(index).map(|tab| tab.pinned).unwrap_or(false);
+                        DropTarget::RootAfter {
+                            pinned: tab_pinned,
+                            row: if y < (rect.top + rect.bottom) / 2 {
+                                previous_root_row(&rows, idx, tab_pinned)
+                            } else {
+                                Some(SidebarRow::Tab(index))
+                            },
+                        }
+                    }
+                    SidebarRow::TabGhost(_) => DropTarget::None,
                     SidebarRow::Label(SidebarLabel::Tabs) => DropTarget::UnpinnedSection,
                     SidebarRow::Label(SidebarLabel::Pinned) => DropTarget::PinnedSection,
                 };
@@ -8217,6 +8513,32 @@ fn create_download_popup(parent: HWND) -> AppResult<HWND> {
     }
 }
 
+fn create_bookmark_popup(parent: HWND) -> AppResult<HWND> {
+    unsafe {
+        let hwnd = WindowsAndMessaging::CreateWindowExW(
+            WINDOW_EX_STYLE::default(),
+            w!("STATIC"),
+            w!(""),
+            WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0),
+            0,
+            0,
+            1,
+            1,
+            Some(parent),
+            Some(HMENU(BOOKMARK_POPUP_ID as usize as *mut _)),
+            Some(HINSTANCE(LibraryLoader::GetModuleHandleW(None)?.0)),
+            None,
+        )?;
+        OLD_BOOKMARK_POPUP_PROC = mem::transmute(WindowsAndMessaging::SetWindowLongPtrW(
+            hwnd,
+            GWLP_WNDPROC,
+            bookmark_popup_proc as *const () as isize,
+        ));
+        let _ = WindowsAndMessaging::ShowWindow(hwnd, WindowsAndMessaging::SW_HIDE);
+        Ok(hwnd)
+    }
+}
+
 unsafe extern "system" fn overlay_menu_proc(
     hwnd: HWND,
     msg: u32,
@@ -8652,6 +8974,42 @@ unsafe extern "system" fn download_popup_proc(
     }
 }
 
+unsafe extern "system" fn bookmark_popup_proc(
+    hwnd: HWND,
+    msg: u32,
+    w_param: WPARAM,
+    l_param: LPARAM,
+) -> LRESULT {
+    match msg {
+        WM_PAINT => {
+            let mut ps = mem::zeroed();
+            let hdc = BeginPaint(hwnd, &mut ps);
+            if let Ok(parent) = WindowsAndMessaging::GetParent(hwnd) {
+                with_app(parent, |app| {
+                    if let Some(toast) = &app.bookmark_toast {
+                        let rect = client_rect(hwnd);
+                        draw_bookmark_popup_gdi(
+                            hdc,
+                            rect,
+                            toast.start_time.elapsed().as_millis() as u64,
+                        );
+                    }
+                });
+            }
+            let _ = EndPaint(hwnd, &ps);
+            LRESULT(0)
+        }
+        WM_ERASEBKGND => LRESULT(1),
+        _ => WindowsAndMessaging::CallWindowProcW(
+            OLD_BOOKMARK_POPUP_PROC,
+            hwnd,
+            msg,
+            w_param,
+            l_param,
+        ),
+    }
+}
+
 extern "system" fn window_proc(hwnd: HWND, msg: u32, w_param: WPARAM, l_param: LPARAM) -> LRESULT {
     match msg {
         WindowsAndMessaging::WM_GETMINMAXINFO => {
@@ -8739,7 +9097,6 @@ extern "system" fn window_proc(hwnd: HWND, msg: u32, w_param: WPARAM, l_param: L
                     let logo = app.logo_rect();
                     let new_tab = app.new_tab_rect();
                     let address = app.address_pill_rect();
-                    let bookmark = app.bookmark_button_rect();
                     let find_bar = app.find_bar_rect();
                     let (min_btn, max_btn, close_btn) = app.window_button_rects();
 
@@ -8749,7 +9106,6 @@ extern "system" fn window_proc(hwnd: HWND, msg: u32, w_param: WPARAM, l_param: L
                         || point_in_rect(pt.x, pt.y, forward)
                         || point_in_rect(pt.x, pt.y, reload)
                         || point_in_rect(pt.x, pt.y, address)
-                        || point_in_rect(pt.x, pt.y, bookmark)
                         || (app.find_open && point_in_rect(pt.x, pt.y, find_bar))
                         || point_in_rect(pt.x, pt.y, min_btn)
                         || point_in_rect(pt.x, pt.y, max_btn)
@@ -8945,6 +9301,7 @@ extern "system" fn window_proc(hwnd: HWND, msg: u32, w_param: WPARAM, l_param: L
             if w_param.0 == DOWNLOAD_TIMER_ID {
                 with_app(hwnd, |app| {
                     app.tick_download_toast();
+                    app.tick_bookmark_toast();
                     app.tick_download_removal();
                     app.tick_download_panel_animation();
                     app.poll_downloads();
@@ -8952,6 +9309,9 @@ extern "system" fn window_proc(hwnd: HWND, msg: u32, w_param: WPARAM, l_param: L
                         let _ = InvalidateRect(Some(app.hwnd), None, false);
                         if app.download_popup_hwnd != HWND(std::ptr::null_mut()) {
                             let _ = InvalidateRect(Some(app.download_popup_hwnd), None, false);
+                        }
+                        if app.bookmark_popup_hwnd != HWND(std::ptr::null_mut()) {
+                            let _ = InvalidateRect(Some(app.bookmark_popup_hwnd), None, false);
                         }
                     }
                 });
@@ -9424,6 +9784,46 @@ unsafe fn draw_download_popup_gdi(hdc: HDC, rect: RECT, elapsed_ms: u64) {
             let _ = DeleteDC(mem_dc);
         }
         let _ = DeleteObject(HGDIOBJ(bitmap.0));
+    }
+}
+
+unsafe fn draw_bookmark_popup_gdi(hdc: HDC, rect: RECT, elapsed_ms: u64) {
+    let slide = if elapsed_ms < 180 {
+        1.0 - (elapsed_ms as f32 / 180.0)
+    } else {
+        0.0
+    };
+    let mut body = rect;
+    body.top += (slide * 26.0) as i32;
+    fill_round_rect(hdc, body, 0x111111, 12);
+    draw_outline(hdc, body, 0x343434, 12);
+    let star_rect = RECT {
+        left: body.left + 14,
+        top: body.top + 10,
+        right: body.left + 42,
+        bottom: body.top + 38,
+    };
+    let icon_font = create_font_with_face(20, 600, w!("Segoe UI Symbol"))
+        .unwrap_or(HFONT(std::ptr::null_mut()));
+    draw_centered_text(hdc, &icon_font, "*", star_rect, 0x27d8ff);
+    if icon_font != HFONT(std::ptr::null_mut()) {
+        let _ = DeleteObject(HGDIOBJ(icon_font.0));
+    }
+    let text_font = create_font(14, 600).unwrap_or(HFONT(std::ptr::null_mut()));
+    draw_text(
+        hdc,
+        &text_font,
+        "Bookmarked Site!",
+        RECT {
+            left: body.left + 52,
+            top: body.top,
+            right: body.right - 12,
+            bottom: body.bottom,
+        },
+        COLOR_TEXT,
+    );
+    if text_font != HFONT(std::ptr::null_mut()) {
+        let _ = DeleteObject(HGDIOBJ(text_font.0));
     }
 }
 
@@ -10527,6 +10927,15 @@ fn mix_color(from: u32, to: u32, amount: f32) -> u32 {
     r | (g << 8) | (b << 16)
 }
 
+fn colorref_to_css(color: u32) -> String {
+    format!(
+        "#{:02x}{:02x}{:02x}",
+        color & 0xff,
+        (color >> 8) & 0xff,
+        (color >> 16) & 0xff
+    )
+}
+
 fn client_rect(hwnd: HWND) -> RECT {
     let mut rect = RECT::default();
     unsafe {
@@ -10785,7 +11194,7 @@ fn js_string_literal(value: &str) -> String {
     out
 }
 
-fn build_find_script(query: &str, delta: i32) -> String {
+fn build_find_script(query: &str, delta: i32, highlight_color: String) -> String {
     format!(
         r##"(function(query, delta) {{
   const cls = "aster-find-mark";
@@ -10838,8 +11247,8 @@ fn build_find_script(query: &str, delta: i32) -> String {
         const mark = document.createElement("mark");
         mark.className = cls;
         mark.textContent = text.slice(hit, hit + query.length);
-        mark.style.background = "#f16f63";
-        mark.style.color = "#0b0b0b";
+        mark.style.background = {};
+        mark.style.color = "#ffffff";
         mark.style.borderRadius = "2px";
         mark.style.padding = "0 1px";
         frag.appendChild(mark);
@@ -10866,6 +11275,7 @@ fn build_find_script(query: &str, delta: i32) -> String {
   active.scrollIntoView({{ block: "center", inline: "nearest" }});
   return {{ count: marks.length, index }};
 }})({}, {});"##,
+        js_string_literal(&highlight_color),
         js_string_literal(query),
         delta
     )
@@ -10971,6 +11381,22 @@ fn hiword(value: u32) -> u16 {
 
 fn point_in_rect(x: i32, y: i32, rect: RECT) -> bool {
     x >= rect.left && x < rect.right && y >= rect.top && y < rect.bottom
+}
+
+fn previous_root_row(
+    rows: &[(SidebarRow, RECT)],
+    before_index: usize,
+    pinned: bool,
+) -> Option<SidebarRow> {
+    rows.iter()
+        .take(before_index)
+        .rev()
+        .take_while(|(row, _)| pinned || !matches!(row, SidebarRow::Label(SidebarLabel::Tabs)))
+        .find_map(|(row, _)| match *row {
+            SidebarRow::Folder(folder_id) => Some(SidebarRow::Folder(folder_id)),
+            SidebarRow::Tab(tab_index) => Some(SidebarRow::Tab(tab_index)),
+            SidebarRow::TabGhost(_) | SidebarRow::Label(_) => None,
+        })
 }
 
 fn with_app<F>(hwnd: HWND, f: F)
