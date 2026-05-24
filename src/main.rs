@@ -3854,6 +3854,7 @@ impl App {
         if let Some(tab) = self.tabs.get_mut(index) {
             tab.url = "aster:settings".to_string();
             tab.title = "Aster Settings".to_string();
+            tab.favicon_bitmap = render_glyph_favicon(18, 0xE713, &self.fonts.icon, COLOR_ACCENT);
             unsafe {
                 let html = CoTaskMemPWSTR::from(html.as_str());
                 let _ = tab.webview.NavigateToString(*html.as_ref().as_pcwstr());
@@ -9926,7 +9927,7 @@ fn draw_settings_button(hdc: HDC, rect: RECT, hovered: bool, icon_font: &HFONT) 
         if hovered {
             fill_round_rect(hdc, rect, COLOR_SURFACE_HOVER, 10);
         }
-        draw_icon_glyph(hdc, icon_font, glyph(0xE713).as_str(), rect, COLOR_MUTED);
+        draw_icon_glyph(hdc, icon_font, glyph(0xE712).as_str(), rect, COLOR_MUTED);
     }
 }
 
@@ -10776,6 +10777,59 @@ fn decode_favicon_stream(stream: &IStream) -> Option<FaviconBitmap> {
             handle,
             width: width as i32,
             height: height as i32,
+        })
+    }
+}
+
+fn render_glyph_favicon(size: i32, codepoint: u32, icon_font: &HFONT, color: u32) -> Option<FaviconBitmap> {
+    unsafe {
+        let hdc = CreateCompatibleDC(None);
+        if hdc.is_invalid() {
+            return None;
+        }
+        let mut info = BITMAPINFO::default();
+        info.bmiHeader = BITMAPINFOHEADER {
+            biSize: mem::size_of::<BITMAPINFOHEADER>() as u32,
+            biWidth: size,
+            biHeight: -size,
+            biPlanes: 1,
+            biBitCount: 32,
+            biCompression: BI_RGB.0,
+            ..Default::default()
+        };
+        let mut bits: *mut core::ffi::c_void = ptr::null_mut();
+        let bitmap = CreateDIBSection(None, &info, DIB_RGB_COLORS, &mut bits, None, 0).ok()?;
+        if bits.is_null() {
+            let _ = DeleteObject(HGDIOBJ(bitmap.0));
+            let _ = DeleteDC(hdc);
+            return None;
+        }
+        let old = SelectObject(hdc, HGDIOBJ(bitmap.0));
+        ptr::write_bytes(bits as *mut u8, 0, (size * size * 4) as usize);
+        draw_icon_glyph(
+            hdc,
+            icon_font,
+            &glyph(codepoint),
+            RECT {
+                left: 0,
+                top: 0,
+                right: size,
+                bottom: size,
+            },
+            color,
+        );
+        let pixels = std::slice::from_raw_parts_mut(bits as *mut u8, (size * size * 4) as usize);
+        for chunk in pixels.chunks_exact_mut(4) {
+            if chunk[0] != 0 || chunk[1] != 0 || chunk[2] != 0 {
+                chunk[3] = 255;
+            }
+        }
+        SelectObject(hdc, old);
+        let _ = DeleteDC(hdc);
+        Some(FaviconBitmap {
+            handle: bitmap,
+            width: size,
+            height: size,
         })
     }
 }
