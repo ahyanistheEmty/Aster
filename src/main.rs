@@ -626,6 +626,7 @@ impl Drop for DragGhost {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum DropTarget {
     PinnedSection,
+    UnpinnedSection,
     Folder(usize),
     Tab(usize),
     None,
@@ -967,7 +968,7 @@ impl App {
                                     .unwrap_or(false);
                                 (None, is_tab_pinned)
                             }
-                            _ => (None, false),
+                            Some(DropTarget::UnpinnedSection) | _ => (None, false),
                         };
                         return (parent_id, pinned);
                     }
@@ -1002,17 +1003,6 @@ impl App {
             }
         }
         false
-    }
-
-    fn get_folder_subtree_rows(&self, folder_id: usize) -> Vec<SidebarRow> {
-        let mut subtree = Vec::new();
-        subtree.push(SidebarRow::Folder(folder_id));
-        if let Some(folder) = self.folders.iter().find(|f| f.id == folder_id) {
-            if !folder.collapsed {
-                self.add_folder_rows_recursive(folder_id, &mut subtree);
-            }
-        }
-        subtree
     }
 
     fn is_preview_item(&self, row: SidebarRow) -> bool {
@@ -1075,7 +1065,7 @@ impl App {
                                     return self.tab_depth(target_tab_index);
                                 }
                             }
-                            _ => return 0,
+                            Some(DropTarget::UnpinnedSection) | _ => return 0,
                         }
                     }
                 }
@@ -1354,13 +1344,14 @@ impl App {
                         let insert_index = match self.drop_target {
                             Some(DropTarget::PinnedSection) => {
                                 // Top of pinned section (index 0)
-                                0
+                                Some(0)
                             }
+                            Some(DropTarget::UnpinnedSection) => Some(base_rows.len()),
                             Some(DropTarget::Folder(target_folder_id)) => {
                                 // Inside target folder: put it right after the folder header row
                                 base_rows.iter().position(|r| matches!(r, SidebarRow::Folder(fid) if *fid == target_folder_id))
                                     .map(|pos| pos + 1)
-                                    .unwrap_or(0)
+                                    .or(Some(0))
                             }
                             Some(DropTarget::Tab(target_tab_index)) => {
                                 // Insert after the last root folder of the same pinned type —
@@ -1368,24 +1359,17 @@ impl App {
                                 // in the folders-first, tabs-second section layout.
                                 base_rows.iter().position(|r| matches!(r, SidebarRow::Tab(idx) if *idx == target_tab_index))
                                     .map(|pos| pos + 1)
-                                    .unwrap_or(0)
+                                    .or(Some(0))
                             }
-                            _ => {
-                                // Unpinned section fallback: after the divider (SidebarLabel::Tabs)
-                                base_rows
-                                    .iter()
-                                    .position(|r| {
-                                        matches!(r, SidebarRow::Label(SidebarLabel::Tabs))
-                                    })
-                                    .map(|pos| pos + 1)
-                                    .unwrap_or(base_rows.len())
-                            }
+                            Some(DropTarget::None) | None => None,
                         };
 
                         // 3. Insert the subtree at the computed index
-                        let insert_index = insert_index.min(base_rows.len());
-                        for (i, item) in subtree_rows.into_iter().enumerate() {
-                            base_rows.insert(insert_index + i, item);
+                        if let Some(insert_index) = insert_index {
+                            let insert_index = insert_index.min(base_rows.len());
+                            for (i, item) in subtree_rows.into_iter().enumerate() {
+                                base_rows.insert(insert_index + i, item);
+                            }
                         }
                         rows = base_rows;
                     }
@@ -1403,35 +1387,29 @@ impl App {
                         let insert_index = match self.drop_target {
                             Some(DropTarget::PinnedSection) => {
                                 // Top of pinned section (index 0)
-                                0
+                                Some(0)
                             }
+                            Some(DropTarget::UnpinnedSection) => Some(base_rows.len()),
                             Some(DropTarget::Folder(target_folder_id)) => {
                                 // Inside target folder: put it right after the folder header row
                                 base_rows.iter().position(|r| matches!(r, SidebarRow::Folder(fid) if *fid == target_folder_id))
                                     .map(|pos| pos + 1)
-                                    .unwrap_or(0)
+                                    .or(Some(0))
                             }
                             Some(DropTarget::Tab(target_tab_index)) => {
                                 // After the hovered tab
                                 base_rows.iter().position(|r| matches!(r, SidebarRow::Tab(idx) if *idx == target_tab_index))
                                     .map(|pos| pos + 1)
-                                    .unwrap_or(0)
+                                    .or(Some(0))
                             }
-                            _ => {
-                                // Unpinned section fallback: after the divider (SidebarLabel::Tabs)
-                                base_rows
-                                    .iter()
-                                    .position(|r| {
-                                        matches!(r, SidebarRow::Label(SidebarLabel::Tabs))
-                                    })
-                                    .map(|pos| pos + 1)
-                                    .unwrap_or(base_rows.len())
-                            }
+                            Some(DropTarget::None) | None => None,
                         };
 
                         // 3. Insert the tab at the computed index
-                        let insert_index = insert_index.min(base_rows.len());
-                        base_rows.insert(insert_index, SidebarRow::Tab(from_tab_index));
+                        if let Some(insert_index) = insert_index {
+                            let insert_index = insert_index.min(base_rows.len());
+                            base_rows.insert(insert_index, SidebarRow::Tab(from_tab_index));
+                        }
                         rows = base_rows;
                     }
                 }
@@ -5453,6 +5431,33 @@ impl App {
                         fill_rect(hdc, line_rect, COLOR_ACCENT);
                     }
                 }
+                Some(DropTarget::UnpinnedSection) => {
+                    let rects = self.sidebar_row_rects();
+                    if let Some((divider_index, (_, divider_rect))) = rects
+                        .iter()
+                        .enumerate()
+                        .find(|(_, (row, _))| matches!(row, SidebarRow::Label(SidebarLabel::Tabs)))
+                    {
+                        let target_y = rects
+                            .iter()
+                            .skip(divider_index + 1)
+                            .rev()
+                            .find(|(row, _)| !matches!(row, SidebarRow::Label(_)))
+                            .map(|(_, rect)| rect.bottom)
+                            .unwrap_or(divider_rect.bottom);
+                        let width = self.sidebar_width();
+                        fill_rect(
+                            hdc,
+                            RECT {
+                                left: 14,
+                                top: target_y - 2,
+                                right: width - 14,
+                                bottom: target_y,
+                            },
+                            COLOR_ACCENT,
+                        );
+                    }
+                }
                 Some(DropTarget::Folder(folder_id)) => {
                     if let Some((_, rect)) = self
                         .sidebar_row_rects()
@@ -6520,10 +6525,8 @@ impl App {
         self.drop_target = Some(DropTarget::None);
         true
     }
-    fn handle_drop(&mut self, source: DragSource, x: i32, _y: i32) {
+    fn handle_drop(&mut self, source: DragSource, _x: i32, _y: i32) {
         let target = self.drop_target.unwrap_or(DropTarget::None);
-
-        let in_sidebar = x >= 0 && (x as f32) < self.sidebar_width;
 
         match source {
             DragSource::Tab(from_index) => {
@@ -6597,7 +6600,7 @@ impl App {
                             );
                         }
                     }
-                    DropTarget::None if in_sidebar => {
+                    DropTarget::UnpinnedSection => {
                         let mut tab = self.tabs.remove(from_index);
                         tab.pinned = false;
                         tab.pinned_url = None;
@@ -6661,7 +6664,7 @@ impl App {
                     }
                     self.propagate_folder_pinning(from_folder_id, tab_pinned);
                 }
-                DropTarget::None if in_sidebar => {
+                DropTarget::UnpinnedSection => {
                     if let Some(folder) = self.folders.iter_mut().find(|f| f.id == from_folder_id) {
                         folder.pinned = false;
                         folder.parent_id = None;
@@ -6677,40 +6680,53 @@ impl App {
     }
 
     fn calculate_drop_target(&self, x: i32, y: i32) -> DropTarget {
-        let hit = self.hit_sidebar(x, y);
-        let divider_y = self
-            .sidebar_row_rects()
+        if self.sidebar_width() <= 92
+            || x < 0
+            || (x as f32) >= self.sidebar_width
+            || y >= self.workspace_switcher_bounds().top - 10
+        {
+            return DropTarget::None;
+        }
+
+        if point_in_rect(x, y, self.workspace_header_rect()) {
+            return DropTarget::None;
+        }
+        for (_, rect) in self.workspace_switcher_items() {
+            if point_in_rect(x, y, rect) {
+                return DropTarget::None;
+            }
+        }
+        if let Some(rect) = self.pinned_section_rect() {
+            if point_in_rect(x, y, rect) {
+                return DropTarget::PinnedSection;
+            }
+        }
+
+        let rows = self.sidebar_row_rects();
+        for (row, rect) in &rows {
+            if point_in_rect(x, y, *rect) {
+                return match *row {
+                    SidebarRow::Folder(folder_id) => DropTarget::Folder(folder_id),
+                    SidebarRow::Tab(index) => DropTarget::Tab(index),
+                    SidebarRow::Label(SidebarLabel::Tabs) => DropTarget::UnpinnedSection,
+                    SidebarRow::Label(SidebarLabel::Pinned) => DropTarget::PinnedSection,
+                };
+            }
+        }
+
+        if let Some((_, divider)) = rows
             .iter()
             .find(|(row, _)| matches!(row, SidebarRow::Label(SidebarLabel::Tabs)))
-            .map(|(_, rect)| rect.top)
-            .unwrap_or(self.sidebar_rows_top() + 72);
-
-        let hit = if hit.is_none() && x >= 0 && (x as f32) < self.sidebar_width {
-            if y <= divider_y {
-                Some(SidebarHit::PinnedSection)
+        {
+            if y < divider.top && y >= self.sidebar_rows_top() {
+                DropTarget::PinnedSection
+            } else if y >= divider.top {
+                DropTarget::UnpinnedSection
             } else {
-                let rects = self.sidebar_row_rects();
-                let last_row = rects
-                    .iter()
-                    .rev()
-                    .find(|(row, _)| !matches!(row, SidebarRow::Label(_)));
-                match last_row {
-                    Some((SidebarRow::Folder(id), _)) => Some(SidebarHit::Folder(*id)),
-                    Some((SidebarRow::Tab(idx), _)) => Some(SidebarHit::Tab(*idx)),
-                    _ => None,
-                }
+                DropTarget::None
             }
         } else {
-            hit
-        };
-
-        match hit {
-            Some(SidebarHit::PinnedSection) | Some(SidebarHit::WorkspaceHeader) => {
-                DropTarget::PinnedSection
-            }
-            Some(SidebarHit::Folder(folder_id)) => DropTarget::Folder(folder_id),
-            Some(SidebarHit::Tab(index)) => DropTarget::Tab(index),
-            _ => DropTarget::None,
+            DropTarget::None
         }
     }
 
