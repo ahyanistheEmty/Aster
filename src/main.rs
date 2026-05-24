@@ -4822,9 +4822,9 @@ impl App {
                     let clip_right = rect.right;
                     let clip_bottom = rect.bottom - self.topbar_pushed_height();
                     let region = CreateRectRgn(clip_left, clip_top, clip_right, clip_bottom);
-                    let _ = SetWindowRgn(tab.child_hwnd, Some(region), false);
+                    let _ = SetWindowRgn(tab.child_hwnd, Some(region), true);
                 } else if should_clear {
-                    let _ = SetWindowRgn(tab.child_hwnd, None, false);
+                    let _ = SetWindowRgn(tab.child_hwnd, None, true);
                 }
                 let _ = tab.controller.SetIsVisible(is_active && !tab.unloaded);
             }
@@ -5458,6 +5458,35 @@ impl App {
                 COLOR_MUTED,
             );
 
+            let settings_row = self.settings_page_row_rect();
+            if self.hover_target == Some(HoverTarget::SettingsPage) {
+                fill_round_rect(hdc, settings_row, COLOR_SURFACE_HOVER, 9);
+            }
+            draw_text(
+                hdc,
+                &self.fonts.small,
+                "Settings",
+                RECT {
+                    left: settings_row.left + 12,
+                    top: settings_row.top,
+                    right: settings_row.right - 30,
+                    bottom: settings_row.bottom,
+                },
+                COLOR_TEXT,
+            );
+            draw_icon_glyph(
+                hdc,
+                &self.fonts.icon,
+                glyph(0xE713).as_str(),
+                RECT {
+                    left: settings_row.right - 28,
+                    top: settings_row.top,
+                    right: settings_row.right - 6,
+                    bottom: settings_row.bottom,
+                },
+                COLOR_MUTED,
+            );
+
             if self.mode_menu_open {
                 let options = self.mode_options_rect();
                 fill_round_rect(hdc, options, 0x151515, 12);
@@ -5505,35 +5534,6 @@ impl App {
                     );
                 }
             }
-
-            let settings_row = self.settings_page_row_rect();
-            if self.hover_target == Some(HoverTarget::SettingsPage) {
-                fill_round_rect(hdc, settings_row, COLOR_SURFACE_HOVER, 9);
-            }
-            draw_text(
-                hdc,
-                &self.fonts.small,
-                "Settings",
-                RECT {
-                    left: settings_row.left + 12,
-                    top: settings_row.top,
-                    right: settings_row.right - 30,
-                    bottom: settings_row.bottom,
-                },
-                COLOR_TEXT,
-            );
-            draw_icon_glyph(
-                hdc,
-                &self.fonts.icon,
-                glyph(0xE713).as_str(),
-                RECT {
-                    left: settings_row.right - 28,
-                    top: settings_row.top,
-                    right: settings_row.right - 6,
-                    bottom: settings_row.bottom,
-                },
-                COLOR_MUTED,
-            );
         }
     }
 
@@ -6695,6 +6695,8 @@ impl App {
             && self.sidebar_width > SIDEBAR_EXPANDED * 0.5
             && (x as f32) >= self.sidebar_width
         {
+            self.settings_open = false;
+            self.mode_menu_open = false;
             self.set_sidebar_mode(SidebarMode::Hidden);
             return;
         }
@@ -8136,6 +8138,8 @@ impl App {
                 self.sidebar_mode = SidebarMode::Hidden;
                 self.sidebar_expand_mode = SidebarMode::Hidden;
                 self.hovering_sidebar = false;
+                self.mode_menu_open = false;
+                self.settings_open = false;
                 self.clear_webview_clipping();
                 self.ensure_hover_detect_timer();
             } else if self.sidebar_target >= SIDEBAR_EXPANDED {
@@ -8259,6 +8263,8 @@ impl App {
                     }
 
                     if !over_sidebar && self.sidebar_mode == SidebarMode::Overlay {
+                        self.settings_open = false;
+                        self.mode_menu_open = false;
                         self.sidebar_expand_mode = SidebarMode::Hidden;
                         self.set_sidebar_mode(SidebarMode::Hidden);
                     }
