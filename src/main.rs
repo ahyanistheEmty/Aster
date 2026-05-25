@@ -843,8 +843,8 @@ impl App {
             dl_panel_cache: RefCell::new(None),
         };
         app.load_state()?;
-        if app.startup_mode == StartupMode::HomePage && app.tabs.is_empty() {
-            app.create_tab(DEFAULT_URL)?;
+        if app.startup_mode == StartupMode::HomePage {
+            app.navigate_active(DEFAULT_URL);
         }
         app.ensure_default_bookmark_folder();
         unsafe {
@@ -2567,9 +2567,6 @@ impl App {
         };
 
         for (workspace_id, folder_id, pinned, title, url, history, sidebar_order) in tab_records {
-            if self.startup_mode == StartupMode::HomePage {
-                break;
-            }
             if !url.trim().is_empty()
                 && self
                     .workspaces
