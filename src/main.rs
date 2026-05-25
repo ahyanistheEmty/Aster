@@ -843,8 +843,15 @@ impl App {
             dl_panel_cache: RefCell::new(None),
         };
         app.load_state()?;
-        if app.startup_mode == StartupMode::HomePage {
-            app.navigate_active(DEFAULT_URL);
+        match app.startup_mode {
+            StartupMode::LastSession => {
+                if let Some(index) = app.active_tab_index() {
+                    app.switch_to(index, true);
+                }
+            }
+            StartupMode::HomePage => {
+                let _ = app.create_tab(DEFAULT_URL);
+            }
         }
         app.ensure_default_bookmark_folder();
         unsafe {
