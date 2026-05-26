@@ -1,10 +1,10 @@
 [package]
 name = "aster"
-version = "0.1.0"
-authors = ["Google DeepMind <support@deepmind.com>"]
+version = "0.2.0-beta"
+authors = ["Mohammed Ahyan <ahyan4529@gmail.com>"]
 license = "MIT"
 edition = "2021"
-description = "A fast Chromium-based desktop browser with vertical tabs."
+description = "Building the best browser possible by taking all the good features and aspects of other browsers and adding our own unique innovations all while ensuring your data is 100% yours. Aster browser data is stored locally, no tracking, no telemetry, no data collection. Everything is stored directly on your machine."
 
 [[bin]]
 name = "Aster"
