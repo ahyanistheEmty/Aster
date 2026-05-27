@@ -4494,8 +4494,7 @@ impl App {
         let visible_tab_ids = self.visible_tab_ids_for_index(index);
         let mut reloads: Vec<(usize, String)> = Vec::new();
         for tab in &mut self.tabs {
-            let visible =
-                tab.workspace_id == workspace_id && visible_tab_ids.iter().any(|id| *id == tab.id);
+            let visible = tab.workspace_id == workspace_id && visible_tab_ids.contains(&tab.id);
             if wake_up && visible {
                 if tab.is_sleeping {
                     let url_to_load = tab.pinned_url.clone().unwrap_or_else(|| tab.url.clone());
@@ -6448,7 +6447,7 @@ impl App {
                     2 => 2,
                     _ => 2,
                 };
-                let rows = ((count + cols - 1) / cols).max(1);
+                let rows = count.div_ceil(cols).max(1);
                 let total_gap_x = SPLIT_GAP * (cols as i32 - 1).max(0);
                 let total_gap_y = SPLIT_GAP * (rows as i32 - 1).max(0);
                 let pane_width = (width - total_gap_x).max(cols as i32) / cols as i32;
@@ -6494,7 +6493,7 @@ impl App {
                     .tab_ids
                     .iter()
                     .copied()
-                    .zip(rects.into_iter())
+                    .zip(rects)
                     .collect();
             }
         }
@@ -6597,6 +6596,12 @@ impl App {
         };
         let source_tab_id = self.tabs.get(source_index).map(|tab| tab.id)?;
         let bounds = self.web_content_bounds();
+        if self.sidebar_width() > 92 && (x as f32) < self.sidebar_width {
+            return None;
+        }
+        if self.topbar_height > 1.0 && y < self.topbar_height as i32 {
+            return None;
+        }
         if !point_in_rect(x, y, bounds) {
             return None;
         }
