@@ -144,8 +144,13 @@ const MENU_TAB_UNSPLIT: usize = 4002;
 const MENU_TAB_SPLIT_HORIZONTAL: usize = 4003;
 const MENU_TAB_SPLIT_VERTICAL: usize = 4004;
 const MENU_TAB_SPLIT_GRID: usize = 4005;
+const MENU_EXTENSION_MANAGE: usize = 4100;
+const MENU_EXTENSION_STORE: usize = 4101;
+const MENU_EXTENSION_REFRESH: usize = 4102;
+const MENU_EXTENSION_ITEM_BASE: usize = 4110;
 const MENU_WIDTH: i32 = 270;
 const MENU_ROW_HEIGHT: i32 = 34;
+const CHROME_WEB_STORE_URL: &str = "https://chromewebstore.google.com/";
 
 const COLOR_BLACK: u32 = 0x000000;
 const COLOR_PANEL: u32 = 0x090909;
@@ -508,6 +513,13 @@ impl ImportStats {
     }
 }
 
+#[derive(Clone)]
+struct BrowserExtensionInfo {
+    id: String,
+    name: String,
+    enabled: bool,
+}
+
 fn default_visit_count() -> u32 {
     1
 }
@@ -564,6 +576,7 @@ enum MenuTarget {
     SidebarBlank,
     AddressMenu,
     Bookmarks,
+    Extensions,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -619,6 +632,8 @@ enum HoverTarget {
     Reload,
     Settings,
     HistoryPage,
+    ExtensionStore,
+    ExtensionsPage,
     SettingsPage,
     ModeRow,
     ModeAuto,
@@ -629,6 +644,7 @@ enum HoverTarget {
     DownloadCancel(usize),
     DownloadPause(usize),
     DownloadOpen(usize),
+    ExtensionsButton,
     FindPrev,
     FindNext,
     FindClose,
@@ -820,6 +836,8 @@ struct App {
     split_groups: Vec<SplitGroup>,
     favicon_cache: HashMap<String, FaviconBitmap>,
     pending_favicon_hosts: Vec<String>,
+    extensions: Vec<BrowserExtensionInfo>,
+    extension_notice: Option<String>,
     active_workspace: usize,
     active: usize,
     next_id: usize,
@@ -993,6 +1011,8 @@ impl App {
             split_groups: Vec::new(),
             favicon_cache: HashMap::new(),
             pending_favicon_hosts: Vec::new(),
+            extensions: Vec::new(),
+            extension_notice: None,
             active_workspace: 1,
             active: 0,
             next_id: 1,
@@ -1530,6 +1550,25 @@ impl App {
         self.open_overlay_menu(x, y, MenuTarget::Bookmarks, items);
     }
 
+    fn open_extension_menu(&mut self) {
+        self.refresh_extensions();
+        let rect = self.extension_button_rect();
+        let mut items = vec![
+            menu_item(MENU_EXTENSION_MANAGE, "Manage Extensions"),
+            menu_item(MENU_EXTENSION_STORE, "Chrome Web Store"),
+            menu_item(MENU_EXTENSION_REFRESH, "Refresh Extensions"),
+        ];
+        for (offset, extension) in self.extensions.iter().take(12).enumerate() {
+            let state = if extension.enabled { "Enabled" } else { "Disabled" };
+            items.push(menu_item_with_subtitle(
+                MENU_EXTENSION_ITEM_BASE + offset,
+                &extension.name,
+                state,
+            ));
+        }
+        self.open_overlay_menu(rect.right - MENU_WIDTH, rect.bottom + 8, MenuTarget::Extensions, items);
+    }
+
     fn clear_site_data_and_reload(&mut self) {
         if let Some(tab) = self
             .active_tab_index()
@@ -1637,6 +1676,10 @@ impl App {
                     }
                 }
             }
+        } else if message == "settings:export:aster" {
+            self.send_settings_export("aster");
+        } else if message == "settings:export:bookmarks" {
+            self.send_settings_export("bookmarks");
         } else if let Some(raw) = message.strip_prefix("settings:import-files:") {
             let stats = self.import_uploaded_files(raw);
             self.import_export_notice = Some(stats.message());
@@ -1644,6 +1687,19 @@ impl App {
         } else if message == "settings:clear-import-notice" {
             self.import_export_notice = None;
             self.reload_settings_pages();
+        } else if message == "extensions:refresh" {
+            self.extension_notice = Some("Refreshing extensions...".to_string());
+            self.refresh_extensions();
+        } else if message == "extensions:open-store" {
+            self.open_extension_store();
+        } else if let Some(path) = message.strip_prefix("extensions:add:") {
+            self.add_extension_from_path(&percent_decode(path));
+        } else if let Some(raw) = message.strip_prefix("extensions:enable:") {
+            if let Some((id, value)) = raw.rsplit_once(':') {
+                self.set_extension_enabled(&percent_decode(id), value == "1");
+            }
+        } else if let Some(id) = message.strip_prefix("extensions:remove:") {
+            self.remove_extension(&percent_decode(id));
         } else if let Some(value) = message.strip_prefix("history:sort:") {
             self.history_sort_mode = HistorySortMode::from_str(value);
             self.reload_history_pages();
@@ -1813,6 +1869,8 @@ impl App {
             self.load_settings_page(index);
         } else if url == "aster:history" {
             self.load_history_page(index);
+        } else if url == "aster:extensions" {
+            self.load_extensions_page(index);
         } else {
             let wide = CoTaskMemPWSTR::from(url);
             unsafe {
@@ -4886,6 +4944,15 @@ impl App {
         let _ = self.create_tab("aster:history");
     }
 
+    fn open_extensions_page(&mut self) {
+        let _ = self.create_tab("aster:extensions");
+        self.refresh_extensions();
+    }
+
+    fn open_extension_store(&mut self) {
+        let _ = self.create_tab(CHROME_WEB_STORE_URL);
+    }
+
     fn navigate_active(&mut self, url: &str) {
         let Some(index) = self.active_tab_index() else {
             let _ = self.create_tab(url);
@@ -4899,6 +4966,11 @@ impl App {
             self.load_history_page(index);
             return;
         }
+        if url == "aster:extensions" {
+            self.load_extensions_page(index);
+            self.refresh_extensions();
+            return;
+        }
         if let Some(tab) = self.tabs.get_mut(index) {
             tab.url = url.to_string();
             tab.title = label_for_url(url);
@@ -4907,6 +4979,28 @@ impl App {
             unsafe {
                 let _ = tab.webview.Navigate(*wide.as_ref().as_pcwstr());
             }
+        }
+        self.save_state();
+        self.refresh();
+    }
+
+    fn load_extensions_page(&mut self, index: usize) {
+        let html = extensions_page_html(
+            self.dominant_color,
+            self.secondary_color,
+            self.accent_color,
+            &self.extensions,
+            self.extension_notice.as_deref().unwrap_or(""),
+        );
+        if let Some(tab) = self.tabs.get_mut(index) {
+            tab.url = "aster:extensions".to_string();
+            tab.title = "Aster Extensions".to_string();
+            tab.favicon_bitmap = render_glyph_favicon(18, 0xECAA, &self.fonts.icon, COLOR_ACCENT);
+            unsafe {
+                let html = CoTaskMemPWSTR::from(html.as_str());
+                let _ = tab.webview.NavigateToString(*html.as_ref().as_pcwstr());
+            }
+            set_window_text(self.address_hwnd, "aster:extensions");
         }
         self.save_state();
         self.refresh();
@@ -4968,6 +5062,24 @@ impl App {
             .collect();
         for index in indexes {
             self.load_settings_page(index);
+        }
+    }
+
+    fn reload_extensions_pages(&mut self) {
+        let indexes: Vec<usize> = self
+            .tabs
+            .iter()
+            .enumerate()
+            .filter_map(|(index, tab)| {
+                if tab.url == "aster:extensions" {
+                    Some(index)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        for index in indexes {
+            self.load_extensions_page(index);
         }
     }
 
@@ -5056,6 +5168,215 @@ impl App {
             cookies: self.export_cookies(),
         };
         serde_json::to_string_pretty(&export).unwrap_or_else(|_| "{}".to_string())
+    }
+
+    fn send_settings_export(&self, kind: &str) {
+        let (mime, payload) = match kind {
+            "aster" => ("application/json", self.aster_export_json()),
+            "bookmarks" => ("text/html", self.bookmarks_export_html()),
+            _ => return,
+        };
+        let script = format!(
+            "window.asterReceiveExport && window.asterReceiveExport({}, {}, {});",
+            js_string_literal(kind),
+            js_string_literal(mime),
+            js_string_literal(&payload)
+        );
+        unsafe {
+            let js = CoTaskMemPWSTR::from(script.as_str());
+            for tab in self.tabs.iter().filter(|tab| tab.url == "aster:settings") {
+                let _ = tab.webview.ExecuteScript(
+                    *js.as_ref().as_pcwstr(),
+                    &ExecuteScriptCompletedHandler::create(Box::new(|_, _| Ok(()))),
+                );
+            }
+        }
+    }
+
+    fn active_extension_profile(&self) -> Option<ICoreWebView2Profile7> {
+        let tab = self.tabs.get(self.active).or_else(|| self.tabs.first())?;
+        unsafe {
+            let webview13 = tab.webview.cast::<ICoreWebView2_13>().ok()?;
+            webview13.Profile().ok()?.cast::<ICoreWebView2Profile7>().ok()
+        }
+    }
+
+    fn refresh_extensions(&self) {
+        let Some(profile) = self.active_extension_profile() else {
+            return;
+        };
+        let hwnd = self.hwnd;
+        unsafe {
+            let _ = profile.GetBrowserExtensions(
+                &ProfileGetBrowserExtensionsCompletedHandler::create(Box::new(
+                    move |error_code, list| {
+                        let mut extensions = Vec::new();
+                        if error_code.is_ok() {
+                            if let Some(list) = list {
+                                let mut count = 0u32;
+                                let _ = list.Count(&mut count);
+                                for index in 0..count {
+                                    if let Ok(extension) = list.GetValueAtIndex(index) {
+                                        extensions.push(extension_info(&extension));
+                                    }
+                                }
+                            }
+                        }
+                        with_app(hwnd, |app| {
+                            app.extensions = extensions;
+                            if app.extension_notice.as_deref()
+                                == Some("Refreshing extensions...")
+                            {
+                                app.extension_notice =
+                                    Some("Extension list refreshed.".to_string());
+                            }
+                            app.reload_extensions_pages();
+                            app.refresh();
+                        });
+                        Ok(())
+                    },
+                )),
+            );
+        }
+    }
+
+    fn add_extension_from_path(&mut self, path: &str) {
+        let path = path.trim().trim_matches('"');
+        if path.is_empty() {
+            self.extension_notice = Some("Enter an unpacked extension folder path.".to_string());
+            self.reload_extensions_pages();
+            return;
+        }
+        let folder = PathBuf::from(path);
+        if !folder.join("manifest.json").exists() {
+            self.extension_notice =
+                Some("That folder does not contain manifest.json.".to_string());
+            self.reload_extensions_pages();
+            return;
+        }
+        let Some(profile) = self.active_extension_profile() else {
+            self.extension_notice =
+                Some("Extensions are not available in this WebView2 runtime.".to_string());
+            self.reload_extensions_pages();
+            return;
+        };
+        self.extension_notice = Some("Loading extension...".to_string());
+        self.reload_extensions_pages();
+        let hwnd = self.hwnd;
+        let path = folder.to_string_lossy().into_owned();
+        unsafe {
+            let wide = CoTaskMemPWSTR::from(path.as_str());
+            let _ = profile.AddBrowserExtension(
+                *wide.as_ref().as_pcwstr(),
+                &ProfileAddBrowserExtensionCompletedHandler::create(Box::new(
+                    move |error_code, extension| {
+                        with_app(hwnd, |app| {
+                            app.extension_notice = if error_code.is_ok() {
+                                let name = extension
+                                    .as_ref()
+                                    .map(extension_info)
+                                    .map(|info| info.name)
+                                    .unwrap_or_else(|| "Extension".to_string());
+                                Some(format!("{name} loaded."))
+                            } else {
+                                Some("Extension could not be loaded.".to_string())
+                            };
+                            app.refresh_extensions();
+                        });
+                        Ok(())
+                    },
+                )),
+            );
+        }
+    }
+
+    fn with_extension_by_id<F>(&self, id: &str, action: F)
+    where
+        F: FnOnce(ICoreWebView2BrowserExtension) + 'static,
+    {
+        let Some(profile) = self.active_extension_profile() else {
+            return;
+        };
+        let wanted = id.to_string();
+        let action = RefCell::new(Some(action));
+        unsafe {
+            let _ = profile.GetBrowserExtensions(
+                &ProfileGetBrowserExtensionsCompletedHandler::create(Box::new(
+                    move |error_code, list| {
+                        if error_code.is_ok() {
+                            if let Some(list) = list {
+                                let mut count = 0u32;
+                                let _ = list.Count(&mut count);
+                                for index in 0..count {
+                                    if let Ok(extension) = list.GetValueAtIndex(index) {
+                                        if extension_info(&extension).id == wanted {
+                                            if let Some(action) = action.borrow_mut().take() {
+                                                action(extension);
+                                            }
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        Ok(())
+                    },
+                )),
+            );
+        }
+    }
+
+    fn set_extension_enabled(&mut self, id: &str, enabled: bool) {
+        let id_for_notice = id.to_string();
+        let hwnd = self.hwnd;
+        self.extension_notice = Some(if enabled {
+            "Enabling extension...".to_string()
+        } else {
+            "Disabling extension...".to_string()
+        });
+        self.reload_extensions_pages();
+        self.with_extension_by_id(id, move |extension| unsafe {
+            let _ = extension.Enable(
+                enabled,
+                &BrowserExtensionEnableCompletedHandler::create(Box::new(move |error_code| {
+                    with_app(hwnd, |app| {
+                        app.extension_notice = if error_code.is_ok() {
+                            Some(if enabled {
+                                "Extension enabled.".to_string()
+                            } else {
+                                "Extension disabled.".to_string()
+                            })
+                        } else {
+                            Some(format!("Could not update extension {id_for_notice}."))
+                        };
+                        app.refresh_extensions();
+                    });
+                    Ok(())
+                })),
+            );
+        });
+    }
+
+    fn remove_extension(&mut self, id: &str) {
+        let id_for_notice = id.to_string();
+        let hwnd = self.hwnd;
+        self.extension_notice = Some("Removing extension...".to_string());
+        self.reload_extensions_pages();
+        self.with_extension_by_id(id, move |extension| unsafe {
+            let _ = extension.Remove(&BrowserExtensionRemoveCompletedHandler::create(Box::new(
+                move |error_code| {
+                    with_app(hwnd, |app| {
+                        app.extension_notice = if error_code.is_ok() {
+                            Some("Extension removed.".to_string())
+                        } else {
+                            Some(format!("Could not remove extension {id_for_notice}."))
+                        };
+                        app.refresh_extensions();
+                    });
+                    Ok(())
+                },
+            )));
+        });
     }
 
     fn bookmarks_export_html(&self) -> String {
@@ -5575,8 +5896,6 @@ impl App {
     }
 
     fn load_settings_page(&mut self, index: usize) {
-        let export_json = self.aster_export_json();
-        let bookmarks_html = self.bookmarks_export_html();
         let html = settings_page_html(
             self.dominant_color,
             self.secondary_color,
@@ -5587,8 +5906,6 @@ impl App {
                 StartupMode::LastSession => "last",
             },
             is_aster_default_browser(),
-            &export_json,
-            &bookmarks_html,
             self.import_export_notice.as_deref().unwrap_or(""),
         );
         if let Some(tab) = self.tabs.get_mut(index) {
@@ -6079,6 +6396,17 @@ impl App {
         }
     }
 
+    fn extension_button_rect(&self) -> RECT {
+        let (min_btn, _, _) = self.window_button_rects();
+        let y = self.topbar_y();
+        RECT {
+            left: min_btn.left - 46,
+            top: y + 16,
+            right: min_btn.left - 18,
+            bottom: y + 44,
+        }
+    }
+
     fn settings_rect(&self) -> RECT {
         let rect = client_rect(self.hwnd);
         RECT {
@@ -6103,7 +6431,7 @@ impl App {
         let bottom = settings.top - 8;
         RECT {
             left: 12,
-            top: bottom - 152,
+            top: bottom - 236,
             right: 196,
             bottom,
         }
@@ -6130,7 +6458,27 @@ impl App {
     }
 
     fn history_page_row_rect(&self) -> RECT {
+        let row = self.extensions_page_row_rect();
+        RECT {
+            left: row.left,
+            top: row.bottom + 8,
+            right: row.right,
+            bottom: row.bottom + 44,
+        }
+    }
+
+    fn extension_store_row_rect(&self) -> RECT {
         let row = self.mode_row_rect();
+        RECT {
+            left: row.left,
+            top: row.bottom + 8,
+            right: row.right,
+            bottom: row.bottom + 44,
+        }
+    }
+
+    fn extensions_page_row_rect(&self) -> RECT {
+        let row = self.extension_store_row_rect();
         RECT {
             left: row.left,
             top: row.bottom + 8,
@@ -6170,10 +6518,9 @@ impl App {
         if self.fullscreen {
             return None;
         }
-        let (min_btn, _, _) = self.window_button_rects();
         let address = self.address_pill_rect();
         let y = self.topbar_y();
-        let right = min_btn.left - 12;
+        let right = self.extension_button_rect().left - 8;
         let left = (right - 88).max(address.right + 10);
         if right - left < 72 {
             return None;
@@ -7065,6 +7412,13 @@ impl App {
                 self.hover_target == Some(HoverTarget::Reload),
                 &self.fonts.toolbar_icon,
             );
+            draw_toolbar_icon_button(
+                hdc,
+                self.extension_button_rect(),
+                IconKind::Extensions,
+                self.hover_target == Some(HoverTarget::ExtensionsButton),
+                &self.fonts.toolbar_icon,
+            );
 
             let edit_rect = self.address_pill_rect();
             let active_is_loading = self
@@ -7749,6 +8103,64 @@ impl App {
                     top: row.top,
                     right: row.right - 6,
                     bottom: row.bottom,
+                },
+                COLOR_MUTED,
+            );
+
+            let store_row = self.extension_store_row_rect();
+            if self.hover_target == Some(HoverTarget::ExtensionStore) {
+                fill_round_rect(hdc, store_row, COLOR_SURFACE_HOVER, 9);
+            }
+            draw_text(
+                hdc,
+                &self.fonts.small,
+                "Extension Store",
+                RECT {
+                    left: store_row.left + 12,
+                    top: store_row.top,
+                    right: store_row.right - 30,
+                    bottom: store_row.bottom,
+                },
+                COLOR_TEXT,
+            );
+            draw_icon_glyph(
+                hdc,
+                &self.fonts.icon,
+                glyph(0xE719).as_str(),
+                RECT {
+                    left: store_row.right - 28,
+                    top: store_row.top,
+                    right: store_row.right - 6,
+                    bottom: store_row.bottom,
+                },
+                COLOR_MUTED,
+            );
+
+            let extensions_row = self.extensions_page_row_rect();
+            if self.hover_target == Some(HoverTarget::ExtensionsPage) {
+                fill_round_rect(hdc, extensions_row, COLOR_SURFACE_HOVER, 9);
+            }
+            draw_text(
+                hdc,
+                &self.fonts.small,
+                "Extensions",
+                RECT {
+                    left: extensions_row.left + 12,
+                    top: extensions_row.top,
+                    right: extensions_row.right - 30,
+                    bottom: extensions_row.bottom,
+                },
+                COLOR_TEXT,
+            );
+            draw_icon_glyph(
+                hdc,
+                &self.fonts.icon,
+                glyph(0xECAA).as_str(),
+                RECT {
+                    left: extensions_row.right - 28,
+                    top: extensions_row.top,
+                    right: extensions_row.right - 6,
+                    bottom: extensions_row.bottom,
                 },
                 COLOR_MUTED,
             );
@@ -9367,6 +9779,18 @@ impl App {
         }
 
         if self.settings_open {
+            if point_in_rect(x, y, self.extension_store_row_rect()) {
+                self.settings_open = false;
+                self.mode_menu_open = false;
+                self.open_extension_store();
+                return;
+            }
+            if point_in_rect(x, y, self.extensions_page_row_rect()) {
+                self.settings_open = false;
+                self.mode_menu_open = false;
+                self.open_extensions_page();
+                return;
+            }
             if point_in_rect(x, y, self.history_page_row_rect()) {
                 self.settings_open = false;
                 self.mode_menu_open = false;
@@ -9463,6 +9887,11 @@ impl App {
         }
         if point_in_rect(x, y, reload) {
             self.reload();
+            return;
+        }
+
+        if point_in_rect(x, y, self.extension_button_rect()) {
+            self.open_extension_menu();
             return;
         }
 
@@ -9879,8 +10308,24 @@ impl App {
                     self.navigate_active(&url);
                 }
             }
+            MenuTarget::Extensions => self.run_extension_menu_command(id),
         }
         self.refresh();
+    }
+
+    fn run_extension_menu_command(&mut self, id: usize) {
+        match id {
+            MENU_EXTENSION_MANAGE => self.open_extensions_page(),
+            MENU_EXTENSION_STORE => self.open_extension_store(),
+            MENU_EXTENSION_REFRESH => {
+                self.extension_notice = Some("Refreshing extensions...".to_string());
+                self.refresh_extensions();
+            }
+            id if (MENU_EXTENSION_ITEM_BASE..MENU_EXTENSION_ITEM_BASE + 12).contains(&id) => {
+                self.open_extensions_page();
+            }
+            _ => {}
+        }
     }
 
     fn run_address_menu_command(&mut self, id: usize) {
@@ -10277,6 +10722,8 @@ impl App {
                     self.hover_target = Some(HoverTarget::Forward);
                 } else if point_in_rect(x, y, reload) {
                     self.hover_target = Some(HoverTarget::Reload);
+                } else if point_in_rect(x, y, self.extension_button_rect()) {
+                    self.hover_target = Some(HoverTarget::ExtensionsButton);
                 } else if point_in_rect(x, y, self.address_menu_rect()) {
                     self.hover_target = Some(HoverTarget::AddressMenu);
                 } else if self
@@ -10304,6 +10751,16 @@ impl App {
                         Some(id) => Some(HoverTarget::DownloadIndicator(id)),
                         None => Some(HoverTarget::DownloadOverflow),
                     };
+                } else if self.settings_open
+                    && point_in_rect(x, y, self.extension_store_row_rect())
+                {
+                    self.hover_target = Some(HoverTarget::ExtensionStore);
+                    self.mode_menu_open = false;
+                } else if self.settings_open
+                    && point_in_rect(x, y, self.extensions_page_row_rect())
+                {
+                    self.hover_target = Some(HoverTarget::ExtensionsPage);
+                    self.mode_menu_open = false;
                 } else if self.settings_open && point_in_rect(x, y, self.history_page_row_rect()) {
                     self.hover_target = Some(HoverTarget::HistoryPage);
                     self.mode_menu_open = false;
@@ -11337,7 +11794,10 @@ fn main() -> AppResult<()> {
     let app = Box::new(App::new(hwnd, environment)?);
     unsafe {
         SetWindowLong(hwnd, GWLP_USERDATA, Box::into_raw(app) as isize);
-        with_app(hwnd, |app| app.request_missing_favicons());
+        with_app(hwnd, |app| {
+            app.request_missing_favicons();
+            app.refresh_extensions();
+        });
         let _ = WindowsAndMessaging::ShowWindow(hwnd, WindowsAndMessaging::SW_SHOW);
         let _ = Gdi::UpdateWindow(hwnd);
     }
@@ -11363,10 +11823,12 @@ fn create_environment() -> AppResult<ICoreWebView2Environment> {
         Box::new(|handler| unsafe {
             let path = profile_path();
             let user_data = CoTaskMemPWSTR::from(path.as_str());
+            let options = CoreWebView2EnvironmentOptions::default();
+            options.set_are_browser_extensions_enabled(true);
             CreateCoreWebView2EnvironmentWithOptions(
                 PCWSTR::null(),
                 *user_data.as_ref().as_pcwstr(),
-                None,
+                &ICoreWebView2EnvironmentOptions::from(options),
                 &handler,
             )
             .map_err(webview2_com::Error::WindowsError)
@@ -12304,6 +12766,7 @@ extern "system" fn window_proc(hwnd: HWND, msg: u32, w_param: WPARAM, l_param: L
                     let (back, forward, reload) = app.top_button_rects();
                     let logo = app.logo_rect();
                     let new_tab = app.new_tab_rect();
+                    let extensions = app.extension_button_rect();
                     let address = app.address_pill_rect();
                     let find_bar = app.find_bar_rect();
                     let (min_btn, max_btn, close_btn) = app.window_button_rects();
@@ -12315,6 +12778,7 @@ extern "system" fn window_proc(hwnd: HWND, msg: u32, w_param: WPARAM, l_param: L
                         || point_in_rect(pt.x, pt.y, back)
                         || point_in_rect(pt.x, pt.y, forward)
                         || point_in_rect(pt.x, pt.y, reload)
+                        || point_in_rect(pt.x, pt.y, extensions)
                         || point_in_rect(pt.x, pt.y, address)
                         || split_layout
                             .map(|rect| point_in_rect(pt.x, pt.y, rect))
@@ -12684,6 +13148,10 @@ extern "system" fn window_proc(hwnd: HWND, msg: u32, w_param: WPARAM, l_param: L
                 if let Some(index) = app.tabs.iter().position(|t| t.url == "aster:history") {
                     app.load_history_page(index);
                 }
+                if let Some(index) = app.tabs.iter().position(|t| t.url == "aster:extensions") {
+                    app.load_extensions_page(index);
+                    app.refresh_extensions();
+                }
             });
             unsafe { WindowsAndMessaging::DefWindowProcW(hwnd, msg, w_param, l_param) }
         }
@@ -12705,6 +13173,10 @@ extern "system" fn window_proc(hwnd: HWND, msg: u32, w_param: WPARAM, l_param: L
                 }
                 if let Some(index) = app.tabs.iter().position(|t| t.url == "aster:history") {
                     app.load_history_page(index);
+                }
+                if let Some(index) = app.tabs.iter().position(|t| t.url == "aster:extensions") {
+                    app.load_extensions_page(index);
+                    app.refresh_extensions();
                 }
 
                 if app.renaming_folder_id.is_some() {
@@ -12959,6 +13431,7 @@ enum IconKind {
     Back,
     Forward,
     Reload,
+    Extensions,
 }
 
 fn draw_toolbar_icon_button(
@@ -13673,6 +14146,7 @@ impl IconKind {
             Self::Back => "\u{E76B}",
             Self::Forward => "\u{E76C}",
             Self::Reload => "\u{E72C}",
+            Self::Extensions => "\u{ECAA}",
         }
     }
 }
@@ -15053,15 +15527,11 @@ fn settings_page_html(
     site_mode: &str,
     startup_mode: &str,
     is_default: bool,
-    export_json: &str,
-    bookmarks_html: &str,
     import_notice: &str,
 ) -> String {
     let dominant = colorref_to_css(dominant_color);
     let secondary = colorref_to_css(secondary_color);
     let accent = colorref_to_css(accent_color);
-    let export_json_literal = js_string_literal(export_json);
-    let bookmarks_html_literal = js_string_literal(bookmarks_html);
     let import_notice_html = if import_notice.trim().is_empty() {
         String::new()
     } else {
@@ -15204,8 +15674,6 @@ document.querySelectorAll(".reset-btn").forEach((btn) => {{
 document.getElementById("openStateFile").onclick = () => post("settings:open-state-file");
 const makeDefaultBtn = document.getElementById("makeDefaultBtn");
 if (makeDefaultBtn) makeDefaultBtn.onclick = () => post("settings:make-default");
-const asterExport = {export_json_literal};
-const bookmarkExport = {bookmarks_html_literal};
 const importStatus = document.getElementById("importStatus");
 const clearImportNotice = document.getElementById("clearImportNotice");
 if (clearImportNotice) clearImportNotice.onclick = () => post("settings:clear-import-notice");
@@ -15223,8 +15691,23 @@ function downloadText(filename, mime, text) {{
   link.remove();
   setTimeout(() => URL.revokeObjectURL(url), 800);
 }}
-document.getElementById("exportAsterData").onclick = () => downloadText(`aster-data-${{dateStamp()}}.json`, "application/json", asterExport);
-document.getElementById("exportBookmarkHtml").onclick = () => downloadText(`aster-bookmarks-${{dateStamp()}}.html`, "text/html", bookmarkExport);
+window.asterReceiveExport = (kind, mime, text) => {{
+  if (kind === "aster") {{
+    downloadText(`aster-data-${{dateStamp()}}.json`, mime, text);
+    importStatus.textContent = "Aster data export ready.";
+  }} else if (kind === "bookmarks") {{
+    downloadText(`aster-bookmarks-${{dateStamp()}}.html`, mime, text);
+    importStatus.textContent = "Bookmarks export ready.";
+  }}
+}};
+document.getElementById("exportAsterData").onclick = () => {{
+  importStatus.textContent = "Preparing Aster data export...";
+  post("settings:export:aster");
+}};
+document.getElementById("exportBookmarkHtml").onclick = () => {{
+  importStatus.textContent = "Preparing bookmarks export...";
+  post("settings:export:bookmarks");
+}};
 const importDrop = document.getElementById("importDrop");
 const importInput = document.getElementById("importInput");
 document.getElementById("chooseImport").onclick = () => importInput.click();
@@ -15327,6 +15810,122 @@ fn history_entries_json(entries: &[VisitedSite]) -> String {
         .collect::<Vec<_>>()
         .join(",");
     format!("[{}]", items)
+}
+
+fn extensions_entries_json(entries: &[BrowserExtensionInfo]) -> String {
+    let items = entries
+        .iter()
+        .map(|entry| {
+            format!(
+                "{{\"id\":{},\"name\":{},\"enabled\":{}}}",
+                js_string_literal(&entry.id),
+                js_string_literal(&entry.name),
+                if entry.enabled { "true" } else { "false" }
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("[{}]", items)
+}
+
+fn extensions_page_html(
+    dominant_color: u32,
+    secondary_color: u32,
+    accent_color: u32,
+    extensions: &[BrowserExtensionInfo],
+    notice: &str,
+) -> String {
+    let dominant = colorref_to_css(dominant_color);
+    let secondary = colorref_to_css(secondary_color);
+    let accent = colorref_to_css(accent_color);
+    let entries_json = extensions_entries_json(extensions);
+    let notice_html = if notice.trim().is_empty() {
+        String::new()
+    } else {
+        format!(
+            r#"<div class="notice"><span>{}</span></div>"#,
+            html_escape_text(notice)
+        )
+    };
+    let template = r#"<!doctype html>
+<html>
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Aster Extensions</title>
+<style>
+:root { --accent: __ACCENT__; --bg: __DOMINANT__; --secondary: __SECONDARY__; --panel: __SECONDARY__; --line: #2a2a2a; --text: #f5f5f5; --muted: #a1a1a1; --soft: #151515; }
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.45 "Segoe UI Variable Text", "Segoe UI", sans-serif; }
+button, input { font: inherit; }
+.page { min-height: 100vh; padding: 34px clamp(22px, 5vw, 72px); }
+.wrap { max-width: 980px; margin: 0 auto; }
+.header { display: flex; align-items: end; justify-content: space-between; gap: 16px; margin: 0 0 22px; }
+h1 { font-size: 28px; line-height: 1.1; margin: 0 0 7px; font-weight: 650; }
+.lead { color: var(--muted); margin: 0; }
+.actions { display: flex; gap: 8px; flex-wrap: wrap; justify-content: flex-end; }
+.group { border: 1px solid var(--line); border-radius: 8px; overflow: hidden; background: var(--panel); margin: 16px 0; }
+.row { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 16px; align-items: center; padding: 15px 17px; border-top: 1px solid var(--line); }
+.row:first-child { border-top: 0; }
+.title { font-weight: 600; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.hint { color: var(--muted); font-size: 12px; margin-top: 3px; overflow-wrap: anywhere; }
+.load { display: grid; grid-template-columns: minmax(180px, 1fr) auto; gap: 8px; width: min(560px, 100%); }
+input { color: var(--text); background: #080808; border: 1px solid var(--line); border-radius: 7px; padding: 8px 10px; min-width: 0; }
+.action-btn { min-width: 110px; color: var(--text); background: #080808; border: 1px solid var(--line); border-radius: 7px; padding: 8px 10px; cursor: pointer; }
+.action-btn:hover { background: color-mix(in srgb, var(--accent), transparent 88%); border-color: color-mix(in srgb, var(--accent), var(--line) 55%); }
+.toggle { display: inline-flex; align-items: center; gap: 8px; color: var(--muted); }
+.toggle input { width: 18px; height: 18px; accent-color: var(--accent); }
+.notice { border: 1px solid color-mix(in srgb, var(--accent), var(--line) 58%); background: color-mix(in srgb, var(--accent), transparent 90%); border-radius: 8px; padding: 11px 13px; margin: 0 0 14px; }
+.empty { color: var(--muted); padding: 18px; }
+@media (max-width: 760px) { .header, .row { grid-template-columns: minmax(0, 1fr); flex-direction: column; align-items: stretch; } .load { grid-template-columns: minmax(0, 1fr); } .actions { justify-content: stretch; } .action-btn { flex: 1; } }
+</style>
+</head>
+<body>
+<div class="page"><div class="wrap">
+<div class="header"><div><h1>Extensions</h1><p class="lead">Load unpacked Chrome extensions and manage what is active in Aster.</p></div><div class="actions"><button class="action-btn" id="openStore">Chrome Web Store</button><button class="action-btn" id="refresh">Refresh</button></div></div>
+__NOTICE__
+<div class="group">
+<div class="row"><div><div class="title">Load unpacked extension</div><div class="hint">Enter the folder that contains manifest.json. Extensions are stored by the WebView2 profile.</div></div><div class="load"><input id="extensionPath" placeholder="C:\path\to\extension"><button class="action-btn" id="loadUnpacked">Load</button></div></div>
+</div>
+<div class="group" id="extensionRows"></div>
+</div></div>
+<script>
+const post = (m) => window.chrome?.webview?.postMessage(m);
+const extensions = __EXTENSIONS__;
+const rows = document.getElementById("extensionRows");
+function render() {
+  rows.innerHTML = "";
+  if (!extensions.length) {
+    rows.innerHTML = `<div class="empty">No extensions installed yet.</div>`;
+    return;
+  }
+  extensions.forEach((extension) => {
+    const row = document.createElement("div");
+    row.className = "row";
+    row.innerHTML = `<div><div class="title"></div><div class="hint"></div></div><div class="actions"><label class="toggle"><input type="checkbox"${extension.enabled ? " checked" : ""}>Enabled</label><button class="action-btn">Remove</button></div>`;
+    row.querySelector(".title").textContent = extension.name;
+    row.querySelector(".hint").textContent = extension.id;
+    row.querySelector("input").onchange = (event) => post("extensions:enable:" + encodeURIComponent(extension.id) + ":" + (event.target.checked ? "1" : "0"));
+    row.querySelector("button").onclick = () => post("extensions:remove:" + encodeURIComponent(extension.id));
+    rows.appendChild(row);
+  });
+}
+document.getElementById("openStore").onclick = () => post("extensions:open-store");
+document.getElementById("refresh").onclick = () => post("extensions:refresh");
+document.getElementById("loadUnpacked").onclick = () => {
+  const path = document.getElementById("extensionPath").value.trim();
+  if (path) post("extensions:add:" + encodeURIComponent(path));
+};
+render();
+</script>
+</body>
+</html>"#;
+    template
+        .replace("__ACCENT__", &accent)
+        .replace("__DOMINANT__", &dominant)
+        .replace("__SECONDARY__", &secondary)
+        .replace("__EXTENSIONS__", &entries_json)
+        .replace("__NOTICE__", &notice_html)
 }
 
 fn history_page_html(
@@ -15573,6 +16172,34 @@ unsafe fn take_pwstr(value: PWSTR) -> String {
     out
 }
 
+fn extension_info(extension: &ICoreWebView2BrowserExtension) -> BrowserExtensionInfo {
+    unsafe {
+        let mut id = PWSTR::null();
+        let mut name = PWSTR::null();
+        let mut enabled = BOOL::from(false);
+        let id = if extension.Id(&mut id).is_ok() {
+            take_pwstr(id)
+        } else {
+            String::new()
+        };
+        let name = if extension.Name(&mut name).is_ok() {
+            take_pwstr(name)
+        } else {
+            String::new()
+        };
+        let _ = extension.IsEnabled(&mut enabled);
+        BrowserExtensionInfo {
+            id,
+            name: if name.trim().is_empty() {
+                "Unnamed extension".to_string()
+            } else {
+                name
+            },
+            enabled: enabled.as_bool(),
+        }
+    }
+}
+
 fn client_rect(hwnd: HWND) -> RECT {
     let mut rect = RECT::default();
     unsafe {
@@ -15679,6 +16306,11 @@ fn normalize_address(raw: &str) -> String {
     }
     if value.eq_ignore_ascii_case(":history") || value.eq_ignore_ascii_case("aster:history") {
         return "aster:history".to_string();
+    }
+    if value.eq_ignore_ascii_case(":extensions")
+        || value.eq_ignore_ascii_case("aster:extensions")
+    {
+        return "aster:extensions".to_string();
     }
     if value.contains("://") || value.starts_with("about:") {
         value.to_string()
