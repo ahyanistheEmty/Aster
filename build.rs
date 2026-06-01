@@ -63,7 +63,8 @@ fn generate_ico_file() {
         let src_y = size - 1 - y;
         let src_offset = src_y * size * 4;
         let dest_offset = y * size * 4;
-        bmp_pixels[dest_offset..(dest_offset + size * 4)].copy_from_slice(&pixels[src_offset..(src_offset + size * 4)]);
+        bmp_pixels[dest_offset..(dest_offset + size * 4)]
+            .copy_from_slice(&pixels[src_offset..(src_offset + size * 4)]);
     }
 
     let and_mask_size = ((size + 31) / 32) * 4 * size;

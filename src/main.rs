@@ -2,7 +2,7 @@
 
 use std::{
     cell::{Cell, RefCell},
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs, mem,
     path::{Path, PathBuf},
     process::Command,
@@ -48,7 +48,7 @@ use windows::{
             WICBitmapDitherTypeNone, WICBitmapPaletteTypeCustom, WICDecodeMetadataCacheOnDemand,
         },
         Security::Cryptography::{CryptUnprotectData, CRYPT_INTEGER_BLOB},
-        System::{Com::*, Com::Urlmon::URLDownloadToCacheFileW, LibraryLoader},
+        System::{Com::Urlmon::URLDownloadToCacheFileW, Com::*, LibraryLoader},
         UI::{
             Controls::{EM_SETMARGINS, EM_SETSEL, MARGINS},
             HiDpi,
@@ -60,8 +60,8 @@ use windows::{
                 self, CreateIconIndirect, GetCursorPos, GetTopWindow, GetWindow, CREATESTRUCTW,
                 CW_USEDEFAULT, EC_LEFTMARGIN, EC_RIGHTMARGIN, GWLP_USERDATA, GWLP_WNDPROC,
                 GWL_STYLE, GW_HWNDNEXT, HICON, HMENU, HWND_TOP, ICONINFO, ICON_BIG, ICON_SMALL,
-                IDC_ARROW, MSG, WINDOW_EX_STYLE, WINDOW_LONG_PTR_INDEX, WINDOW_STYLE, WM_APP,
-                WM_CHAR, WM_CLOSE, WM_COMMAND, WM_CREATE, WM_CTLCOLORBTN, WM_CTLCOLOREDIT,
+                IDC_ARROW, MSG, WINDOW_EX_STYLE, WINDOW_LONG_PTR_INDEX, WINDOW_STYLE, WM_ACTIVATE,
+                WM_APP, WM_CHAR, WM_CLOSE, WM_COMMAND, WM_CREATE, WM_CTLCOLORBTN, WM_CTLCOLOREDIT,
                 WM_CTLCOLORSTATIC, WM_DESTROY, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDOWN,
                 WM_LBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCREATE, WM_PAINT,
                 WM_RBUTTONDOWN, WM_SETCURSOR, WM_SETFOCUS, WM_SETFONT, WM_SETICON, WM_SIZE,
@@ -86,6 +86,7 @@ const TOPBAR_EXPANDED: f32 = 58.0;
 const TOPBAR_HIDDEN: f32 = 0.0;
 const HOVER_ZONE: i32 = 4;
 const TOPBAR_HEIGHT: i32 = 58;
+const EXTENSION_SIDE_PANEL_WIDTH: i32 = 360;
 const SIDEBAR_TIMER_ID: usize = 42;
 const HOVER_LEAVE_TIMER_ID: usize = 43;
 const HOVER_DETECT_TIMER_ID: usize = 44;
@@ -98,7 +99,281 @@ const SPLIT_GAP: i32 = 6;
 const STATE_FILE: &str = ".aster-state";
 const FOCUS_EDIT_MSG: u32 = WM_APP + 1;
 const FAVICON_FETCHED_MSG: u32 = WM_APP + 2;
+const EXTENSION_PACKAGE_READY_MSG: u32 = WM_APP + 3;
+const WEBVIEW_MESSAGE_MSG: u32 = WM_APP + 4;
+const NEW_WINDOW_REQUESTED_MSG: u32 = WM_APP + 5;
+const WEBVIEW_PROCESS_FAILED_MSG: u32 = WM_APP + 6;
+const EXTENSION_FOLDER_PICKED_MSG: u32 = WM_APP + 7;
 const WM_COPYDATA: u32 = 0x004A;
+const CHROME_COMPAT_VERSION: &str = "148.0.7778.216";
+const ASTER_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.7778.216 Safari/537.36";
+const EXTENSION_STORE_ASSIST_SCRIPT: &str = r##"
+(() => {
+  if (window.__asterExtensionStoreAssistInstalled) return;
+  window.__asterExtensionStoreAssistInstalled = true;
+
+  const accent = "__ASTER_ACCENT__";
+  const chromeVersion = "__CHROME_VERSION__";
+  const chromeMajor = chromeVersion.split(".")[0];
+  const installedIds = new Set(__ASTER_INSTALLED_EXTENSION_IDS__.map((id) => String(id).toLowerCase()));
+  const post = (message) => window.chrome?.webview?.postMessage(message);
+  try {
+    Object.defineProperty(Navigator.prototype, "vendor", { get: () => "Google Inc.", configurable: true });
+    Object.defineProperty(Navigator.prototype, "userAgent", { get: () => "__ASTER_USER_AGENT__", configurable: true });
+    Object.defineProperty(Navigator.prototype, "userAgentData", {
+      get: () => ({
+        brands: [
+          { brand: "Chromium", version: chromeMajor },
+          { brand: "Google Chrome", version: chromeMajor },
+          { brand: "Not A(Brand", version: "24" }
+        ],
+        mobile: false,
+        platform: "Windows",
+        getHighEntropyValues: async () => ({
+          architecture: "x86",
+          bitness: "64",
+          brands: [
+            { brand: "Chromium", version: chromeMajor },
+            { brand: "Google Chrome", version: chromeMajor },
+            { brand: "Not A(Brand", version: "24" }
+          ],
+          fullVersionList: [
+            { brand: "Chromium", version: chromeVersion },
+            { brand: "Google Chrome", version: chromeVersion },
+            { brand: "Not A(Brand", version: "24.0.0.0" }
+          ],
+          mobile: false,
+          model: "",
+          platform: "Windows",
+          platformVersion: "15.0.0",
+          uaFullVersion: chromeVersion,
+          wow64: false
+        })
+      }),
+      configurable: true
+    });
+  } catch {}
+
+  const isStore = () => /(^|\.)chromewebstore\.google\.com$/i.test(location.hostname)
+    || /^chrome\.google\.com$/i.test(location.hostname);
+  const extensionId = () => {
+    const text = `${location.pathname}/${location.search}/${location.hash}`.toLowerCase();
+    const match = text.match(/[a-p]{32}/);
+    return match ? match[0] : "";
+  };
+  const status = (message) => {
+    const label = document.getElementById("__asterExtensionStatus");
+    if (label) label.textContent = message || "";
+  };
+  window.asterExtensionStoreStatus = status;
+  window.asterSetInstalledExtensions = (ids) => {
+    installedIds.clear();
+    (Array.isArray(ids) ? ids : []).forEach((id) => installedIds.add(String(id).toLowerCase()));
+    render();
+  };
+  window.asterMarkExtensionInstalled = (id) => {
+    if (id) installedIds.add(String(id).toLowerCase());
+    status("Installed in Aster");
+    render();
+  };
+
+  let queued = false;
+  let lastInstallAt = 0;
+  const schedule = () => {
+    if (queued) return;
+    queued = true;
+    requestAnimationFrame(() => {
+      queued = false;
+      render();
+    });
+  };
+  const install = () => {
+    const now = Date.now();
+    if (now - lastInstallAt < 800) return;
+    lastInstallAt = now;
+    const id = extensionId();
+    if (!id) {
+      status("Open an extension detail page first.");
+      return;
+    }
+    if (installedIds.has(id)) {
+      status("Installed in Aster");
+      render();
+      return;
+    }
+    status("Sending install request to Aster...");
+    post("extensions:install-store:" + encodeURIComponent(id));
+  };
+  const firstCallback = (args) => Array.from(args).find((item) => typeof item === "function");
+  const labelForNode = (node) => {
+    if (!node) return "";
+    const text = node.textContent || "";
+    const aria = node.getAttribute ? (node.getAttribute("aria-label") || node.getAttribute("title") || "") : "";
+    return `${text} ${aria}`.toLowerCase();
+  };
+  const eventIntentLabel = (event) => {
+    const path = typeof event.composedPath === "function" ? event.composedPath() : [event.target];
+    return path.slice(0, 8).map(labelForNode).join(" ");
+  };
+  const isInstallIntent = (label) => label.includes("add to chrome")
+    || label.includes("download chrome")
+    || label.includes("install chrome")
+    || label.includes("install")
+    || label.includes("get extension")
+    || label.includes("installed in aster");
+  const applyInstallState = (el, installed) => {
+    if (installed) {
+      if ("disabled" in el) el.disabled = true;
+      el.setAttribute("aria-disabled", "true");
+      el.style.pointerEvents = "auto";
+      el.style.cursor = "default";
+      if (el.textContent) el.textContent = "Installed in Aster";
+      return;
+    }
+    if ("disabled" in el) el.disabled = false;
+    el.removeAttribute("disabled");
+    el.setAttribute("aria-disabled", "false");
+    el.style.pointerEvents = "auto";
+    el.style.cursor = "pointer";
+    if (el.textContent) el.textContent = "Install in Aster";
+  };
+  const patchChromePrompts = (installed) => {
+    document.querySelectorAll("div, section, aside").forEach((el) => {
+      const text = (el.textContent || "").trim().toLowerCase();
+      if (text === "download chrome to install extensions and themes") {
+        el.textContent = installed ? "Installed and managed in Aster." : "Install this extension with Aster.";
+      } else if (installed && text.length < 360 && text.includes("switch to chrome?") && text.includes("google recommends using chrome")) {
+        el.style.display = "none";
+      }
+    });
+  };
+  const patchChromeInstallApi = () => {
+    try {
+      const originalChrome = window.chrome || {};
+      const chromeObject = originalChrome;
+      chromeObject.runtime = chromeObject.runtime || {};
+      chromeObject.webstore = chromeObject.webstore || {};
+      chromeObject.webstore.install = (_url, success, failure) => {
+        try {
+          install();
+          if (typeof success === "function") setTimeout(success, 0);
+        } catch (error) {
+          if (typeof failure === "function") setTimeout(() => failure(String(error)), 0);
+        }
+      };
+      chromeObject.webstorePrivate = chromeObject.webstorePrivate || {};
+      chromeObject.webstorePrivate.beginInstallWithManifest3 = (...args) => {
+        install();
+        const callback = firstCallback(args);
+        if (callback) setTimeout(() => callback({ result: "success" }), 0);
+      };
+      chromeObject.webstorePrivate.completeInstall = (...args) => {
+        install();
+        const callback = firstCallback(args);
+        if (callback) setTimeout(callback, 0);
+      };
+      chromeObject.webstorePrivate.getExtensionStatus = (...args) => {
+        const callback = firstCallback(args);
+        if (callback) setTimeout(() => callback("can_request"), 0);
+      };
+      if (!window.chrome) {
+        Object.defineProperty(window, "chrome", { value: chromeObject, configurable: true });
+      }
+      if (!window.chrome?.webstore?.install) {
+        Object.defineProperty(window, "chrome", {
+          value: {
+            ...originalChrome,
+            runtime: chromeObject.runtime,
+            webstore: chromeObject.webstore,
+            webstorePrivate: chromeObject.webstorePrivate,
+            webview: originalChrome.webview
+          },
+          configurable: true
+        });
+      }
+    } catch {}
+  };
+  const patchStoreControls = () => {
+    if (!isStore() || !extensionId()) return;
+    const installed = installedIds.has(extensionId());
+    document.querySelectorAll("button, a, div[role='button']").forEach((el) => {
+      const label = labelForNode(el);
+      if (!isInstallIntent(label)) return;
+      if (!el.dataset.asterInstallPatched) {
+        el.dataset.asterInstallPatched = "1";
+        el.addEventListener("click", (event) => {
+          event.preventDefault();
+          event.stopPropagation();
+          install();
+        }, true);
+      }
+      applyInstallState(el, installed);
+    });
+    patchChromePrompts(installed);
+  };
+  const render = () => {
+    patchChromeInstallApi();
+    let panel = document.getElementById("__asterExtensionInstall");
+    if (!isStore() || !extensionId()) {
+      if (panel) panel.remove();
+      return;
+    }
+    if (!panel) {
+      panel = document.createElement("div");
+      panel.id = "__asterExtensionInstall";
+      panel.innerHTML = `<button type="button">Install in Aster</button><span id="__asterExtensionStatus"></span>`;
+      const style = document.createElement("style");
+      style.textContent = `
+        #__asterExtensionInstall {
+          position: fixed; right: 22px; bottom: 22px; z-index: 2147483647;
+          display: flex; align-items: center; gap: 10px; max-width: min(460px, calc(100vw - 44px));
+          padding: 10px 12px; border-radius: 8px; border: 1px solid rgba(255,255,255,.18);
+          background: rgba(14,14,14,.94); color: #f7f7f7;
+          box-shadow: 0 14px 44px rgba(0,0,0,.34);
+          font: 13px/1.3 "Segoe UI", system-ui, sans-serif;
+        }
+        #__asterExtensionInstall button {
+          border: 0; border-radius: 7px; padding: 8px 12px; cursor: pointer;
+          background: ${accent}; color: #fff; font: inherit; font-weight: 650; white-space: nowrap;
+        }
+        #__asterExtensionStatus { color: rgba(255,255,255,.72); overflow-wrap: anywhere; }
+      `;
+      document.documentElement.appendChild(style);
+      panel.querySelector("button").addEventListener("click", install);
+      document.documentElement.appendChild(panel);
+    }
+    const installed = installedIds.has(extensionId());
+    const btn = panel.querySelector("button");
+    if (btn) applyInstallState(btn, installed);
+    if (installed) status("Installed in Aster");
+    patchStoreControls();
+  };
+  document.addEventListener("click", (event) => {
+    if (!isStore() || !extensionId()) return;
+    const label = eventIntentLabel(event);
+    const path = typeof event.composedPath === "function" ? event.composedPath() : [event.target];
+    const buttonLike = path.some((node) => node?.matches?.("button, a, [role='button']"));
+    const knownNonInstall = /\b(search|sign in|share|reviews?|overview|privacy|support|related|website|report abuse|menu|close|back)\b/.test(label);
+    if (isInstallIntent(label) || (buttonLike && !knownNonInstall && path.length && path[0]?.id !== "__asterExtensionInstall")) {
+      event.preventDefault();
+      event.stopPropagation();
+      event.stopImmediatePropagation();
+      if (installedIds.has(extensionId())) {
+        status("Installed in Aster");
+        render();
+        return;
+      }
+      install();
+    }
+  }, true);
+  new MutationObserver(schedule).observe(document.documentElement, { childList: true, subtree: true });
+  window.addEventListener("popstate", schedule);
+  window.addEventListener("hashchange", schedule);
+  patchChromeInstallApi();
+  render();
+  schedule();
+})();
+"##;
 
 #[allow(non_snake_case)]
 #[repr(C)]
@@ -147,6 +422,8 @@ const MENU_TAB_SPLIT_GRID: usize = 4005;
 const MENU_EXTENSION_MANAGE: usize = 4100;
 const MENU_EXTENSION_STORE: usize = 4101;
 const MENU_EXTENSION_REFRESH: usize = 4102;
+const MENU_EXTENSION_PIN: usize = 4103;
+const MENU_EXTENSION_UNPIN: usize = 4104;
 const MENU_EXTENSION_ITEM_BASE: usize = 4110;
 const MENU_WIDTH: i32 = 270;
 const MENU_ROW_HEIGHT: i32 = 34;
@@ -171,6 +448,7 @@ static mut OLD_RENAME_EDIT_PROC: WNDPROC = None;
 static mut OLD_OVERLAY_MENU_PROC: WNDPROC = None;
 static mut OLD_DOWNLOAD_POPUP_PROC: WNDPROC = None;
 static mut OLD_BOOKMARK_POPUP_PROC: WNDPROC = None;
+static mut OLD_EXTENSION_POPUP_PROC: WNDPROC = None;
 static mut OLD_DRAG_GHOST_PROC: WNDPROC = None;
 static mut CURRENT_DRAG_GHOST_BITMAP: Option<HBITMAP> = None;
 
@@ -228,6 +506,17 @@ struct FaviconBitmap {
 struct FaviconFetchResult {
     host: String,
     path: String,
+}
+
+struct ExtensionCrxResult {
+    extension_id: String,
+    install_path: String,
+    error: Option<String>,
+}
+
+struct WebViewProcessFailure {
+    tab_id: usize,
+    kind: i32,
 }
 
 impl Drop for FaviconBitmap {
@@ -518,6 +807,28 @@ struct BrowserExtensionInfo {
     id: String,
     name: String,
     enabled: bool,
+    version: String,
+    description: String,
+    has_action: bool,
+    popup_path: String,
+    side_panel_path: String,
+    options_path: String,
+    permissions: Vec<String>,
+    install_path: String,
+    icon_path: String,
+}
+
+#[derive(Clone, Default)]
+struct ExtensionManifestDetails {
+    name: String,
+    version: String,
+    description: String,
+    has_action: bool,
+    popup_path: String,
+    side_panel_path: String,
+    options_path: String,
+    permissions: Vec<String>,
+    icon_path: String,
 }
 
 fn default_visit_count() -> u32 {
@@ -566,6 +877,8 @@ struct OverlayMenuItem {
     id: usize,
     label: String,
     sublabel: String,
+    icon_key: String,
+    icon_path: String,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -577,6 +890,21 @@ enum MenuTarget {
     AddressMenu,
     Bookmarks,
     Extensions,
+    ExtensionContext(usize),
+}
+
+impl MenuTarget {
+    fn keeps_topbar_expanded(self) -> bool {
+        matches!(
+            self,
+            MenuTarget::BackHistory(_)
+                | MenuTarget::ForwardHistory(_)
+                | MenuTarget::AddressMenu
+                | MenuTarget::Bookmarks
+                | MenuTarget::Extensions
+                | MenuTarget::ExtensionContext(_)
+        )
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -632,8 +960,6 @@ enum HoverTarget {
     Reload,
     Settings,
     HistoryPage,
-    ExtensionStore,
-    ExtensionsPage,
     SettingsPage,
     ModeRow,
     ModeAuto,
@@ -644,6 +970,7 @@ enum HoverTarget {
     DownloadCancel(usize),
     DownloadPause(usize),
     DownloadOpen(usize),
+    ExtensionButton(usize),
     ExtensionsButton,
     FindPrev,
     FindNext,
@@ -838,6 +1165,11 @@ struct App {
     pending_favicon_hosts: Vec<String>,
     extensions: Vec<BrowserExtensionInfo>,
     extension_notice: Option<String>,
+    extension_install_paths: HashMap<String, String>,
+    extension_badges: HashMap<String, (String, u32)>,
+    pinned_extensions: HashSet<String>,
+    pending_extension_installs: HashSet<String>,
+    extension_icon_cache: RefCell<HashMap<String, FaviconBitmap>>,
     active_workspace: usize,
     active: usize,
     next_id: usize,
@@ -918,6 +1250,12 @@ struct App {
     download_panel_reveal: f32,
     download_panel_reveal_target: f32,
     download_popup_hwnd: HWND,
+    extension_popup_hwnd: HWND,
+    extension_popup_controller: Option<ICoreWebView2Controller>,
+    extension_popup_anchor: Option<RECT>,
+    extension_side_panel_hwnd: HWND,
+    extension_side_panel_controller: Option<ICoreWebView2Controller>,
+    extension_side_panel_extension_id: Option<String>,
     bookmark_toast: Option<BookmarkToastState>,
     download_removal_anim: Option<DownloadRemovalAnim>,
     download_collapse_anim: Option<DownloadCollapseAnim>,
@@ -1013,6 +1351,11 @@ impl App {
             pending_favicon_hosts: Vec::new(),
             extensions: Vec::new(),
             extension_notice: None,
+            extension_install_paths: HashMap::new(),
+            extension_badges: HashMap::new(),
+            pinned_extensions: HashSet::new(),
+            pending_extension_installs: HashSet::new(),
+            extension_icon_cache: RefCell::new(HashMap::new()),
             active_workspace: 1,
             active: 0,
             next_id: 1,
@@ -1098,6 +1441,12 @@ impl App {
             download_panel_reveal: 0.0,
             download_panel_reveal_target: 0.0,
             download_popup_hwnd,
+            extension_popup_hwnd: HWND(std::ptr::null_mut()),
+            extension_popup_controller: None,
+            extension_popup_anchor: None,
+            extension_side_panel_hwnd: HWND(std::ptr::null_mut()),
+            extension_side_panel_controller: None,
+            extension_side_panel_extension_id: None,
             bookmark_toast: None,
             download_removal_anim: None,
             download_collapse_anim: None,
@@ -1558,15 +1907,306 @@ impl App {
             menu_item(MENU_EXTENSION_STORE, "Chrome Web Store"),
             menu_item(MENU_EXTENSION_REFRESH, "Refresh Extensions"),
         ];
-        for (offset, extension) in self.extensions.iter().take(12).enumerate() {
-            let state = if extension.enabled { "Enabled" } else { "Disabled" };
-            items.push(menu_item_with_subtitle(
-                MENU_EXTENSION_ITEM_BASE + offset,
-                &extension.name,
-                state,
-            ));
+        for (offset, extension) in self.extensions.iter().enumerate() {
+            let access = if extension.enabled {
+                if self.pinned_extensions.contains(&extension.id) {
+                    "Pinned"
+                } else {
+                    "Unpinned"
+                }
+            } else {
+                "Disabled"
+            };
+            let mut item =
+                menu_item_with_subtitle(MENU_EXTENSION_ITEM_BASE + offset, &extension.name, access);
+            item.icon_key = extension.id.clone();
+            item.icon_path = extension.icon_path.clone();
+            items.push(item);
         }
-        self.open_overlay_menu(rect.right - MENU_WIDTH, rect.bottom + 8, MenuTarget::Extensions, items);
+        self.open_overlay_menu(
+            rect.right - MENU_WIDTH,
+            rect.bottom + 8,
+            MenuTarget::Extensions,
+            items,
+        );
+    }
+
+    fn open_extension_context_menu(&mut self, extension_index: usize, x: i32, y: i32) {
+        let Some(extension) = self.extensions.get(extension_index) else {
+            return;
+        };
+        let pinned = self.pinned_extensions.contains(&extension.id);
+        self.open_overlay_menu(
+            x,
+            y,
+            MenuTarget::ExtensionContext(extension_index),
+            vec![menu_item(
+                if pinned {
+                    MENU_EXTENSION_UNPIN
+                } else {
+                    MENU_EXTENSION_PIN
+                },
+                if pinned {
+                    "Unpin from Toolbar"
+                } else {
+                    "Pin to Toolbar"
+                },
+            )],
+        );
+    }
+
+    fn set_extension_pinned(&mut self, extension_index: usize, pinned: bool) {
+        let Some(extension) = self.extensions.get(extension_index) else {
+            return;
+        };
+        if pinned {
+            self.pinned_extensions.insert(extension.id.clone());
+        } else {
+            self.pinned_extensions.remove(&extension.id);
+        }
+        self.save_state();
+        self.refresh();
+    }
+
+    fn close_extension_popup(&mut self) {
+        if let Some(controller) = self.extension_popup_controller.take() {
+            unsafe {
+                let _ = controller.Close();
+            }
+        }
+        unsafe {
+            if self.extension_popup_hwnd != HWND(std::ptr::null_mut()) {
+                let _ = WindowsAndMessaging::DestroyWindow(self.extension_popup_hwnd);
+                self.extension_popup_hwnd = HWND(std::ptr::null_mut());
+            }
+        }
+        self.extension_popup_anchor = None;
+    }
+
+    fn close_extension_side_panel(&mut self) {
+        if let Some(controller) = self.extension_side_panel_controller.take() {
+            unsafe {
+                let _ = controller.Close();
+            }
+        }
+        unsafe {
+            if self.extension_side_panel_hwnd != HWND(std::ptr::null_mut()) {
+                let _ = WindowsAndMessaging::DestroyWindow(self.extension_side_panel_hwnd);
+                self.extension_side_panel_hwnd = HWND(std::ptr::null_mut());
+            }
+        }
+        self.extension_side_panel_extension_id = None;
+        self.layout();
+        self.refresh();
+    }
+
+    fn click_extension_action_button(&mut self, extension_index: usize) {
+        let anchor = self
+            .extension_action_button_rects()
+            .iter()
+            .find(|(idx, _)| *idx == extension_index)
+            .map(|(_, r)| *r)
+            .unwrap_or_else(|| self.extension_button_rect());
+        self.open_extension_popup_by_index(extension_index, anchor);
+    }
+
+    fn open_extension_popup_by_id(&mut self, extension_id: &str) {
+        if let Some(index) = self
+            .extensions
+            .iter()
+            .position(|ext| ext.id == extension_id)
+        {
+            self.open_extension_popup_by_index(index, self.extension_button_rect());
+        } else {
+            self.extension_notice =
+                Some("Extension is not available yet. Try Refresh.".to_string());
+            self.reload_extensions_pages();
+        }
+    }
+
+    fn open_extension_popup_by_index(&mut self, extension_index: usize, anchor: RECT) {
+        self.close_extension_popup();
+        let Some(ext) = self.extensions.get(extension_index).cloned() else {
+            return;
+        };
+        if !ext.enabled {
+            self.extension_notice = Some("Enable the extension before opening it.".to_string());
+            self.reload_extensions_pages();
+            return;
+        }
+        if ext.popup_path.is_empty() && !ext.side_panel_path.is_empty() {
+            self.open_extension_side_panel(&ext);
+            return;
+        }
+        let open_path = if !ext.popup_path.is_empty() {
+            ext.popup_path.as_str()
+        } else {
+            ext.options_path.as_str()
+        };
+        if open_path.is_empty() {
+            self.extension_notice = Some(format!(
+                "{} does not provide a popup, side panel, or options page.",
+                ext.name
+            ));
+            self.reload_extensions_pages();
+            return;
+        }
+        let url = extension_page_url(&ext.id, open_path);
+        if let Ok(hwnd) = create_extension_popup_window(self.hwnd, anchor) {
+            if let Ok(controller) = create_webview_controller(&self.environment, hwnd) {
+                unsafe {
+                    let _ = controller.SetBounds(client_rect(hwnd));
+                    let _ = controller.SetIsVisible(true);
+                    if let Ok(wv) = controller.CoreWebView2() {
+                        let _ = configure_webview(&wv);
+                        self.attach_web_message_handler(&wv);
+                        self.install_extension_host_script(&wv, &ext);
+                        apply_site_mode_to_webview(&wv, self.site_mode);
+                        let wide = CoTaskMemPWSTR::from(url.as_str());
+                        let _ = wv.Navigate(*wide.as_ref().as_pcwstr());
+                    }
+                }
+                self.extension_popup_hwnd = hwnd;
+                self.extension_popup_controller = Some(controller);
+                self.extension_popup_anchor = Some(anchor);
+            }
+        }
+        self.refresh();
+    }
+
+    fn open_extension_side_panel_by_id_with_path(
+        &mut self,
+        extension_id: &str,
+        path_override: Option<String>,
+    ) {
+        if let Some(mut ext) = self
+            .extensions
+            .iter()
+            .find(|ext| ext.id == extension_id)
+            .cloned()
+        {
+            if let Some(path) = path_override {
+                ext.side_panel_path = path;
+            }
+            self.open_extension_side_panel(&ext);
+        }
+    }
+
+    fn open_extension_side_panel(&mut self, ext: &BrowserExtensionInfo) {
+        if !ext.enabled {
+            self.extension_notice = Some("Enable the extension before opening it.".to_string());
+            self.reload_extensions_pages();
+            return;
+        }
+        let panel_path = ext
+            .side_panel_path
+            .trim()
+            .trim_start_matches('/')
+            .to_string();
+        if panel_path.is_empty() {
+            self.extension_notice = Some(format!("{} does not provide a side panel.", ext.name));
+            self.reload_extensions_pages();
+            return;
+        }
+        if self.extension_side_panel_extension_id.as_deref() == Some(ext.id.as_str()) {
+            self.close_extension_side_panel();
+            return;
+        }
+        self.close_extension_popup();
+        self.close_extension_side_panel();
+        let url = extension_page_url(&ext.id, &panel_path);
+        if let Ok(hwnd) = create_extension_side_panel_window(self.hwnd) {
+            if let Ok(controller) = create_webview_controller(&self.environment, hwnd) {
+                unsafe {
+                    let _ = controller.SetBounds(client_rect(hwnd));
+                    let _ = controller.SetIsVisible(true);
+                    if let Ok(wv) = controller.CoreWebView2() {
+                        let _ = configure_webview(&wv);
+                        self.attach_web_message_handler(&wv);
+                        self.install_extension_host_script(&wv, ext);
+                        apply_site_mode_to_webview(&wv, self.site_mode);
+                        let wide = CoTaskMemPWSTR::from(url.as_str());
+                        let _ = wv.Navigate(*wide.as_ref().as_pcwstr());
+                    }
+                }
+                self.extension_side_panel_hwnd = hwnd;
+                self.extension_side_panel_controller = Some(controller);
+                self.extension_side_panel_extension_id = Some(ext.id.clone());
+                self.layout();
+                self.refresh();
+            } else {
+                unsafe {
+                    let _ = WindowsAndMessaging::DestroyWindow(hwnd);
+                }
+            }
+        }
+    }
+
+    fn handle_webview_process_failure(&mut self, failure: WebViewProcessFailure) {
+        let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == failure.tab_id) else {
+            return;
+        };
+        match COREWEBVIEW2_PROCESS_FAILED_KIND(failure.kind) {
+            COREWEBVIEW2_PROCESS_FAILED_KIND_RENDER_PROCESS_UNRESPONSIVE => unsafe {
+                let _ = tab.webview.Reload();
+                tab.is_loading = true;
+            },
+            COREWEBVIEW2_PROCESS_FAILED_KIND_RENDER_PROCESS_EXITED
+            | COREWEBVIEW2_PROCESS_FAILED_KIND_FRAME_RENDER_PROCESS_EXITED => unsafe {
+                let _ = tab.webview.Reload();
+                tab.is_loading = true;
+            },
+            COREWEBVIEW2_PROCESS_FAILED_KIND_BROWSER_PROCESS_EXITED => {
+                tab.title = "WebView runtime restarted".to_string();
+                tab.is_loading = false;
+            }
+            _ => {}
+        }
+        self.refresh();
+    }
+
+    fn handle_extension_folder_picked(&mut self, folder: String) {
+        if folder.trim().is_empty() {
+            self.extension_notice = Some("No extension folder selected.".to_string());
+            self.reload_extensions_pages();
+            self.refresh();
+            return;
+        }
+        self.extension_notice = Some("Path set. Click Load to install.".to_string());
+        self.reload_extensions_pages();
+        let js = format!(
+            "document.getElementById('extensionPath').value = {};",
+            js_string_literal(&folder)
+        );
+        for tab in self.tabs.iter().filter(|tab| tab.url == "aster:extensions") {
+            execute_webview_script(&tab.webview, &js);
+        }
+        self.refresh();
+    }
+
+    fn resize_extension_popup_to_content(&mut self, width: i32, height: i32) {
+        if self.extension_popup_hwnd == HWND(std::ptr::null_mut()) {
+            return;
+        }
+        let anchor = self
+            .extension_popup_anchor
+            .unwrap_or_else(|| self.extension_button_rect());
+        let size = extension_popup_size_for_content(self.hwnd, width, height);
+        let (x, y) = extension_popup_position(self.hwnd, anchor, size.0, size.1);
+        unsafe {
+            let _ = WindowsAndMessaging::SetWindowPos(
+                self.extension_popup_hwnd,
+                Some(HWND_TOP),
+                x,
+                y,
+                size.0,
+                size.1,
+                WindowsAndMessaging::SWP_NOACTIVATE | WindowsAndMessaging::SWP_SHOWWINDOW,
+            );
+            if let Some(controller) = &self.extension_popup_controller {
+                let _ = controller.SetBounds(client_rect(self.extension_popup_hwnd));
+            }
+        }
     }
 
     fn clear_site_data_and_reload(&mut self) {
@@ -1609,7 +2249,7 @@ impl App {
                         let mut raw = PWSTR::null();
                         if args.TryGetWebMessageAsString(&mut raw).is_ok() {
                             let message = take_pwstr(raw);
-                            with_app(hwnd, |app| app.handle_settings_message(&message));
+                            post_boxed_string(hwnd, WEBVIEW_MESSAGE_MSG, message);
                         }
                     }
                     Ok(())
@@ -1617,6 +2257,34 @@ impl App {
                 &mut token,
             );
         }
+    }
+
+    fn install_extension_store_assist_script(&self, webview: &ICoreWebView2) {
+        let script = extension_store_assist_script(self.accent_color, &self.extensions);
+        unsafe {
+            let script = CoTaskMemPWSTR::from(script.as_str());
+            let _ = webview.AddScriptToExecuteOnDocumentCreated(
+                *script.as_ref().as_pcwstr(),
+                &AddScriptToExecuteOnDocumentCreatedCompletedHandler::create(Box::new(|_, _| {
+                    Ok(())
+                })),
+            );
+        }
+        execute_webview_script(webview, &script);
+    }
+
+    fn install_extension_host_script(&self, webview: &ICoreWebView2, ext: &BrowserExtensionInfo) {
+        let script = extension_host_script(&ext.id, &ext.side_panel_path);
+        unsafe {
+            let script = CoTaskMemPWSTR::from(script.as_str());
+            let _ = webview.AddScriptToExecuteOnDocumentCreated(
+                *script.as_ref().as_pcwstr(),
+                &AddScriptToExecuteOnDocumentCreatedCompletedHandler::create(Box::new(|_, _| {
+                    Ok(())
+                })),
+            );
+        }
+        execute_webview_script(webview, &script);
     }
 
     fn recreate_secondary_brush(&mut self) {
@@ -1692,6 +2360,30 @@ impl App {
             self.refresh_extensions();
         } else if message == "extensions:open-store" {
             self.open_extension_store();
+        } else if let Some(value) = message.strip_prefix("extensions:install-store:") {
+            self.install_extension_from_store(&percent_decode(value));
+        } else if let Some(id) = message.strip_prefix("extensions:open-popup:") {
+            self.open_extension_popup_by_id(&percent_decode(id));
+        } else if let Some(raw) = message.strip_prefix("extensions:open-side-panel:") {
+            let mut parts = raw.splitn(2, ':');
+            let id = parts.next().map(percent_decode).unwrap_or_default();
+            let path = parts
+                .next()
+                .map(percent_decode)
+                .filter(|value| !value.is_empty());
+            self.open_extension_side_panel_by_id_with_path(&id, path);
+        } else if let Some(raw) = message.strip_prefix("extensions:popup-size:") {
+            let mut parts = raw.split(':');
+            let _id = parts.next();
+            let width = parts
+                .next()
+                .and_then(|value| value.parse::<i32>().ok())
+                .unwrap_or(0);
+            let height = parts
+                .next()
+                .and_then(|value| value.parse::<i32>().ok())
+                .unwrap_or(0);
+            self.resize_extension_popup_to_content(width, height);
         } else if let Some(path) = message.strip_prefix("extensions:add:") {
             self.add_extension_from_path(&percent_decode(path));
         } else if let Some(raw) = message.strip_prefix("extensions:enable:") {
@@ -1700,6 +2392,19 @@ impl App {
             }
         } else if let Some(id) = message.strip_prefix("extensions:remove:") {
             self.remove_extension(&percent_decode(id));
+        } else if message == "extensions:browse-folder" {
+            self.extension_notice = Some("Choose an extension folder...".to_string());
+            self.reload_extensions_pages();
+            let hwnd_raw = self.hwnd.0 as isize;
+            std::thread::spawn(move || {
+                let hwnd = HWND(hwnd_raw as *mut core::ffi::c_void);
+                let picked = pick_extension_folder(hwnd);
+                post_boxed_string(
+                    hwnd,
+                    EXTENSION_FOLDER_PICKED_MSG,
+                    picked.unwrap_or_default(),
+                );
+            });
         } else if let Some(value) = message.strip_prefix("history:sort:") {
             self.history_sort_mode = HistorySortMode::from_str(value);
             self.reload_history_pages();
@@ -1812,6 +2517,7 @@ impl App {
         configure_webview(&webview)?;
         apply_site_mode_to_webview(&webview, self.site_mode);
         self.attach_web_message_handler(&webview);
+        self.install_extension_store_assist_script(&webview);
 
         let id = self.next_id;
         self.next_id += 1;
@@ -2717,9 +3423,9 @@ impl App {
             .map(|(index, _)| index)
             .collect();
         let child_tabs = child_tabs.into_iter().map(SidebarRow::Tab);
-        for row in self.coalesce_split_rows(self.sorted_sidebar_rows(
-            child_folders.chain(child_tabs).collect(),
-        )) {
+        for row in self.coalesce_split_rows(
+            self.sorted_sidebar_rows(child_folders.chain(child_tabs).collect()),
+        ) {
             rows.push(row);
             if let SidebarRow::Folder(child_folder_id) = row {
                 if let Some(folder) = self.folders.iter().find(|f| f.id == child_folder_id) {
@@ -2767,9 +3473,9 @@ impl App {
             .map(|(index, _)| index)
             .collect();
         let loose_pinned_tabs = loose_pinned_tabs.into_iter().map(SidebarRow::Tab);
-        for row in self.coalesce_split_rows(self.sorted_sidebar_rows(
-            root_pinned_folders.chain(loose_pinned_tabs).collect(),
-        )) {
+        for row in self.coalesce_split_rows(
+            self.sorted_sidebar_rows(root_pinned_folders.chain(loose_pinned_tabs).collect()),
+        ) {
             pinned_rows.push(row);
             if let SidebarRow::Folder(folder_id) = row {
                 if let Some(folder) = self.folders.iter().find(|f| f.id == folder_id) {
@@ -2803,9 +3509,9 @@ impl App {
             .map(|(index, _)| index)
             .collect();
         let loose_tabs = loose_tabs.into_iter().map(SidebarRow::Tab);
-        for row in self.coalesce_split_rows(self.sorted_sidebar_rows(
-            root_unpinned_folders.chain(loose_tabs).collect(),
-        )) {
+        for row in self.coalesce_split_rows(
+            self.sorted_sidebar_rows(root_unpinned_folders.chain(loose_tabs).collect()),
+        ) {
             unpinned_rows.push(row);
             if let SidebarRow::Folder(folder_id) = row {
                 if let Some(folder) = self.folders.iter().find(|f| f.id == folder_id) {
@@ -2903,9 +3609,7 @@ impl App {
                                         || self
                                             .split_group(group_id)
                                             .zip(from_tab_id)
-                                            .map(|(group, tab_id)| {
-                                                !group.tab_ids.contains(&tab_id)
-                                            })
+                                            .map(|(group, tab_id)| !group.tab_ids.contains(&tab_id))
                                             .unwrap_or(true)
                                 }
                                 SidebarRow::TabGhost(_) => false,
@@ -3185,6 +3889,7 @@ impl App {
         self.workspace_active_tabs.clear();
         self.visited_sites.clear();
         self.custom_keybinds.clear();
+        self.pinned_extensions.clear();
 
         let mut tab_records = Vec::new();
         let mut active_workspace = 1usize;
@@ -3331,6 +4036,11 @@ impl App {
                         (parts[1].parse::<usize>(), parts[2].parse::<usize>())
                     {
                         self.workspace_active_tabs.push((workspace_id, tab_id));
+                    }
+                }
+                "pinned_extension" if parts.len() >= 2 => {
+                    if !parts[1].trim().is_empty() {
+                        self.pinned_extensions.insert(parts[1].clone());
                     }
                 }
                 "setting" if parts.len() >= 3 => match parts[1].as_str() {
@@ -3531,6 +4241,9 @@ impl App {
                 escape_state(combo)
             ));
         }
+        for extension_id in &self.pinned_extensions {
+            lines.push(format!("pinned_extension\t{}", escape_state(extension_id)));
+        }
         for (workspace_id, active_tab_id) in &self.workspace_active_tabs {
             lines.push(format!("active_tab\t{}\t{}", workspace_id, active_tab_id));
         }
@@ -3678,7 +4391,22 @@ impl App {
             let hwnd = self.hwnd;
             let mut token = 0;
             webview.add_NavigationCompleted(
-                &NavigationCompletedEventHandler::create(Box::new(move |_sender, _args| {
+                &NavigationCompletedEventHandler::create(Box::new(move |sender, _args| {
+                    if let Some(sender) = sender {
+                        let mut uri = PWSTR::null();
+                        if sender.Source(&mut uri).is_ok() {
+                            let url = CoTaskMemPWSTR::from(uri).to_string();
+                            if is_extension_store_url(&url) {
+                                with_app(hwnd, |app| {
+                                    let script = extension_store_assist_script(
+                                        app.accent_color,
+                                        &app.extensions,
+                                    );
+                                    execute_webview_script(&sender, &script);
+                                });
+                            }
+                        }
+                    }
                     with_app(hwnd, |app| {
                         app.set_tab_loading(tab_id, false);
                         if app.find_open {
@@ -3814,10 +4542,36 @@ impl App {
                         let mut uri = PWSTR::null();
                         if args.Uri(&mut uri).is_ok() {
                             let url = CoTaskMemPWSTR::from(uri).to_string();
-                            with_app(hwnd, |app| {
-                                let _ = app.create_tab(&url);
-                            });
+                            post_boxed_string(hwnd, NEW_WINDOW_REQUESTED_MSG, url);
                             let _ = args.SetHandled(true);
+                        }
+                    }
+                    Ok(())
+                })),
+                &mut token,
+            )?;
+
+            let hwnd = self.hwnd;
+            let mut token = 0;
+            webview.add_ProcessFailed(
+                &ProcessFailedEventHandler::create(Box::new(move |_sender, args| {
+                    if let Some(args) = args {
+                        let mut kind = COREWEBVIEW2_PROCESS_FAILED_KIND(0);
+                        let _ = args.ProcessFailedKind(&mut kind);
+                        let result = WebViewProcessFailure {
+                            tab_id,
+                            kind: kind.0,
+                        };
+                        let ptr = Box::into_raw(Box::new(result));
+                        let posted = WindowsAndMessaging::PostMessageW(
+                            Some(hwnd),
+                            WEBVIEW_PROCESS_FAILED_MSG,
+                            WPARAM(ptr as usize),
+                            LPARAM(0),
+                        )
+                        .is_ok();
+                        if !posted {
+                            drop(Box::from_raw(ptr));
                         }
                     }
                     Ok(())
@@ -3831,7 +4585,6 @@ impl App {
                 webview4.add_DownloadStarting(
                     &DownloadStartingEventHandler::create(Box::new(move |_sender, args| {
                         if let Some(args) = args {
-                            let _ = args.SetHandled(true);
                             if let Ok(operation) = args.DownloadOperation() {
                                 let mut result_path = PWSTR::null();
                                 let file_path = if args.ResultFilePath(&mut result_path).is_ok() {
@@ -4560,7 +5313,10 @@ impl App {
         let host = display_host(url);
         if host.is_empty()
             || self.favicon_cache.contains_key(&host)
-            || self.pending_favicon_hosts.iter().any(|pending| pending == &host)
+            || self
+                .pending_favicon_hosts
+                .iter()
+                .any(|pending| pending == &host)
         {
             return;
         }
@@ -5197,7 +5953,11 @@ impl App {
         let tab = self.tabs.get(self.active).or_else(|| self.tabs.first())?;
         unsafe {
             let webview13 = tab.webview.cast::<ICoreWebView2_13>().ok()?;
-            webview13.Profile().ok()?.cast::<ICoreWebView2Profile7>().ok()
+            webview13
+                .Profile()
+                .ok()?
+                .cast::<ICoreWebView2Profile7>()
+                .ok()
         }
     }
 
@@ -5207,36 +5967,127 @@ impl App {
         };
         let hwnd = self.hwnd;
         unsafe {
-            let _ = profile.GetBrowserExtensions(
-                &ProfileGetBrowserExtensionsCompletedHandler::create(Box::new(
-                    move |error_code, list| {
+            let _ =
+                profile.GetBrowserExtensions(&ProfileGetBrowserExtensionsCompletedHandler::create(
+                    Box::new(move |error_code, list| {
                         let mut extensions = Vec::new();
                         if error_code.is_ok() {
                             if let Some(list) = list {
                                 let mut count = 0u32;
                                 let _ = list.Count(&mut count);
                                 for index in 0..count {
-                                    if let Ok(extension) = list.GetValueAtIndex(index) {
-                                        extensions.push(extension_info(&extension));
+                                    if let Ok(ext) = list.GetValueAtIndex(index) {
+                                        extensions.push(extension_info(&ext));
                                     }
                                 }
                             }
                         }
+                        // Deduplicate by ID
+                        let mut seen = HashSet::new();
+                        extensions.retain(|ext| seen.insert(ext.id.clone()));
+                        let installed_ids = extensions
+                            .iter()
+                            .map(|extension| extension.id.clone())
+                            .collect::<HashSet<_>>();
                         with_app(hwnd, |app| {
+                            app.pinned_extensions
+                                .retain(|extension_id| installed_ids.contains(extension_id));
+                            // Enrich with manifest data from stored install paths
+                            for ext in extensions.iter_mut() {
+                                let known_path = app.extension_install_paths.get(&ext.id).cloned();
+                                let path = resolve_extension_install_path(
+                                    &ext.id,
+                                    &ext.name,
+                                    known_path.as_deref(),
+                                )
+                                .unwrap_or_else(|| ext.install_path.clone());
+                                if Path::new(&path).join("manifest.json").exists() {
+                                    let details = read_extension_manifest(&path);
+                                    if !details.name.is_empty() {
+                                        ext.name = details.name;
+                                    }
+                                    if !details.version.is_empty() {
+                                        ext.version = details.version;
+                                    }
+                                    if !details.description.is_empty() {
+                                        ext.description = details.description;
+                                    }
+                                    ext.has_action = details.has_action;
+                                    if !details.popup_path.is_empty() {
+                                        ext.popup_path = details.popup_path;
+                                    }
+                                    if !details.side_panel_path.is_empty() {
+                                        ext.side_panel_path = details.side_panel_path;
+                                    }
+                                    if !details.options_path.is_empty() {
+                                        ext.options_path = details.options_path;
+                                    }
+                                    if !details.permissions.is_empty() {
+                                        ext.permissions = details.permissions;
+                                    }
+                                    if !details.icon_path.is_empty() {
+                                        ext.icon_path = details.icon_path;
+                                    }
+                                    ext.install_path = path;
+                                }
+                            }
                             app.extensions = extensions;
-                            if app.extension_notice.as_deref()
-                                == Some("Refreshing extensions...")
-                            {
+                            if app.extension_notice.as_deref() == Some("Refreshing extensions...") {
                                 app.extension_notice =
                                     Some("Extension list refreshed.".to_string());
                             }
+                            app.sync_store_installed_extensions();
                             app.reload_extensions_pages();
                             app.refresh();
                         });
                         Ok(())
-                    },
-                )),
-            );
+                    }),
+                ));
+        }
+    }
+
+    fn sync_store_installed_extensions(&self) {
+        let ids = installed_extension_ids_json(&self.extensions);
+        let script = format!(
+            "window.asterSetInstalledExtensions && window.asterSetInstalledExtensions({ids});"
+        );
+        for tab in self.tabs.iter() {
+            if is_extension_store_url(&tab.url) {
+                execute_webview_script(&tab.webview, &script);
+            }
+        }
+    }
+
+    fn notify_store_tabs(&mut self, extension_id: &str) {
+        let script = format!(
+            r#"(() => {{
+            if (window.asterMarkExtensionInstalled) window.asterMarkExtensionInstalled({});
+            const panel = document.getElementById("__asterExtensionInstall");
+            if (panel) {{
+                const btn = panel.querySelector("button");
+                if (btn) {{ btn.disabled = true; btn.textContent = "Installed"; }}
+            }}
+            const s = window.asterExtensionStoreStatus;
+            if (typeof s === "function") s("Installed in Aster");
+        }})()"#,
+            js_string_literal(extension_id)
+        );
+        for tab in self.tabs.iter() {
+            if is_extension_store_url(&tab.url) {
+                execute_webview_script(&tab.webview, &script);
+            }
+        }
+    }
+
+    fn send_store_status(&self, message: &str) {
+        let script = format!(
+            "window.asterExtensionStoreStatus && window.asterExtensionStoreStatus({});",
+            js_string_literal(message)
+        );
+        for tab in self.tabs.iter() {
+            if is_extension_store_url(&tab.url) {
+                execute_webview_script(&tab.webview, &script);
+            }
         }
     }
 
@@ -5249,14 +6100,13 @@ impl App {
         }
         let folder = PathBuf::from(path);
         if !folder.join("manifest.json").exists() {
-            self.extension_notice =
-                Some("That folder does not contain manifest.json.".to_string());
+            self.extension_notice = Some("That folder does not contain manifest.json.".to_string());
             self.reload_extensions_pages();
             return;
         }
         let Some(profile) = self.active_extension_profile() else {
             self.extension_notice =
-                Some("Extensions are not available in this WebView2 runtime.".to_string());
+                Some("Extensions are not available in this browser runtime.".to_string());
             self.reload_extensions_pages();
             return;
         };
@@ -5264,6 +6114,7 @@ impl App {
         self.reload_extensions_pages();
         let hwnd = self.hwnd;
         let path = folder.to_string_lossy().into_owned();
+        let path_for_callback = path.clone();
         unsafe {
             let wide = CoTaskMemPWSTR::from(path.as_str());
             let _ = profile.AddBrowserExtension(
@@ -5275,7 +6126,11 @@ impl App {
                                 let name = extension
                                     .as_ref()
                                     .map(extension_info)
-                                    .map(|info| info.name)
+                                    .map(|info| {
+                                        app.extension_install_paths
+                                            .insert(info.id.clone(), path_for_callback.clone());
+                                        info.name
+                                    })
                                     .unwrap_or_else(|| "Extension".to_string());
                                 Some(format!("{name} loaded."))
                             } else {
@@ -5300,9 +6155,9 @@ impl App {
         let wanted = id.to_string();
         let action = RefCell::new(Some(action));
         unsafe {
-            let _ = profile.GetBrowserExtensions(
-                &ProfileGetBrowserExtensionsCompletedHandler::create(Box::new(
-                    move |error_code, list| {
+            let _ =
+                profile.GetBrowserExtensions(&ProfileGetBrowserExtensionsCompletedHandler::create(
+                    Box::new(move |error_code, list| {
                         if error_code.is_ok() {
                             if let Some(list) = list {
                                 let mut count = 0u32;
@@ -5320,9 +6175,8 @@ impl App {
                             }
                         }
                         Ok(())
-                    },
-                )),
-            );
+                    }),
+                ));
         }
     }
 
@@ -5377,6 +6231,153 @@ impl App {
                 },
             )));
         });
+    }
+
+    fn install_extension_from_store(&mut self, extension_id: &str) {
+        let Some(id) = extract_chrome_extension_id(extension_id) else {
+            self.extension_notice =
+                Some("Paste a valid Chrome Web Store link or extension id.".to_string());
+            self.reload_extensions_pages();
+            self.refresh();
+            return;
+        };
+        if self.extensions.iter().any(|e| e.id == id)
+            || self.pending_extension_installs.contains(&id)
+        {
+            self.extension_notice =
+                Some("Extension is already installed or being installed.".to_string());
+            self.reload_extensions_pages();
+            self.refresh();
+            return;
+        }
+        self.pending_extension_installs.insert(id.clone());
+        self.extension_notice = Some(format!("Downloading extension from Chrome Web Store..."));
+        self.send_store_status("Downloading extension package...");
+        self.reload_extensions_pages();
+        self.refresh();
+        let hwnd_raw = self.hwnd.0 as isize;
+        std::thread::spawn(move || {
+            unsafe {
+                let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+            }
+            let url = format!(
+                "https://clients2.google.com/service/update2/crx?response=redirect&prodversion={CHROME_COMPAT_VERSION}&acceptformat=crx2,crx3&x=id%3D{id}%26installsource%3Dondemand%26uc"
+            );
+            let crx_path = download_url_to_cache(&url).unwrap_or_default();
+            let result = if crx_path.is_empty() {
+                ExtensionCrxResult {
+                    extension_id: id.clone(),
+                    install_path: String::new(),
+                    error: Some(
+                        "Failed to download extension. Check your internet connection.".to_string(),
+                    ),
+                }
+            } else {
+                match extract_crx(&crx_path, &id) {
+                    Ok(install_path) => ExtensionCrxResult {
+                        extension_id: id.clone(),
+                        install_path,
+                        error: None,
+                    },
+                    Err(e) => ExtensionCrxResult {
+                        extension_id: id.clone(),
+                        install_path: String::new(),
+                        error: Some(e),
+                    },
+                }
+            };
+            let ptr = Box::into_raw(Box::new(result));
+            let hwnd = HWND(hwnd_raw as *mut core::ffi::c_void);
+            let posted = unsafe {
+                WindowsAndMessaging::PostMessageW(
+                    Some(hwnd),
+                    EXTENSION_PACKAGE_READY_MSG,
+                    WPARAM(ptr as usize),
+                    LPARAM(0),
+                )
+                .is_ok()
+            };
+            if !posted {
+                unsafe {
+                    drop(Box::from_raw(ptr));
+                }
+            }
+            unsafe {
+                CoUninitialize();
+            }
+        });
+    }
+
+    fn complete_extension_install(&mut self, result: ExtensionCrxResult) {
+        let hwnd = self.hwnd;
+        let ext_id = result.extension_id.clone();
+        if let Some(error) = result.error {
+            self.pending_extension_installs.remove(&ext_id);
+            self.extension_notice = Some(error);
+            if let Some(message) = self.extension_notice.as_deref() {
+                self.send_store_status(message);
+            }
+            self.reload_extensions_pages();
+            self.refresh();
+            return;
+        }
+        if result.install_path.is_empty() {
+            self.pending_extension_installs.remove(&ext_id);
+            self.extension_notice = Some("Failed to install extension: empty path.".to_string());
+            self.send_store_status("Failed to install extension.");
+            self.reload_extensions_pages();
+            self.refresh();
+            return;
+        }
+        self.extension_notice = Some("Installing extension into browser...".to_string());
+        self.send_store_status("Installing extension in Aster...");
+        self.reload_extensions_pages();
+        if let Some(profile) = self.active_extension_profile() {
+            let path = result.install_path;
+            let path_for_callback = path.clone();
+            unsafe {
+                let wide = CoTaskMemPWSTR::from(path.as_str());
+                let _ = profile.AddBrowserExtension(
+                    *wide.as_ref().as_pcwstr(),
+                    &ProfileAddBrowserExtensionCompletedHandler::create(Box::new(
+                        move |error_code, extension| {
+                            with_app(hwnd, |app| {
+                                app.pending_extension_installs.remove(&ext_id);
+                                let ext_name = extension
+                                    .as_ref()
+                                    .map(|ext| extension_info(ext).name)
+                                    .unwrap_or_default();
+                                app.extension_notice = if error_code.is_ok() {
+                                    if let Some(ref ext) = extension {
+                                        let info = extension_info(ext);
+                                        app.extension_install_paths
+                                            .insert(info.id.clone(), path_for_callback.clone());
+                                    }
+                                    Some(format!("{ext_name} installed from Chrome Web Store."))
+                                } else {
+                                    Some(format!("{ext_name} could not be loaded."))
+                                };
+                                if let Some(message) = app.extension_notice.as_deref() {
+                                    app.send_store_status(message);
+                                }
+                                if error_code.is_ok() {
+                                    app.notify_store_tabs(&ext_id);
+                                }
+                                app.refresh_extensions();
+                            });
+                            Ok(())
+                        },
+                    )),
+                );
+            }
+        } else {
+            self.pending_extension_installs.remove(&ext_id);
+            self.extension_notice =
+                Some("Extensions are not available in this browser runtime.".to_string());
+            self.send_store_status("Extensions are not available in this browser runtime.");
+            self.reload_extensions_pages();
+            self.refresh();
+        }
     }
 
     fn bookmarks_export_html(&self) -> String {
@@ -6407,6 +7408,57 @@ impl App {
         }
     }
 
+    fn extension_action_button_rects(&self) -> Vec<(usize, RECT)> {
+        let overflow = self.extension_button_rect();
+        let y = self.topbar_y();
+        let mut rects = Vec::new();
+        let mut right = overflow.left - 4;
+        for (i, ext) in self.extensions.iter().enumerate() {
+            if ext.enabled
+                && self.pinned_extensions.contains(&ext.id)
+                && (ext.has_action
+                    || !ext.popup_path.is_empty()
+                    || !ext.side_panel_path.is_empty()
+                    || !ext.options_path.is_empty())
+            {
+                let left = right - 28;
+                rects.push((
+                    i,
+                    RECT {
+                        left,
+                        top: y + 16,
+                        right,
+                        bottom: y + 44,
+                    },
+                ));
+                right = left - 4;
+            }
+        }
+        rects.reverse();
+        rects
+    }
+
+    fn get_or_cache_extension_icon(
+        &self,
+        id: &str,
+        icon_path: &str,
+    ) -> Option<(HBITMAP, i32, i32)> {
+        if icon_path.is_empty() {
+            return None;
+        }
+        let mut cache = self.extension_icon_cache.borrow_mut();
+        if let Some(cached) = cache.get(id) {
+            return Some((cached.handle, cached.width, cached.height));
+        }
+        if let Some(favicon) = decode_favicon_file(icon_path) {
+            cache.insert(id.to_string(), favicon);
+            let cached = cache.get(id)?;
+            Some((cached.handle, cached.width, cached.height))
+        } else {
+            None
+        }
+    }
+
     fn settings_rect(&self) -> RECT {
         let rect = client_rect(self.hwnd);
         RECT {
@@ -6431,7 +7483,7 @@ impl App {
         let bottom = settings.top - 8;
         RECT {
             left: 12,
-            top: bottom - 236,
+            top: bottom - 148,
             right: 196,
             bottom,
         }
@@ -6458,27 +7510,7 @@ impl App {
     }
 
     fn history_page_row_rect(&self) -> RECT {
-        let row = self.extensions_page_row_rect();
-        RECT {
-            left: row.left,
-            top: row.bottom + 8,
-            right: row.right,
-            bottom: row.bottom + 44,
-        }
-    }
-
-    fn extension_store_row_rect(&self) -> RECT {
         let row = self.mode_row_rect();
-        RECT {
-            left: row.left,
-            top: row.bottom + 8,
-            right: row.right,
-            bottom: row.bottom + 44,
-        }
-    }
-
-    fn extensions_page_row_rect(&self) -> RECT {
-        let row = self.extension_store_row_rect();
         RECT {
             left: row.left,
             top: row.bottom + 8,
@@ -6803,6 +7835,8 @@ impl App {
         let rect = client_rect(self.hwnd);
         let sidebar_width = self.sidebar_width();
         let pushed_left = sidebar_width;
+        let panel_width = self.extension_side_panel_width();
+        let right = rect.right - panel_width;
         if self.fullscreen {
             RECT {
                 left: 0,
@@ -6818,19 +7852,19 @@ impl App {
                             SidebarMode::Overlay => RECT {
                                 left: 0,
                                 top: self.topbar_pushed_height(),
-                                right: rect.right,
+                                right,
                                 bottom: rect.bottom,
                             },
                             SidebarMode::Pushed => RECT {
                                 left: pushed_left,
                                 top: self.topbar_pushed_height(),
-                                right: rect.right,
+                                right,
                                 bottom: rect.bottom,
                             },
                             _ => RECT {
                                 left: HOVER_ZONE,
                                 top: self.topbar_pushed_height(),
-                                right: rect.right,
+                                right,
                                 bottom: rect.bottom,
                             },
                         }
@@ -6838,7 +7872,7 @@ impl App {
                         RECT {
                             left: 0,
                             top: self.topbar_pushed_height(),
-                            right: rect.right,
+                            right,
                             bottom: rect.bottom,
                         }
                     }
@@ -6846,16 +7880,40 @@ impl App {
                 SidebarMode::Overlay => RECT {
                     left: 0,
                     top: self.topbar_pushed_height(),
-                    right: rect.right,
+                    right,
                     bottom: rect.bottom,
                 },
                 SidebarMode::Pushed => RECT {
                     left: pushed_left,
                     top: self.topbar_pushed_height(),
-                    right: rect.right,
+                    right,
                     bottom: rect.bottom,
                 },
             }
+        }
+    }
+
+    fn extension_side_panel_width(&self) -> i32 {
+        if self.fullscreen || self.extension_side_panel_hwnd == HWND(std::ptr::null_mut()) {
+            return 0;
+        }
+        let rect = client_rect(self.hwnd);
+        let width = (rect.right - rect.left).max(0);
+        if width < 720 {
+            0
+        } else {
+            EXTENSION_SIDE_PANEL_WIDTH.min(width / 2).max(300)
+        }
+    }
+
+    fn extension_side_panel_rect(&self) -> RECT {
+        let rect = client_rect(self.hwnd);
+        let width = self.extension_side_panel_width();
+        RECT {
+            left: rect.right - width,
+            top: 0,
+            right: rect.right,
+            bottom: rect.bottom,
         }
     }
 
@@ -6950,14 +8008,8 @@ impl App {
         };
         if let Some(group_id) = active_tab.split_group_id {
             if let Some(group) = self.split_group(group_id) {
-                let rects =
-                    self.split_layout_rects_for(bounds, group.layout, group.tab_ids.len());
-                return group
-                    .tab_ids
-                    .iter()
-                    .copied()
-                    .zip(rects)
-                    .collect();
+                let rects = self.split_layout_rects_for(bounds, group.layout, group.tab_ids.len());
+                return group.tab_ids.iter().copied().zip(rects).collect();
             }
         }
         vec![(active_tab.id, bounds)]
@@ -7270,6 +8322,52 @@ impl App {
                 let _ = tab.controller.SetIsVisible(is_visible);
             }
         }
+        if self.extension_side_panel_hwnd != HWND(std::ptr::null_mut()) {
+            let panel_rect = self.extension_side_panel_rect();
+            let panel_visible =
+                panel_rect.right > panel_rect.left && panel_rect.bottom > panel_rect.top;
+            unsafe {
+                let _ = WindowsAndMessaging::SetWindowPos(
+                    self.extension_side_panel_hwnd,
+                    Some(HWND_TOP),
+                    panel_rect.left,
+                    panel_rect.top,
+                    panel_rect.right - panel_rect.left,
+                    panel_rect.bottom - panel_rect.top,
+                    WindowsAndMessaging::SWP_NOACTIVATE,
+                );
+                if panel_visible {
+                    let panel_width = (panel_rect.right - panel_rect.left).max(1);
+                    let panel_height = (panel_rect.bottom - panel_rect.top).max(1);
+                    let clip_top = if self.fullscreen {
+                        0
+                    } else {
+                        self.topbar_height.ceil() as i32
+                    }
+                    .clamp(0, panel_height.saturating_sub(1));
+                    if clip_top > 0 {
+                        let region = CreateRectRgn(0, clip_top, panel_width, panel_height);
+                        let _ = SetWindowRgn(self.extension_side_panel_hwnd, Some(region), true);
+                    } else {
+                        let _ = SetWindowRgn(self.extension_side_panel_hwnd, None, true);
+                    }
+                } else {
+                    let _ = SetWindowRgn(self.extension_side_panel_hwnd, None, true);
+                }
+                if let Some(controller) = &self.extension_side_panel_controller {
+                    let _ = controller.SetBounds(client_rect(self.extension_side_panel_hwnd));
+                    let _ = controller.SetIsVisible(panel_visible);
+                }
+                let _ = WindowsAndMessaging::ShowWindow(
+                    self.extension_side_panel_hwnd,
+                    if panel_visible {
+                        WindowsAndMessaging::SW_SHOWNA
+                    } else {
+                        WindowsAndMessaging::SW_HIDE
+                    },
+                );
+            }
+        }
         unsafe {
             if self.download_popup_hwnd != HWND(std::ptr::null_mut()) && self.sidebar_width < 1.0 {
                 if let Some(toast) = &self.download_toast {
@@ -7412,6 +8510,69 @@ impl App {
                 self.hover_target == Some(HoverTarget::Reload),
                 &self.fonts.toolbar_icon,
             );
+            for (idx, rect) in self.extension_action_button_rects() {
+                let hovered = self.hover_target == Some(HoverTarget::ExtensionButton(idx));
+                if let Some(ext) = self.extensions.get(idx) {
+                    let icon_handle = self.get_or_cache_extension_icon(&ext.id, &ext.icon_path);
+                    if let Some((icon_hbmp, icon_w, icon_h)) = icon_handle {
+                        if hovered {
+                            fill_round_rect(hdc, rect, COLOR_SURFACE_HOVER, 8);
+                        }
+                        let icon_rect = RECT {
+                            left: rect.left + 3,
+                            top: rect.top + 3,
+                            right: rect.right - 3,
+                            bottom: rect.bottom - 3,
+                        };
+                        let src_hdc = CreateCompatibleDC(Some(hdc));
+                        if !src_hdc.is_invalid() {
+                            let old = SelectObject(src_hdc, HGDIOBJ(icon_hbmp.0));
+                            let _ = StretchBlt(
+                                hdc,
+                                icon_rect.left,
+                                icon_rect.top,
+                                icon_rect.right - icon_rect.left,
+                                icon_rect.bottom - icon_rect.top,
+                                Some(src_hdc),
+                                0,
+                                0,
+                                icon_w,
+                                icon_h,
+                                SRCCOPY,
+                            );
+                            let _ = SelectObject(src_hdc, old);
+                            let _ = DeleteDC(src_hdc);
+                        }
+                    } else {
+                        draw_toolbar_icon_button(
+                            hdc,
+                            rect,
+                            IconKind::Extensions,
+                            hovered,
+                            &self.fonts.toolbar_icon,
+                        );
+                    }
+                } else {
+                    draw_toolbar_icon_button(
+                        hdc,
+                        rect,
+                        IconKind::Extensions,
+                        hovered,
+                        &self.fonts.toolbar_icon,
+                    );
+                }
+                if let Some((badge_text, bg_color)) = self.extension_badges.get(
+                    &self
+                        .extensions
+                        .get(idx)
+                        .map(|e| e.id.clone())
+                        .unwrap_or_default(),
+                ) {
+                    if !badge_text.is_empty() {
+                        draw_extension_badge(hdc, rect, badge_text, *bg_color);
+                    }
+                }
+            }
             draw_toolbar_icon_button(
                 hdc,
                 self.extension_button_rect(),
@@ -8021,12 +9182,59 @@ impl App {
                 if self.hover_target.map(|_| false).unwrap_or(false) {
                     let _ = row;
                 }
+                let text_left = if item.icon_path.is_empty() {
+                    row.left + 10
+                } else {
+                    if let Some((icon_hbmp, icon_w, icon_h)) =
+                        self.get_or_cache_extension_icon(&item.icon_key, &item.icon_path)
+                    {
+                        let icon_rect = RECT {
+                            left: row.left + 10,
+                            top: row.top + 6,
+                            right: row.left + 32,
+                            bottom: row.top + 28,
+                        };
+                        let src_hdc = CreateCompatibleDC(Some(hdc));
+                        if !src_hdc.is_invalid() {
+                            let old = SelectObject(src_hdc, HGDIOBJ(icon_hbmp.0));
+                            let _ = StretchBlt(
+                                hdc,
+                                icon_rect.left,
+                                icon_rect.top,
+                                icon_rect.right - icon_rect.left,
+                                icon_rect.bottom - icon_rect.top,
+                                Some(src_hdc),
+                                0,
+                                0,
+                                icon_w,
+                                icon_h,
+                                SRCCOPY,
+                            );
+                            let _ = SelectObject(src_hdc, old);
+                            let _ = DeleteDC(src_hdc);
+                        }
+                    } else {
+                        draw_icon_glyph(
+                            hdc,
+                            &self.fonts.toolbar_icon,
+                            IconKind::Extensions.glyph(),
+                            RECT {
+                                left: row.left + 10,
+                                top: row.top + 7,
+                                right: row.left + 30,
+                                bottom: row.top + 27,
+                            },
+                            COLOR_MUTED,
+                        );
+                    }
+                    row.left + 40
+                };
                 draw_text(
                     hdc,
                     &self.fonts.small,
                     &item.label,
                     RECT {
-                        left: row.left + 10,
+                        left: text_left,
                         top: row.top,
                         right: row.right - 10,
                         bottom: if item.sublabel.is_empty() {
@@ -8043,7 +9251,7 @@ impl App {
                         &self.fonts.small,
                         &item.sublabel,
                         RECT {
-                            left: row.left + 10,
+                            left: text_left,
                             top: row.top + 15,
                             right: row.right - 10,
                             bottom: row.bottom,
@@ -8103,64 +9311,6 @@ impl App {
                     top: row.top,
                     right: row.right - 6,
                     bottom: row.bottom,
-                },
-                COLOR_MUTED,
-            );
-
-            let store_row = self.extension_store_row_rect();
-            if self.hover_target == Some(HoverTarget::ExtensionStore) {
-                fill_round_rect(hdc, store_row, COLOR_SURFACE_HOVER, 9);
-            }
-            draw_text(
-                hdc,
-                &self.fonts.small,
-                "Extension Store",
-                RECT {
-                    left: store_row.left + 12,
-                    top: store_row.top,
-                    right: store_row.right - 30,
-                    bottom: store_row.bottom,
-                },
-                COLOR_TEXT,
-            );
-            draw_icon_glyph(
-                hdc,
-                &self.fonts.icon,
-                glyph(0xE719).as_str(),
-                RECT {
-                    left: store_row.right - 28,
-                    top: store_row.top,
-                    right: store_row.right - 6,
-                    bottom: store_row.bottom,
-                },
-                COLOR_MUTED,
-            );
-
-            let extensions_row = self.extensions_page_row_rect();
-            if self.hover_target == Some(HoverTarget::ExtensionsPage) {
-                fill_round_rect(hdc, extensions_row, COLOR_SURFACE_HOVER, 9);
-            }
-            draw_text(
-                hdc,
-                &self.fonts.small,
-                "Extensions",
-                RECT {
-                    left: extensions_row.left + 12,
-                    top: extensions_row.top,
-                    right: extensions_row.right - 30,
-                    bottom: extensions_row.bottom,
-                },
-                COLOR_TEXT,
-            );
-            draw_icon_glyph(
-                hdc,
-                &self.fonts.icon,
-                glyph(0xECAA).as_str(),
-                RECT {
-                    left: extensions_row.right - 28,
-                    top: extensions_row.top,
-                    right: extensions_row.right - 6,
-                    bottom: extensions_row.bottom,
                 },
                 COLOR_MUTED,
             );
@@ -9527,16 +10677,13 @@ impl App {
                 .tab_ids
                 .iter()
                 .filter_map(|tab_id| {
-                    self.tabs
-                        .iter()
-                        .find(|tab| tab.id == *tab_id)
-                        .map(|tab| {
-                            if tab.title.trim().is_empty() {
-                                label_for_url(&tab.url)
-                            } else {
-                                tab.title.clone()
-                            }
-                        })
+                    self.tabs.iter().find(|tab| tab.id == *tab_id).map(|tab| {
+                        if tab.title.trim().is_empty() {
+                            label_for_url(&tab.url)
+                        } else {
+                            tab.title.clone()
+                        }
+                    })
                 })
                 .take(3)
                 .collect::<Vec<_>>()
@@ -9585,9 +10732,7 @@ impl App {
                 group.tab_ids.len(),
             );
             for (tab_id, cell) in group.tab_ids.iter().copied().zip(mini_cells) {
-                let is_active_cell = active
-                    .map(|tab| tab.id == tab_id)
-                    .unwrap_or(false);
+                let is_active_cell = active.map(|tab| tab.id == tab_id).unwrap_or(false);
                 fill_round_rect(
                     hdc,
                     cell,
@@ -9779,18 +10924,6 @@ impl App {
         }
 
         if self.settings_open {
-            if point_in_rect(x, y, self.extension_store_row_rect()) {
-                self.settings_open = false;
-                self.mode_menu_open = false;
-                self.open_extension_store();
-                return;
-            }
-            if point_in_rect(x, y, self.extensions_page_row_rect()) {
-                self.settings_open = false;
-                self.mode_menu_open = false;
-                self.open_extensions_page();
-                return;
-            }
             if point_in_rect(x, y, self.history_page_row_rect()) {
                 self.settings_open = false;
                 self.mode_menu_open = false;
@@ -9887,6 +11020,15 @@ impl App {
         }
         if point_in_rect(x, y, reload) {
             self.reload();
+            return;
+        }
+
+        if let Some((idx, _)) = self
+            .extension_action_button_rects()
+            .iter()
+            .find(|(_, rect)| point_in_rect(x, y, *rect))
+        {
+            self.click_extension_action_button(*idx);
             return;
         }
 
@@ -10004,6 +11146,15 @@ impl App {
         }
         if point_in_rect(x, y, forward) {
             self.open_history_menu(x, y, false);
+            return;
+        }
+
+        if let Some((idx, _)) = self
+            .extension_action_button_rects()
+            .iter()
+            .find(|(_, rect)| point_in_rect(x, y, *rect))
+        {
+            self.open_extension_context_menu(*idx, x, y);
             return;
         }
 
@@ -10166,6 +11317,14 @@ impl App {
         target: MenuTarget,
         items: Vec<OverlayMenuItem>,
     ) {
+        if target.keeps_topbar_expanded() && !self.fullscreen {
+            if self.topbar_mode != SidebarMode::Pushed
+                && self.topbar_expand_mode != SidebarMode::Pushed
+            {
+                self.topbar_expand_mode = SidebarMode::Overlay;
+                self.set_topbar_mode(SidebarMode::Overlay);
+            }
+        }
         if items.is_empty() {
             self.overlay_menu = None;
             unsafe {
@@ -10288,7 +11447,39 @@ impl App {
         }
         let id = menu.items[row_index as usize].id;
         self.overlay_menu = None;
+        if menu.target == MenuTarget::Extensions && id >= MENU_EXTENSION_ITEM_BASE {
+            let anchor = RECT {
+                left: menu.rect.left + 6,
+                top: menu.rect.top + 6 + row_index * MENU_ROW_HEIGHT,
+                right: menu.rect.right - 6,
+                bottom: menu.rect.top + 6 + (row_index + 1) * MENU_ROW_HEIGHT,
+            };
+            let offset = id - MENU_EXTENSION_ITEM_BASE;
+            self.open_extension_popup_by_index(offset, anchor);
+            self.refresh();
+            return true;
+        }
         self.run_menu_command(menu.target, id);
+        true
+    }
+
+    fn handle_overlay_right_click(&mut self, x: i32, y: i32) -> bool {
+        let Some(menu) = self.overlay_menu.clone() else {
+            return false;
+        };
+        if !point_in_rect(x, y, menu.rect) {
+            return false;
+        }
+        let row_index = (y - menu.rect.top - 6) / MENU_ROW_HEIGHT;
+        if row_index < 0 || row_index as usize >= menu.items.len() {
+            return true;
+        }
+        let id = menu.items[row_index as usize].id;
+        if menu.target == MenuTarget::Extensions && id >= MENU_EXTENSION_ITEM_BASE {
+            let offset = id - MENU_EXTENSION_ITEM_BASE;
+            self.open_extension_context_menu(offset, x, y);
+            return true;
+        }
         true
     }
 
@@ -10309,6 +11500,9 @@ impl App {
                 }
             }
             MenuTarget::Extensions => self.run_extension_menu_command(id),
+            MenuTarget::ExtensionContext(index) => {
+                self.run_extension_context_menu_command(index, id)
+            }
         }
         self.refresh();
     }
@@ -10321,9 +11515,18 @@ impl App {
                 self.extension_notice = Some("Refreshing extensions...".to_string());
                 self.refresh_extensions();
             }
-            id if (MENU_EXTENSION_ITEM_BASE..MENU_EXTENSION_ITEM_BASE + 12).contains(&id) => {
-                self.open_extensions_page();
+            id if id >= MENU_EXTENSION_ITEM_BASE => {
+                let offset = id - MENU_EXTENSION_ITEM_BASE;
+                self.open_extension_popup_by_index(offset, self.extension_button_rect());
             }
+            _ => {}
+        }
+    }
+
+    fn run_extension_context_menu_command(&mut self, extension_index: usize, id: usize) {
+        match id {
+            MENU_EXTENSION_PIN => self.set_extension_pinned(extension_index, true),
+            MENU_EXTENSION_UNPIN => self.set_extension_pinned(extension_index, false),
             _ => {}
         }
     }
@@ -10463,8 +11666,10 @@ impl App {
                             if let Some(group_id) =
                                 self.tabs.get(index).and_then(|tab| tab.split_group_id)
                             {
-                                if let Some(group) =
-                                    self.split_groups.iter_mut().find(|group| group.id == group_id)
+                                if let Some(group) = self
+                                    .split_groups
+                                    .iter_mut()
+                                    .find(|group| group.id == group_id)
                                 {
                                     group.layout = SplitLayout::Horizontal;
                                 }
@@ -10478,8 +11683,10 @@ impl App {
                             if let Some(group_id) =
                                 self.tabs.get(index).and_then(|tab| tab.split_group_id)
                             {
-                                if let Some(group) =
-                                    self.split_groups.iter_mut().find(|group| group.id == group_id)
+                                if let Some(group) = self
+                                    .split_groups
+                                    .iter_mut()
+                                    .find(|group| group.id == group_id)
                                 {
                                     group.layout = SplitLayout::Vertical;
                                 }
@@ -10493,8 +11700,10 @@ impl App {
                             if let Some(group_id) =
                                 self.tabs.get(index).and_then(|tab| tab.split_group_id)
                             {
-                                if let Some(group) =
-                                    self.split_groups.iter_mut().find(|group| group.id == group_id)
+                                if let Some(group) = self
+                                    .split_groups
+                                    .iter_mut()
+                                    .find(|group| group.id == group_id)
                                 {
                                     group.layout = SplitLayout::Grid;
                                 }
@@ -10722,6 +11931,12 @@ impl App {
                     self.hover_target = Some(HoverTarget::Forward);
                 } else if point_in_rect(x, y, reload) {
                     self.hover_target = Some(HoverTarget::Reload);
+                } else if let Some((idx, _)) = self
+                    .extension_action_button_rects()
+                    .iter()
+                    .find(|(_, rect)| point_in_rect(x, y, *rect))
+                {
+                    self.hover_target = Some(HoverTarget::ExtensionButton(*idx));
                 } else if point_in_rect(x, y, self.extension_button_rect()) {
                     self.hover_target = Some(HoverTarget::ExtensionsButton);
                 } else if point_in_rect(x, y, self.address_menu_rect()) {
@@ -10751,16 +11966,6 @@ impl App {
                         Some(id) => Some(HoverTarget::DownloadIndicator(id)),
                         None => Some(HoverTarget::DownloadOverflow),
                     };
-                } else if self.settings_open
-                    && point_in_rect(x, y, self.extension_store_row_rect())
-                {
-                    self.hover_target = Some(HoverTarget::ExtensionStore);
-                    self.mode_menu_open = false;
-                } else if self.settings_open
-                    && point_in_rect(x, y, self.extensions_page_row_rect())
-                {
-                    self.hover_target = Some(HoverTarget::ExtensionsPage);
-                    self.mode_menu_open = false;
                 } else if self.settings_open && point_in_rect(x, y, self.history_page_row_rect()) {
                     self.hover_target = Some(HoverTarget::HistoryPage);
                     self.mode_menu_open = false;
@@ -11824,6 +13029,8 @@ fn create_environment() -> AppResult<ICoreWebView2Environment> {
             let path = profile_path();
             let user_data = CoTaskMemPWSTR::from(path.as_str());
             let options = CoreWebView2EnvironmentOptions::default();
+            options
+                .set_additional_browser_arguments(format!("--user-agent=\"{}\"", ASTER_USER_AGENT));
             options.set_are_browser_extensions_enabled(true);
             CreateCoreWebView2EnvironmentWithOptions(
                 PCWSTR::null(),
@@ -11871,6 +13078,9 @@ fn configure_webview(webview: &ICoreWebView2) -> AppResult<()> {
         settings.SetAreDefaultScriptDialogsEnabled(true)?;
         settings.SetAreDevToolsEnabled(true)?;
         settings.SetIsStatusBarEnabled(false)?;
+        let settings2: ICoreWebView2Settings2 = settings.cast()?;
+        let user_agent = CoTaskMemPWSTR::from(ASTER_USER_AGENT);
+        settings2.SetUserAgent(*user_agent.as_ref().as_pcwstr())?;
         let settings3: ICoreWebView2Settings3 = settings.cast()?;
         settings3.SetAreBrowserAcceleratorKeysEnabled(true)?;
     }
@@ -12162,6 +13372,125 @@ fn create_bookmark_popup(parent: HWND) -> AppResult<HWND> {
     }
 }
 
+fn create_extension_popup_window(parent: HWND, btn_rect: RECT) -> AppResult<HWND> {
+    let (popup_w, popup_h) = extension_popup_size_for_content(parent, 380, 480);
+    let (x, y) = extension_popup_position(parent, btn_rect, popup_w, popup_h);
+    unsafe {
+        let hwnd = WindowsAndMessaging::CreateWindowExW(
+            WINDOW_EX_STYLE(0x00000080 /* WS_EX_TOOLWINDOW */),
+            w!("STATIC"),
+            w!(""),
+            WINDOW_STYLE(WS_POPUP.0),
+            x,
+            y,
+            popup_w,
+            popup_h,
+            Some(parent),
+            None,
+            Some(HINSTANCE(LibraryLoader::GetModuleHandleW(None)?.0)),
+            None,
+        )?;
+        OLD_EXTENSION_POPUP_PROC = mem::transmute(WindowsAndMessaging::SetWindowLongPtrW(
+            hwnd,
+            GWLP_WNDPROC,
+            extension_popup_proc as *const () as isize,
+        ));
+        let _ = WindowsAndMessaging::ShowWindow(hwnd, WindowsAndMessaging::SW_SHOWNA);
+        Ok(hwnd)
+    }
+}
+
+fn extension_popup_size_for_content(parent: HWND, content_w: i32, content_h: i32) -> (i32, i32) {
+    let client = client_rect(parent);
+    let max_w = (client.right - client.left - 24).max(160);
+    let max_h = (client.bottom - client.top - 24).max(120);
+    let width = content_w.clamp(160, max_w);
+    let height = content_h.clamp(120, max_h);
+    (width, height)
+}
+
+fn extension_popup_position(
+    parent: HWND,
+    _btn_rect: RECT,
+    popup_w: i32,
+    popup_h: i32,
+) -> (i32, i32) {
+    unsafe {
+        let client = client_rect(parent);
+        let mut client_top_left = POINT {
+            x: client.left,
+            y: client.top,
+        };
+        let mut client_bottom_right = POINT {
+            x: client.right,
+            y: client.bottom,
+        };
+        let _ = Gdi::ClientToScreen(parent, &mut client_top_left);
+        let _ = Gdi::ClientToScreen(parent, &mut client_bottom_right);
+        let min_x = client_top_left.x + 8;
+        let max_x = (client_bottom_right.x - popup_w - 8).max(min_x);
+        let min_y = client_top_left.y + 8;
+        let max_y = (client_bottom_right.y - popup_h - 8).max(min_y);
+        let x = (client_top_left.x + 12).clamp(min_x, max_x);
+        let y = (client_top_left.y + 12).clamp(min_y, max_y);
+        (x, y)
+    }
+}
+
+fn create_extension_side_panel_window(parent: HWND) -> AppResult<HWND> {
+    let rect = client_rect(parent);
+    unsafe {
+        let hwnd = WindowsAndMessaging::CreateWindowExW(
+            WINDOW_EX_STYLE::default(),
+            w!("STATIC"),
+            w!(""),
+            WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0 | WS_CLIPSIBLINGS.0),
+            rect.right - EXTENSION_SIDE_PANEL_WIDTH,
+            0,
+            EXTENSION_SIDE_PANEL_WIDTH,
+            rect.bottom.max(1),
+            Some(parent),
+            None,
+            Some(HINSTANCE(LibraryLoader::GetModuleHandleW(None)?.0)),
+            None,
+        )?;
+        let _ = WindowsAndMessaging::ShowWindow(hwnd, WindowsAndMessaging::SW_SHOWNA);
+        Ok(hwnd)
+    }
+}
+
+unsafe extern "system" fn extension_popup_proc(
+    hwnd: HWND,
+    msg: u32,
+    w_param: WPARAM,
+    l_param: LPARAM,
+) -> LRESULT {
+    match msg {
+        WM_ACTIVATE => {
+            if loword(w_param.0 as u32) == 0 {
+                if let Ok(parent) = WindowsAndMessaging::GetParent(hwnd) {
+                    with_app(parent, |app| {
+                        app.close_extension_popup();
+                        app.refresh();
+                    });
+                }
+                return LRESULT(0);
+            }
+        }
+        WM_CLOSE => {
+            if let Ok(parent) = WindowsAndMessaging::GetParent(hwnd) {
+                with_app(parent, |app| {
+                    app.close_extension_popup();
+                    app.refresh();
+                });
+            }
+            return LRESULT(0);
+        }
+        _ => {}
+    }
+    WindowsAndMessaging::CallWindowProcW(OLD_EXTENSION_POPUP_PROC, hwnd, msg, w_param, l_param)
+}
+
 unsafe extern "system" fn overlay_menu_proc(
     hwnd: HWND,
     msg: u32,
@@ -12192,6 +13521,20 @@ unsafe extern "system" fn overlay_menu_proc(
                         let parent_x = x + menu.rect.left;
                         let parent_y = y + menu.rect.top;
                         let _ = app.handle_overlay_click(parent_x, parent_y);
+                    }
+                });
+            }
+            LRESULT(0)
+        }
+        WM_RBUTTONDOWN => {
+            let x = loword(l_param.0 as u32) as i16 as i32;
+            let y = hiword(l_param.0 as u32) as i16 as i32;
+            if let Ok(parent) = WindowsAndMessaging::GetParent(hwnd) {
+                with_app(parent, |app| {
+                    if let Some(menu) = &app.overlay_menu {
+                        let parent_x = x + menu.rect.left;
+                        let parent_y = y + menu.rect.top;
+                        let _ = app.handle_overlay_right_click(parent_x, parent_y);
                     }
                 });
             }
@@ -12658,6 +14001,59 @@ extern "system" fn window_proc(hwnd: HWND, msg: u32, w_param: WPARAM, l_param: L
             }
             LRESULT(0)
         }
+        msg if msg == EXTENSION_PACKAGE_READY_MSG => {
+            let ptr = w_param.0 as *mut ExtensionCrxResult;
+            if !ptr.is_null() {
+                unsafe {
+                    let result = *Box::from_raw(ptr);
+                    with_app(hwnd, |app| app.complete_extension_install(result));
+                }
+            }
+            LRESULT(0)
+        }
+        msg if msg == WEBVIEW_MESSAGE_MSG => {
+            let ptr = w_param.0 as *mut String;
+            if !ptr.is_null() {
+                unsafe {
+                    let message = *Box::from_raw(ptr);
+                    with_app(hwnd, |app| app.handle_settings_message(&message));
+                }
+            }
+            LRESULT(0)
+        }
+        msg if msg == NEW_WINDOW_REQUESTED_MSG => {
+            let ptr = w_param.0 as *mut String;
+            if !ptr.is_null() {
+                unsafe {
+                    let url = *Box::from_raw(ptr);
+                    with_app(hwnd, |app| {
+                        let _ = app.create_tab(&url);
+                        app.refresh();
+                    });
+                }
+            }
+            LRESULT(0)
+        }
+        msg if msg == WEBVIEW_PROCESS_FAILED_MSG => {
+            let ptr = w_param.0 as *mut WebViewProcessFailure;
+            if !ptr.is_null() {
+                unsafe {
+                    let failure = *Box::from_raw(ptr);
+                    with_app(hwnd, |app| app.handle_webview_process_failure(failure));
+                }
+            }
+            LRESULT(0)
+        }
+        msg if msg == EXTENSION_FOLDER_PICKED_MSG => {
+            let ptr = w_param.0 as *mut String;
+            if !ptr.is_null() {
+                unsafe {
+                    let folder = *Box::from_raw(ptr);
+                    with_app(hwnd, |app| app.handle_extension_folder_picked(folder));
+                }
+            }
+            LRESULT(0)
+        }
         WM_COPYDATA => {
             unsafe {
                 let cds = &*(l_param.0 as *const COPYDATASTRUCT);
@@ -12773,11 +14169,16 @@ extern "system" fn window_proc(hwnd: HWND, msg: u32, w_param: WPARAM, l_param: L
                     let split_layout = app.split_layout_button_rect();
                     let split_unsplit = app.split_unsplit_button_rect();
 
+                    let has_ext_buttons = app
+                        .extension_action_button_rects()
+                        .iter()
+                        .any(|(_, r)| point_in_rect(pt.x, pt.y, *r));
                     if point_in_rect(pt.x, pt.y, logo)
                         || point_in_rect(pt.x, pt.y, new_tab)
                         || point_in_rect(pt.x, pt.y, back)
                         || point_in_rect(pt.x, pt.y, forward)
                         || point_in_rect(pt.x, pt.y, reload)
+                        || has_ext_buttons
                         || point_in_rect(pt.x, pt.y, extensions)
                         || point_in_rect(pt.x, pt.y, address)
                         || split_layout
@@ -13457,6 +14858,43 @@ fn draw_toolbar_icon_button(
             },
             if hovered { COLOR_TEXT } else { COLOR_MUTED },
         );
+    }
+}
+
+fn draw_extension_badge(hdc: HDC, rect: RECT, text: &str, bg: u32) {
+    unsafe {
+        if text.is_empty() {
+            return;
+        }
+        let bg = if bg == 0 { 0xFF0000 } else { bg };
+        let small_font = create_font(9, 700);
+        if let Ok(font) = small_font {
+            let badge_w = (rect.right - rect.left).min(20).max(12);
+            let badge_h = 10;
+            let badge_x = rect.right - badge_w;
+            let badge_y = rect.top;
+            let mut badge_rect = RECT {
+                left: badge_x,
+                top: badge_y,
+                right: badge_x + badge_w,
+                bottom: badge_y + badge_h,
+            };
+            fill_round_rect(hdc, badge_rect, bg, 5);
+            let old_font = SelectObject(hdc, HGDIOBJ(font.0));
+            let _ = SetBkMode(hdc, TRANSPARENT);
+            let _ = SetTextColor(hdc, COLORREF(0xFFFFFF));
+            let display = if text.len() > 3 { &text[..3] } else { text };
+            let mut wide = to_wide(display);
+            let text_len = wide.len().saturating_sub(1);
+            let _ = DrawTextW(
+                hdc,
+                &mut wide[..text_len],
+                &mut badge_rect,
+                DT_CENTER | DT_VCENTER | DT_SINGLELINE,
+            );
+            let _ = SelectObject(hdc, old_font);
+            let _ = DeleteObject(HGDIOBJ(font.0));
+        }
     }
 }
 
@@ -14432,11 +15870,7 @@ fn url_origin(url: &str) -> Option<String> {
     if scheme != "http" && scheme != "https" {
         return None;
     }
-    let host = rest
-        .split(['/', '?', '#'])
-        .next()
-        .unwrap_or("")
-        .trim();
+    let host = rest.split(['/', '?', '#']).next().unwrap_or("").trim();
     if host.is_empty() {
         None
     } else {
@@ -14544,18 +15978,17 @@ fn resolve_url(base: &str, href: &str) -> Option<String> {
         return Some(href.to_string());
     }
     if href.starts_with("//") {
-        let scheme = base.split_once("://").map(|(scheme, _)| scheme).unwrap_or("https");
+        let scheme = base
+            .split_once("://")
+            .map(|(scheme, _)| scheme)
+            .unwrap_or("https");
         return Some(format!("{scheme}:{href}"));
     }
     let origin = url_origin(base)?;
     if href.starts_with('/') {
         return Some(format!("{origin}{href}"));
     }
-    let mut prefix = base
-        .split(['?', '#'])
-        .next()
-        .unwrap_or(base)
-        .to_string();
+    let mut prefix = base.split(['?', '#']).next().unwrap_or(base).to_string();
     if !prefix.ends_with('/') {
         if let Some(pos) = prefix.rfind('/') {
             prefix.truncate(pos + 1);
@@ -14588,6 +16021,355 @@ fn download_url_to_cache(url: &str) -> Option<String> {
     } else {
         Some(String::from_utf16_lossy(&path[..len]))
     }
+}
+
+fn pick_extension_folder(parent: HWND) -> Option<String> {
+    use std::ffi::c_void;
+    #[link(name = "shell32")]
+    extern "system" {
+        fn SHBrowseForFolderW(lpbi: *const BrowseInfoW) -> *mut c_void;
+        fn SHGetPathFromIDListW(pidl: *const c_void, pszPath: *mut u16) -> i32;
+    }
+    #[allow(non_snake_case)]
+    #[repr(C)]
+    struct BrowseInfoW {
+        hwndOwner: HWND,
+        pidlRoot: *const c_void,
+        pszDisplayName: *mut u16,
+        lpszTitle: *const u16,
+        ulFlags: u32,
+        lpfn: Option<unsafe extern "system" fn(HWND, u32, isize, isize) -> isize>,
+        lParam: isize,
+        iImage: i32,
+    }
+    let mut display_buf = [0u16; 260];
+    let title = to_wide("Select the extension folder");
+    let bi = BrowseInfoW {
+        hwndOwner: parent,
+        pidlRoot: ptr::null(),
+        pszDisplayName: display_buf.as_mut_ptr(),
+        lpszTitle: title.as_ptr(),
+        ulFlags: 0x00000001,
+        lpfn: None,
+        lParam: 0,
+        iImage: 0,
+    };
+    unsafe {
+        let pidl = SHBrowseForFolderW(&bi);
+        if pidl.is_null() {
+            return None;
+        }
+        let mut path_buf = [0u16; 260];
+        if SHGetPathFromIDListW(pidl, path_buf.as_mut_ptr()) != 0 {
+            let len = path_buf
+                .iter()
+                .position(|c| *c == 0)
+                .unwrap_or(path_buf.len());
+            let path = String::from_utf16_lossy(&path_buf[..len]);
+            CoTaskMemFree(Some(pidl as *const _));
+            if !path.is_empty() {
+                return Some(path);
+            }
+        } else {
+            CoTaskMemFree(Some(pidl as *const _));
+        }
+        None
+    }
+}
+
+fn extension_store_assist_script(accent_color: u32, extensions: &[BrowserExtensionInfo]) -> String {
+    EXTENSION_STORE_ASSIST_SCRIPT
+        .replace("__ASTER_ACCENT__", &colorref_to_css(accent_color))
+        .replace("__CHROME_VERSION__", CHROME_COMPAT_VERSION)
+        .replace("__ASTER_USER_AGENT__", ASTER_USER_AGENT)
+        .replace(
+            "__ASTER_INSTALLED_EXTENSION_IDS__",
+            &installed_extension_ids_json(extensions),
+        )
+}
+
+fn extension_host_script(extension_id: &str, side_panel_path: &str) -> String {
+    format!(
+        r#"
+(() => {{
+  if (window.__asterExtensionHostInstalled) return;
+  window.__asterExtensionHostInstalled = true;
+  const extensionId = {};
+  const defaultSidePanelPath = {};
+  const post = (message) => window.chrome?.webview?.postMessage?.(message);
+  let sidePanelPath = defaultSidePanelPath;
+  let sizeQueued = false;
+  const postPopupSize = () => {{
+    if (sizeQueued) return;
+    sizeQueued = true;
+    requestAnimationFrame(() => {{
+      sizeQueued = false;
+      const body = document.body;
+      const root = document.documentElement;
+      const width = Math.max(root?.scrollWidth || 0, body?.scrollWidth || 0, root?.offsetWidth || 0, body?.offsetWidth || 0);
+      const height = Math.max(root?.scrollHeight || 0, body?.scrollHeight || 0, root?.offsetHeight || 0, body?.offsetHeight || 0);
+      if (width || height) post(`extensions:popup-size:${{extensionId}}:${{Math.ceil(width)}}:${{Math.ceil(height)}}`);
+    }});
+  }};
+  const openPanel = (path) => {{
+    if (typeof path === "string" && path.trim()) sidePanelPath = path.trim();
+    if (sidePanelPath) {{
+      post(`extensions:open-side-panel:${{encodeURIComponent(extensionId)}}:${{encodeURIComponent(sidePanelPath)}}`);
+    }} else {{
+      post(`extensions:open-side-panel:${{encodeURIComponent(extensionId)}}`);
+    }}
+  }};
+  const installSidePanelBridge = () => {{
+    const chromeObject = window.chrome || {{}};
+    const original = chromeObject.sidePanel || {{}};
+    const behavior = {{ openPanelOnActionClick: false }};
+    const sidePanel = Object.assign(Object.create(Object.getPrototypeOf(original) || Object.prototype), original);
+    sidePanel.open = (options, callback) => {{
+      openPanel(options && typeof options.path === "string" ? options.path : sidePanelPath);
+      if (typeof callback === "function") setTimeout(callback, 0);
+      return Promise.resolve();
+    }};
+    sidePanel.close = (options, callback) => {{
+      if (typeof callback === "function") setTimeout(callback, 0);
+      return Promise.resolve();
+    }};
+    sidePanel.setOptions = (options, callback) => {{
+      if (options && typeof options.path === "string" && options.path.trim()) sidePanelPath = options.path.trim();
+      if (typeof callback === "function") setTimeout(callback, 0);
+      return Promise.resolve();
+    }};
+    sidePanel.getOptions = (options, callback) => {{
+      const value = {{ enabled: true, path: sidePanelPath || defaultSidePanelPath || "" }};
+      if (typeof callback === "function") setTimeout(() => callback(value), 0);
+      return Promise.resolve(value);
+    }};
+    sidePanel.setPanelBehavior = (next, callback) => {{
+      Object.assign(behavior, next || {{}});
+      if (typeof callback === "function") setTimeout(callback, 0);
+      return Promise.resolve();
+    }};
+    sidePanel.getPanelBehavior = (callback) => {{
+      const value = Object.assign({{}}, behavior);
+      if (typeof callback === "function") setTimeout(() => callback(value), 0);
+      return Promise.resolve(value);
+    }};
+    try {{
+      chromeObject.sidePanel = sidePanel;
+      if (!window.chrome) Object.defineProperty(window, "chrome", {{ value: chromeObject, configurable: true }});
+    }} catch {{}}
+  }};
+  installSidePanelBridge();
+  if (document.readyState === "loading") {{
+    document.addEventListener("DOMContentLoaded", postPopupSize, {{ once: true }});
+  }} else {{
+    postPopupSize();
+  }}
+  window.addEventListener("load", postPopupSize);
+  new ResizeObserver(postPopupSize).observe(document.documentElement);
+  setTimeout(postPopupSize, 250);
+}})();
+"#,
+        js_string_literal(extension_id),
+        js_string_literal(side_panel_path)
+    )
+}
+
+fn installed_extension_ids_json(extensions: &[BrowserExtensionInfo]) -> String {
+    let ids = extensions
+        .iter()
+        .map(|ext| js_string_literal(&ext.id))
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("[{}]", ids)
+}
+
+fn is_extension_store_url(url: &str) -> bool {
+    url.contains("chromewebstore.google.com") || url.contains("chrome.google.com/webstore")
+}
+
+fn execute_webview_script(webview: &ICoreWebView2, script: &str) {
+    unsafe {
+        let js = CoTaskMemPWSTR::from(script);
+        let _ = webview.ExecuteScript(
+            *js.as_ref().as_pcwstr(),
+            &ExecuteScriptCompletedHandler::create(Box::new(|_, _| Ok(()))),
+        );
+    }
+}
+
+fn post_boxed_string(hwnd: HWND, message_id: u32, value: String) {
+    let ptr = Box::into_raw(Box::new(value));
+    let posted = unsafe {
+        WindowsAndMessaging::PostMessageW(Some(hwnd), message_id, WPARAM(ptr as usize), LPARAM(0))
+            .is_ok()
+    };
+    if !posted {
+        unsafe {
+            drop(Box::from_raw(ptr));
+        }
+    }
+}
+
+fn extension_page_url(extension_id: &str, path: &str) -> String {
+    let clean_path = path.trim().trim_start_matches('/');
+    format!("chrome-extension://{extension_id}/{clean_path}")
+}
+
+fn manifest_exists(path: &Path) -> bool {
+    path.join("manifest.json").exists()
+}
+
+fn normalize_extension_label(value: &str) -> String {
+    value
+        .trim()
+        .to_ascii_lowercase()
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .collect()
+}
+
+fn resolve_extension_install_path(
+    id: &str,
+    name: &str,
+    known_path: Option<&str>,
+) -> Option<String> {
+    if let Some(path) = known_path {
+        let candidate = PathBuf::from(path);
+        if manifest_exists(&candidate) {
+            return Some(candidate.to_string_lossy().to_string());
+        }
+    }
+
+    let direct = crx_install_dir(id);
+    if manifest_exists(&direct) {
+        return Some(direct.to_string_lossy().to_string());
+    }
+
+    let root = crx_install_root();
+    let wanted_name = normalize_extension_label(name);
+    let entries = fs::read_dir(root).ok()?;
+    let mut only_manifest_dir: Option<PathBuf> = None;
+    let mut manifest_dir_count = 0usize;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() || !manifest_exists(&path) {
+            continue;
+        }
+        let folder_matches = path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .map(|folder| folder.eq_ignore_ascii_case(id))
+            .unwrap_or(false);
+        if folder_matches {
+            return Some(path.to_string_lossy().to_string());
+        }
+        manifest_dir_count += 1;
+        only_manifest_dir = Some(path.clone());
+        if !wanted_name.is_empty() {
+            let manifest_name = read_extension_manifest_name(&path);
+            if normalize_extension_label(&manifest_name) == wanted_name {
+                return Some(path.to_string_lossy().to_string());
+            }
+        }
+    }
+    if manifest_dir_count == 1 {
+        only_manifest_dir.map(|path| path.to_string_lossy().to_string())
+    } else {
+        None
+    }
+}
+
+fn extract_chrome_extension_id(value: &str) -> Option<String> {
+    let lower = value.trim().to_ascii_lowercase();
+    for token in lower.split(|ch: char| !ch.is_ascii_lowercase()) {
+        if token.len() == 32 && token.chars().all(|ch| ('a'..='p').contains(&ch)) {
+            return Some(token.to_string());
+        }
+    }
+    None
+}
+
+fn crx_install_root() -> PathBuf {
+    if let Ok(appdata) = std::env::var("APPDATA") {
+        let mut p = PathBuf::from(appdata);
+        p.push("Aster");
+        p.push(".aster-profile");
+        p.push("Extensions");
+        p
+    } else {
+        let mut p = PathBuf::from(".aster-profile");
+        p.push("Extensions");
+        p
+    }
+}
+
+fn crx_install_dir(extension_id: &str) -> PathBuf {
+    let mut path = crx_install_root();
+    path.push(extension_id);
+    path
+}
+
+fn extract_crx(crx_path: &str, extension_id: &str) -> std::result::Result<String, String> {
+    let data = fs::read(crx_path).map_err(|e| format!("Failed to read CRX: {e}"))?;
+    if data.len() < 4 || &data[0..4] != b"Cr24" {
+        return Err("Invalid CRX file: missing Cr24 magic.".to_string());
+    }
+    let version = u32::from_le_bytes([data[4], data[5], data[6], data[7]]);
+    let zip_start = match version {
+        2 => {
+            if data.len() < 16 {
+                return Err("CRX2 file too short.".to_string());
+            }
+            let key_len = u32::from_le_bytes([data[8], data[9], data[10], data[11]]) as usize;
+            let sig_len = u32::from_le_bytes([data[12], data[13], data[14], data[15]]) as usize;
+            16 + key_len + sig_len
+        }
+        3 => {
+            if data.len() < 12 {
+                return Err("CRX3 file too short.".to_string());
+            }
+            let header_len = u32::from_le_bytes([data[8], data[9], data[10], data[11]]) as usize;
+            12 + header_len
+        }
+        _ => return Err(format!("Unsupported CRX version: {version}")),
+    };
+    if zip_start >= data.len() {
+        return Err("CRX has no ZIP data.".to_string());
+    }
+    let zip_data = &data[zip_start..];
+    let install_dir = crx_install_dir(extension_id);
+    if install_dir.exists() {
+        fs::remove_dir_all(&install_dir)
+            .map_err(|e| format!("Failed to replace old extension files: {e}"))?;
+    }
+    fs::create_dir_all(&install_dir).map_err(|e| format!("Failed to create extension dir: {e}"))?;
+    let reader = std::io::Cursor::new(zip_data.to_vec());
+    let mut archive =
+        zip::ZipArchive::new(reader).map_err(|e| format!("Failed to read CRX ZIP content: {e}"))?;
+    for i in 0..archive.len() {
+        let mut file = archive
+            .by_index(i)
+            .map_err(|e| format!("ZIP entry {i}: {e}"))?;
+        let Some(enclosed) = file.enclosed_name().map(|path| path.to_owned()) else {
+            continue;
+        };
+        let out_path = install_dir.join(enclosed);
+        if file.is_dir() {
+            let _ = fs::create_dir_all(&out_path);
+        } else {
+            if let Some(parent) = out_path.parent() {
+                let _ = fs::create_dir_all(parent);
+            }
+            let mut outfile = fs::File::create(&out_path)
+                .map_err(|e| format!("Failed to create {:?}: {e}", out_path))?;
+            std::io::copy(&mut file, &mut outfile)
+                .map_err(|e| format!("Failed to extract {:?}: {e}", out_path))?;
+        }
+    }
+    if !install_dir.join("manifest.json").exists() {
+        return Err("Extension package did not contain manifest.json.".to_string());
+    }
+    Ok(install_dir.to_string_lossy().to_string())
 }
 
 fn render_glyph_favicon(
@@ -15509,6 +17291,8 @@ fn menu_item(id: usize, label: &str) -> OverlayMenuItem {
         id,
         label: label.to_string(),
         sublabel: String::new(),
+        icon_key: String::new(),
+        icon_path: String::new(),
     }
 }
 
@@ -15517,6 +17301,8 @@ fn menu_item_with_subtitle(id: usize, label: &str, sublabel: &str) -> OverlayMen
         id,
         label: label.to_string(),
         sublabel: sublabel.to_string(),
+        icon_key: String::new(),
+        icon_path: String::new(),
     }
 }
 
@@ -15812,15 +17598,60 @@ fn history_entries_json(entries: &[VisitedSite]) -> String {
     format!("[{}]", items)
 }
 
+fn extension_icon_data_url(path: &str) -> String {
+    if path.trim().is_empty() {
+        return String::new();
+    }
+    let Ok(bytes) = fs::read(path) else {
+        return String::new();
+    };
+    if bytes.is_empty() {
+        return String::new();
+    }
+    let mime = match Path::new(path)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "svg" => "image/svg+xml",
+        "ico" => "image/x-icon",
+        _ => "image/png",
+    };
+    format!(
+        "data:{mime};base64,{}",
+        general_purpose::STANDARD.encode(bytes)
+    )
+}
+
 fn extensions_entries_json(entries: &[BrowserExtensionInfo]) -> String {
     let items = entries
         .iter()
         .map(|entry| {
+            let icon = extension_icon_data_url(&entry.icon_path);
             format!(
-                "{{\"id\":{},\"name\":{},\"enabled\":{}}}",
+                "{{\"id\":{},\"name\":{},\"enabled\":{},\"version\":{},\"description\":{},\"hasAction\":{},\"canOpen\":{},\"permissions\":{},\"icon\":{}}}",
                 js_string_literal(&entry.id),
                 js_string_literal(&entry.name),
-                if entry.enabled { "true" } else { "false" }
+                if entry.enabled { "true" } else { "false" },
+                js_string_literal(&entry.version),
+                js_string_literal(&entry.description),
+                if entry.has_action { "true" } else { "false" },
+                if entry.enabled
+                    && (!entry.popup_path.is_empty()
+                        || !entry.side_panel_path.is_empty()
+                        || !entry.options_path.is_empty())
+                {
+                    "true"
+                } else {
+                    "false"
+                },
+                js_string_literal(&entry.permissions.join(", ")),
+                js_string_literal(&icon),
             )
         })
         .collect::<Vec<_>>()
@@ -15867,9 +17698,16 @@ h1 { font-size: 28px; line-height: 1.1; margin: 0 0 7px; font-weight: 650; }
 .group { border: 1px solid var(--line); border-radius: 8px; overflow: hidden; background: var(--panel); margin: 16px 0; }
 .row { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 16px; align-items: center; padding: 15px 17px; border-top: 1px solid var(--line); }
 .row:first-child { border-top: 0; }
+.ext-main { min-width: 0; display: grid; grid-template-columns: 36px minmax(0, 1fr); gap: 12px; align-items: center; padding: 0; border: 0; background: transparent; color: var(--text); text-align: left; cursor: pointer; }
+.ext-main:hover .title, .ext-main:focus-visible .title { color: var(--accent); }
+.ext-main:focus-visible { outline: 2px solid color-mix(in srgb, var(--accent), transparent 40%); outline-offset: 4px; border-radius: 6px; }
+.ext-icon { width: 32px; height: 32px; object-fit: contain; border-radius: 7px; background: var(--soft); }
+.ext-icon-fallback { display: grid; place-items: center; color: var(--accent); font-weight: 700; }
 .title { font-weight: 600; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.subtitle { color: var(--muted); font-size: 12px; margin-top: 1px; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.desc { color: var(--muted); font-size: 12px; margin-top: 3px; overflow-wrap: anywhere; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
 .hint { color: var(--muted); font-size: 12px; margin-top: 3px; overflow-wrap: anywhere; }
-.load { display: grid; grid-template-columns: minmax(180px, 1fr) auto; gap: 8px; width: min(560px, 100%); }
+.load { display: grid; grid-template-columns: minmax(180px, 1fr) auto auto; gap: 8px; width: min(620px, 100%); }
 input { color: var(--text); background: #080808; border: 1px solid var(--line); border-radius: 7px; padding: 8px 10px; min-width: 0; }
 .action-btn { min-width: 110px; color: var(--text); background: #080808; border: 1px solid var(--line); border-radius: 7px; padding: 8px 10px; cursor: pointer; }
 .action-btn:hover { background: color-mix(in srgb, var(--accent), transparent 88%); border-color: color-mix(in srgb, var(--accent), var(--line) 55%); }
@@ -15877,15 +17715,19 @@ input { color: var(--text); background: #080808; border: 1px solid var(--line); 
 .toggle input { width: 18px; height: 18px; accent-color: var(--accent); }
 .notice { border: 1px solid color-mix(in srgb, var(--accent), var(--line) 58%); background: color-mix(in srgb, var(--accent), transparent 90%); border-radius: 8px; padding: 11px 13px; margin: 0 0 14px; }
 .empty { color: var(--muted); padding: 18px; }
+.perms { color: var(--muted); font-size: 11px; margin-top: 4px; overflow-wrap: anywhere; }
+.perms span { display: inline-block; background: var(--soft); border-radius: 4px; padding: 1px 6px; margin: 1px 2px; }
+.action-btn:disabled { opacity: .45; cursor: default; }
 @media (max-width: 760px) { .header, .row { grid-template-columns: minmax(0, 1fr); flex-direction: column; align-items: stretch; } .load { grid-template-columns: minmax(0, 1fr); } .actions { justify-content: stretch; } .action-btn { flex: 1; } }
 </style>
 </head>
 <body>
 <div class="page"><div class="wrap">
-<div class="header"><div><h1>Extensions</h1><p class="lead">Load unpacked Chrome extensions and manage what is active in Aster.</p></div><div class="actions"><button class="action-btn" id="openStore">Chrome Web Store</button><button class="action-btn" id="refresh">Refresh</button></div></div>
+<div class="header"><div><h1>Extensions</h1><p class="lead">Install Chrome extensions and manage what is active in Aster.</p></div><div class="actions"><button class="action-btn" id="openStore">Chrome Web Store</button><button class="action-btn" id="refresh">Refresh</button></div></div>
 __NOTICE__
 <div class="group">
-<div class="row"><div><div class="title">Load unpacked extension</div><div class="hint">Enter the folder that contains manifest.json. Extensions are stored by the WebView2 profile.</div></div><div class="load"><input id="extensionPath" placeholder="C:\path\to\extension"><button class="action-btn" id="loadUnpacked">Load</button></div></div>
+<div class="row"><div><div class="title">Install from Chrome Web Store</div><div class="hint">Paste a Chrome Web Store link or extension id. Aster downloads and loads the extension locally.</div></div><div class="load"><input id="storeExtension" placeholder="Chrome Web Store URL or extension id"><button class="action-btn" id="installStore">Install</button></div></div>
+<div class="row"><div><div class="title">Load unpacked extension</div><div class="hint">Enter the folder containing manifest.json, or use Browse to pick one.</div></div><div class="load"><input id="extensionPath" placeholder="C:\path\to\extension"><button class="action-btn" id="browseExtension">Browse...</button><button class="action-btn" id="loadUnpacked">Load</button></div></div>
 </div>
 <div class="group" id="extensionRows"></div>
 </div></div>
@@ -15902,16 +17744,31 @@ function render() {
   extensions.forEach((extension) => {
     const row = document.createElement("div");
     row.className = "row";
-    row.innerHTML = `<div><div class="title"></div><div class="hint"></div></div><div class="actions"><label class="toggle"><input type="checkbox"${extension.enabled ? " checked" : ""}>Enabled</label><button class="action-btn">Remove</button></div>`;
-    row.querySelector(".title").textContent = extension.name;
-    row.querySelector(".hint").textContent = extension.id;
+    const icon = extension.icon
+      ? `<img class="ext-icon" src="${escapeAttr(extension.icon)}" alt="">`
+      : `<div class="ext-icon ext-icon-fallback" aria-hidden="true">${escapeHtml((extension.name || "?").slice(0, 1).toUpperCase())}</div>`;
+    let info = `<div class="title">${escapeHtml(extension.name)}</div>`;
+    if (extension.version) info += `<div class="subtitle">v${escapeHtml(extension.version)} &middot; ${escapeHtml(extension.id)}</div>`;
+    else info += `<div class="subtitle">${escapeHtml(extension.id)}</div>`;
+    if (extension.description) info += `<div class="desc">${escapeHtml(extension.description)}</div>`;
+    if (extension.permissions) info += `<div class="perms">` + extension.permissions.split(", ").filter(p => p).map(p => `<span>${escapeHtml(p)}</span>`).join("") + `</div>`;
+    row.innerHTML = `<button class="ext-main" type="button" title="Open ${escapeAttr(extension.name)}">${icon}<span>${info}</span></button><div class="actions"><label class="toggle"><input type="checkbox"${extension.enabled ? " checked" : ""}>Enabled</label><button class="action-btn" data-action="open"${extension.canOpen ? "" : " disabled"}>Open</button><button class="action-btn" data-action="remove">Remove</button></div>`;
+    row.querySelector(".ext-main").onclick = () => post("extensions:open-popup:" + encodeURIComponent(extension.id));
     row.querySelector("input").onchange = (event) => post("extensions:enable:" + encodeURIComponent(extension.id) + ":" + (event.target.checked ? "1" : "0"));
-    row.querySelector("button").onclick = () => post("extensions:remove:" + encodeURIComponent(extension.id));
+    row.querySelector("[data-action='open']").onclick = () => post("extensions:open-popup:" + encodeURIComponent(extension.id));
+    row.querySelector("[data-action='remove']").onclick = () => post("extensions:remove:" + encodeURIComponent(extension.id));
     rows.appendChild(row);
   });
 }
+function escapeHtml(s) { return (s||"").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;"); }
+function escapeAttr(s) { return escapeHtml(s).replace(/"/g,"&quot;"); }
 document.getElementById("openStore").onclick = () => post("extensions:open-store");
 document.getElementById("refresh").onclick = () => post("extensions:refresh");
+document.getElementById("installStore").onclick = () => {
+  const value = document.getElementById("storeExtension").value.trim();
+  if (value) post("extensions:install-store:" + encodeURIComponent(value));
+};
+document.getElementById("browseExtension").onclick = () => post("extensions:browse-folder");
 document.getElementById("loadUnpacked").onclick = () => {
   const path = document.getElementById("extensionPath").value.trim();
   if (path) post("extensions:add:" + encodeURIComponent(path));
@@ -16146,6 +18003,63 @@ fn colorref_to_css(color: u32) -> String {
     )
 }
 
+fn manifest_message(dir: &Path, key: &str, default_locale: &str) -> Option<String> {
+    let locale = if default_locale.trim().is_empty() {
+        "en"
+    } else {
+        default_locale.trim()
+    };
+    let candidates = [locale, "en", "en_US"];
+    for candidate in candidates {
+        let path = dir.join("_locales").join(candidate).join("messages.json");
+        let Ok(content) = fs::read_to_string(path) else {
+            continue;
+        };
+        let Ok(json) = serde_json::from_str::<Value>(&content) else {
+            continue;
+        };
+        if let Some(message) = json
+            .get(key)
+            .and_then(|entry| entry.get("message"))
+            .and_then(|value| value.as_str())
+            .filter(|value| !value.trim().is_empty())
+        {
+            return Some(message.to_string());
+        }
+    }
+    None
+}
+
+fn resolve_manifest_text(dir: &Path, raw: &str, default_locale: &str) -> String {
+    let trimmed = raw.trim();
+    if let Some(key) = trimmed
+        .strip_prefix("__MSG_")
+        .and_then(|value| value.strip_suffix("__"))
+    {
+        manifest_message(dir, key, default_locale).unwrap_or_else(|| trimmed.to_string())
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn read_extension_manifest_name(dir: &Path) -> String {
+    let manifest_path = dir.join("manifest.json");
+    let Ok(content) = fs::read_to_string(&manifest_path) else {
+        return String::new();
+    };
+    let Ok(json) = serde_json::from_str::<Value>(&content) else {
+        return String::new();
+    };
+    let default_locale = json
+        .get("default_locale")
+        .and_then(|value| value.as_str())
+        .unwrap_or("en");
+    json.get("name")
+        .and_then(|value| value.as_str())
+        .map(|raw| resolve_manifest_text(dir, raw, default_locale))
+        .unwrap_or_default()
+}
+
 fn parse_css_color_to_colorref(value: &str) -> Option<u32> {
     let hex = value.trim().trim_start_matches('#');
     if hex.len() != 6 {
@@ -16188,16 +18102,174 @@ fn extension_info(extension: &ICoreWebView2BrowserExtension) -> BrowserExtension
             String::new()
         };
         let _ = extension.IsEnabled(&mut enabled);
+        let install_path = crx_install_dir(&id).to_string_lossy().to_string();
+        let details = if Path::new(&install_path).join("manifest.json").exists() {
+            read_extension_manifest(&install_path)
+        } else {
+            ExtensionManifestDetails::default()
+        };
         BrowserExtensionInfo {
             id,
-            name: if name.trim().is_empty() {
+            name: if !details.name.trim().is_empty()
+                && (name.trim().is_empty() || name.trim().starts_with("__MSG_"))
+            {
+                details.name
+            } else if name.trim().is_empty() {
                 "Unnamed extension".to_string()
             } else {
                 name
             },
             enabled: enabled.as_bool(),
+            version: details.version,
+            description: details.description,
+            has_action: details.has_action,
+            popup_path: details.popup_path,
+            side_panel_path: details.side_panel_path,
+            options_path: details.options_path,
+            permissions: details.permissions,
+            install_path,
+            icon_path: details.icon_path,
         }
     }
+}
+
+fn read_extension_manifest(dir: &str) -> ExtensionManifestDetails {
+    let manifest_path = Path::new(dir).join("manifest.json");
+    let content = match fs::read_to_string(&manifest_path) {
+        Ok(content) => content,
+        Err(_) => return ExtensionManifestDetails::default(),
+    };
+    let json: Value = match serde_json::from_str(&content) {
+        Ok(json) => json,
+        Err(_) => return ExtensionManifestDetails::default(),
+    };
+    let dir_path = Path::new(dir);
+    let default_locale = json
+        .get("default_locale")
+        .and_then(|v| v.as_str())
+        .unwrap_or("en");
+    let name = json
+        .get("name")
+        .and_then(|v| v.as_str())
+        .map(|raw| resolve_manifest_text(dir_path, raw, default_locale))
+        .unwrap_or_default();
+    let version = json
+        .get("version")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let description = json
+        .get("description")
+        .and_then(|v| v.as_str())
+        .map(|raw| resolve_manifest_text(dir_path, raw, default_locale))
+        .unwrap_or_default();
+    let permissions: Vec<String> = json
+        .get("permissions")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .collect()
+        })
+        .unwrap_or_default();
+    let has_action = json.get("action").is_some() || json.get("browser_action").is_some();
+    let popup_path = json
+        .get("action")
+        .or_else(|| json.get("browser_action"))
+        .and_then(|a| a.get("default_popup"))
+        .and_then(|p| p.as_str())
+        .unwrap_or("")
+        .to_string();
+    let side_panel_path = json
+        .get("side_panel")
+        .and_then(|panel| panel.get("default_path"))
+        .and_then(|path| path.as_str())
+        .unwrap_or("")
+        .to_string();
+    let options_path = json
+        .get("options_ui")
+        .and_then(|ui| ui.get("page"))
+        .or_else(|| json.get("options_page"))
+        .and_then(|p| p.as_str())
+        .unwrap_or("")
+        .to_string();
+    let icon_path = pick_best_icon(
+        json.get("icons"),
+        json.get("action")
+            .or_else(|| json.get("browser_action"))
+            .and_then(|a| a.get("default_icon")),
+        dir,
+    );
+    ExtensionManifestDetails {
+        name,
+        version,
+        description,
+        has_action,
+        popup_path,
+        side_panel_path,
+        options_path,
+        permissions,
+        icon_path,
+    }
+}
+
+fn pick_best_icon(icons: Option<&Value>, default_icon: Option<&Value>, dir: &str) -> String {
+    let preferred_sizes = [32i32, 48, 64, 96, 128, 16];
+    let dir_path = Path::new(dir);
+    if let Some(icons_obj) = icons.and_then(|v| v.as_object()) {
+        if let Some(path) = preferred_sizes.iter().find_map(|&s| {
+            icons_obj
+                .get(&s.to_string())
+                .or_else(|| {
+                    icons_obj
+                        .keys()
+                        .filter_map(|k| k.parse::<i32>().ok())
+                        .min_by_key(|k| (k - s).abs())
+                        .and_then(|k| icons_obj.get(&k.to_string()))
+                })
+                .and_then(|v| v.as_str())
+                .filter(|p| dir_path.join(p).exists())
+        }) {
+            return dir_path.join(path).to_string_lossy().to_string();
+        }
+        if let Some(path) = icons_obj
+            .values()
+            .filter_map(|v| v.as_str())
+            .find(|p| dir_path.join(p).exists())
+        {
+            return dir_path.join(path).to_string_lossy().to_string();
+        }
+    }
+    if let Some(icon_val) = default_icon {
+        if let Some(path) = icon_val.as_str() {
+            let candidate = dir_path.join(path);
+            if candidate.exists() {
+                return candidate.to_string_lossy().to_string();
+            }
+        } else if let Some(obj) = icon_val.as_object() {
+            if let Some(path) = preferred_sizes.iter().find_map(|&s| {
+                obj.get(&s.to_string())
+                    .or_else(|| {
+                        obj.keys()
+                            .filter_map(|k| k.parse::<i32>().ok())
+                            .min_by_key(|k| (k - s).abs())
+                            .and_then(|k| obj.get(&k.to_string()))
+                    })
+                    .and_then(|v| v.as_str())
+                    .filter(|p| dir_path.join(p).exists())
+            }) {
+                return dir_path.join(path).to_string_lossy().to_string();
+            }
+            if let Some(path) = obj
+                .values()
+                .filter_map(|v| v.as_str())
+                .find(|p| dir_path.join(p).exists())
+            {
+                return dir_path.join(path).to_string_lossy().to_string();
+            }
+        }
+    }
+    String::new()
 }
 
 fn client_rect(hwnd: HWND) -> RECT {
@@ -16307,9 +18379,7 @@ fn normalize_address(raw: &str) -> String {
     if value.eq_ignore_ascii_case(":history") || value.eq_ignore_ascii_case("aster:history") {
         return "aster:history".to_string();
     }
-    if value.eq_ignore_ascii_case(":extensions")
-        || value.eq_ignore_ascii_case("aster:extensions")
-    {
+    if value.eq_ignore_ascii_case(":extensions") || value.eq_ignore_ascii_case("aster:extensions") {
         return "aster:extensions".to_string();
     }
     if value.contains("://") || value.starts_with("about:") {
@@ -17054,5 +19124,18 @@ mod tests {
             favicon_candidate_urls("https://example.com/docs/page", None),
             vec!["https://example.com/favicon.ico".to_string()]
         );
+    }
+
+    #[test]
+    fn test_extract_chrome_extension_id() {
+        let id = "abcdefghijklmnopabcdefghijklmnop";
+        assert_eq!(extract_chrome_extension_id(id), Some(id.to_string()));
+        assert_eq!(
+            extract_chrome_extension_id(&format!(
+                "https://chromewebstore.google.com/detail/example/{id}"
+            )),
+            Some(id.to_string())
+        );
+        assert_eq!(extract_chrome_extension_id("not-an-extension"), None);
     }
 }
