@@ -387,10 +387,41 @@ const EXTENSION_STORE_ASSIST_SCRIPT: &str = r##"
       install();
     }
   };
-  ["pointerdown", "mousedown", "click"].forEach((type) => document.addEventListener(type, handleInstallEvent, true));
+  const isRemoveIntent = (label) => /\b(remove from chrome|remove|uninstall)\b/i.test(label)
+    && !/\b(add|install|get|share|search|reviews?|overview|privacy|support|related|website|report abuse|menu|close|back)\b/i.test(label);
+  const handleRemoveEvent = (event) => {
+    if (!isStore() || !extensionId()) return;
+    const path = typeof event.composedPath === "function" ? event.composedPath() : [event.target];
+    const buttonLike = Array.from(path || []).find((node) =>
+      node?.matches?.("button, a, [role='button'], [jsaction], [data-test-id], [aria-label]")
+    );
+    if (!buttonLike) return;
+    const label = labelForNode(buttonLike);
+    if (!isRemoveIntent(label)) return;
+    if (!installedIds.has(extensionId())) return;
+    event.preventDefault();
+    event.stopPropagation();
+    event.stopImmediatePropagation();
+    post("extensions:uninstall-request:" + encodeURIComponent(extensionId()));
+  };
+  ["pointerdown", "mousedown", "click"].forEach((type) => {
+    document.addEventListener(type, handleInstallEvent, true);
+    document.addEventListener(type, handleRemoveEvent, true);
+  });
   new MutationObserver(schedule).observe(document.documentElement, { childList: true, subtree: true });
   window.addEventListener("popstate", schedule);
   window.addEventListener("hashchange", schedule);
+  try {
+    const origChrome = window.chrome || {};
+    if (origChrome.webstorePrivate) {
+      origChrome.webstorePrivate.uninstallSelf = (...args) => {
+        const id = extensionId();
+        if (id) post("extensions:uninstall-request:" + encodeURIComponent(id));
+        const callback = firstCallback(args);
+        if (callback) setTimeout(callback, 0);
+      };
+    }
+  } catch {}
   patchChromeInstallApi();
   render();
   schedule();
@@ -1321,6 +1352,7 @@ struct App {
     dialog_active_permission: Option<ActivePermissionRequest>,
     dialog_active_script_dialog: Option<ActiveScriptDialog>,
     dialog_active_extension: Option<ExtensionCrxResult>,
+    dialog_active_extension_remove: Option<String>,
     extension_side_panel_hwnd: HWND,
     extension_side_panel_controller: Option<ICoreWebView2Controller>,
     extension_side_panel_extension_id: Option<String>,
@@ -1523,6 +1555,7 @@ impl App {
             dialog_active_permission: None,
             dialog_active_script_dialog: None,
             dialog_active_extension: None,
+            dialog_active_extension_remove: None,
             extension_side_panel_hwnd: HWND(std::ptr::null_mut()),
             extension_side_panel_controller: None,
             extension_side_panel_extension_id: None,
@@ -2404,18 +2437,39 @@ impl App {
         if self.dialog_popup_hwnd == HWND(std::ptr::null_mut()) {
             return;
         }
+        unsafe {
+            if WindowsAndMessaging::IsIconic(self.hwnd).as_bool()
+                || !WindowsAndMessaging::IsWindowVisible(self.hwnd).as_bool()
+            {
+                let _ = WindowsAndMessaging::ShowWindow(
+                    self.dialog_popup_hwnd,
+                    WindowsAndMessaging::SW_HIDE,
+                );
+                return;
+            }
+        }
         let bounds = self.web_content_bounds();
         let width = 360;
         let height = 240;
-        let right = bounds.right - 12;
-        let top = bounds.top + 12;
+        let mut right = bounds.right - 12;
+        let mut top = bounds.top + 12;
+        if right < bounds.left + width + 12 {
+            right = bounds.left + width + 12;
+        }
+        if top + height + 12 > bounds.bottom {
+            top = bounds.bottom - height - 12;
+        }
         let left = right - width;
+        let mut pt = POINT { x: left, y: top };
+        unsafe {
+            let _ = Gdi::ClientToScreen(self.hwnd, &mut pt);
+        }
         unsafe {
             let _ = WindowsAndMessaging::SetWindowPos(
                 self.dialog_popup_hwnd,
                 Some(HWND_TOP),
-                left,
-                top,
+                pt.x,
+                pt.y,
                 width,
                 height,
                 WindowsAndMessaging::SWP_SHOWWINDOW,
@@ -2463,6 +2517,12 @@ impl App {
             }
         }
 
+        if let Some(ext_id) = self.dialog_active_extension_remove.take() {
+            if approved {
+                self.remove_extension_final(&ext_id);
+            }
+        }
+
         if let Some(controller) = self.dialog_popup_controller.take() {
             unsafe {
                 let _ = controller.Close();
@@ -2479,8 +2539,8 @@ impl App {
 
     fn show_extension_install_dialog(&mut self, ext_id: &str) {
         let path = self.dialog_active_extension.as_ref().map(|r| r.install_path.as_str()).unwrap_or("");
-        let (name, desc, perms) = get_manifest_info(path).unwrap_or_else(|| {
-            ("Extension".to_string(), "No description provided.".to_string(), Vec::new())
+        let (name, desc, perms, icon_base64) = get_manifest_info(path).unwrap_or_else(|| {
+            ("Extension".to_string(), "No description provided.".to_string(), Vec::new(), None)
         });
 
         let mut body_html = format!(r#"<div style="font-weight:600;margin-bottom:8px;font-size:12.5px;">Do you want to install "{}" to Aster?</div>"#, html_escape_text(&name));
@@ -2504,10 +2564,14 @@ impl App {
             <button class="btn btn-primary" onclick="post('dialog:extension:accept')">Add Extension</button>
         "#;
 
-        let icon_svg = r#"<svg viewBox="0 0 24 24"><path d="M20.5 11H19V7c0-1.1-.9-2-2-2h-4V3.5a2.5 2.5 0 0 0-5 0V5H4c-1.1 0-1.99.9-1.99 2v3.8H3.5a2.5 2.5 0 0 1 0 5H2v3.8c0 1.1.9 2 2 2h3.8v-1.5a2.5 2.5 0 0 1 5 0v1.5H17c1.1 0 2-.9 2-2v-4h1.5a2.5 2.5 0 0 0 0-5z"/></svg>"#;
+        let icon_html = if let Some(ref b64) = icon_base64 {
+            format!(r#"<img src="{}" />"#, b64)
+        } else {
+            r#"<svg viewBox="0 0 24 24"><path d="M20.5 11H19V7c0-1.1-.9-2-2-2h-4V3.5a2.5 2.5 0 0 0-5 0V5H4c-1.1 0-1.99.9-1.99 2v3.8H3.5a2.5 2.5 0 0 1 0 5H2v3.8c0 1.1.9 2 2 2h3.8v-1.5a2.5 2.5 0 0 1 5 0v1.5H17c1.1 0 2-.9 2-2v-4h1.5a2.5 2.5 0 0 0 0-5z"/></svg>"#.to_string()
+        };
 
         let html = dialog_popup_html(
-            icon_svg,
+            &icon_html,
             "Install Extension",
             &format!("ID: {}", ext_id),
             &body_html,
@@ -2516,6 +2580,67 @@ impl App {
             &colorref_to_css(self.dominant_color),
             &colorref_to_css(self.secondary_color),
         );
+
+        if let Ok(controller) = self.ensure_dialog_popup() {
+            if let Ok(wv) = unsafe { controller.CoreWebView2() } {
+                let wide = CoTaskMemPWSTR::from(html.as_str());
+                unsafe {
+                    let _ = wv.NavigateToString(*wide.as_ref().as_pcwstr());
+                }
+                self.layout_dialog_popup();
+                unsafe {
+                    let _ = WindowsAndMessaging::ShowWindow(self.dialog_popup_hwnd, WindowsAndMessaging::SW_SHOW);
+                    let _ = WindowsAndMessaging::SetWindowPos(self.dialog_popup_hwnd, Some(HWND_TOP), 0, 0, 0, 0, WindowsAndMessaging::SWP_NOMOVE | WindowsAndMessaging::SWP_NOSIZE);
+                }
+            }
+        }
+    }
+
+    fn show_extension_remove_dialog(&mut self, ext_id: &str) {
+        let extension_info = self.extensions.iter().find(|e| e.id == ext_id).cloned();
+        let (name, _desc, install_path) = if let Some(info) = extension_info {
+            (info.name, info.description, info.install_path)
+        } else {
+            ("Extension".to_string(), "Are you sure you want to remove this extension?".to_string(), String::new())
+        };
+
+        let (_, _, _, icon_base64) = if !install_path.is_empty() {
+            get_manifest_info(&install_path).unwrap_or_else(|| {
+                ("".to_string(), "".to_string(), Vec::new(), None)
+            })
+        } else {
+            ("".to_string(), "".to_string(), Vec::new(), None)
+        };
+
+        let mut body_html = format!(
+            r#"<div style="font-weight:600;margin-bottom:8px;font-size:12.5px;">Remove "{}"?</div>"#,
+            html_escape_text(&name)
+        );
+        body_html.push_str(r#"<div style="margin-bottom:12px;color:var(--muted);font-style:italic;">It will be removed from Aster. Any data associated with this extension will also be deleted.</div>"#);
+
+        let buttons_html = r#"
+            <button class="btn btn-secondary" onclick="post('dialog:extension-remove:cancel')">Cancel</button>
+            <button class="btn btn-danger" onclick="post('dialog:extension-remove:accept')">Remove</button>
+        "#;
+
+        let icon_html = if let Some(ref b64) = icon_base64 {
+            format!(r#"<img src="{}" />"#, b64)
+        } else {
+            r#"<svg viewBox="0 0 24 24"><path d="M20.5 11H19V7c0-1.1-.9-2-2-2h-4V3.5a2.5 2.5 0 0 0-5 0V5H4c-1.1 0-1.99.9-1.99 2v3.8H3.5a2.5 2.5 0 0 1 0 5H2v3.8c0 1.1.9 2 2 2h3.8v-1.5a2.5 2.5 0 0 1 5 0v1.5H17c1.1 0 2-.9 2-2v-4h1.5a2.5 2.5 0 0 0 0-5z"/></svg>"#.to_string()
+        };
+
+        let html = dialog_popup_html(
+            &icon_html,
+            "Remove Extension",
+            &format!("ID: {}", ext_id),
+            &body_html,
+            buttons_html,
+            &colorref_to_css(self.accent_color),
+            &colorref_to_css(self.dominant_color),
+            &colorref_to_css(self.secondary_color),
+        );
+
+        self.dialog_active_extension_remove = Some(ext_id.to_string());
 
         if let Ok(controller) = self.ensure_dialog_popup() {
             if let Ok(wv) = unsafe { controller.CoreWebView2() } {
@@ -2885,6 +3010,12 @@ impl App {
             self.close_dialog_popup(true);
         } else if message == "dialog:extension:cancel" {
             self.close_dialog_popup(false);
+        } else if message == "dialog:extension-remove:accept" {
+            self.close_dialog_popup(true);
+        } else if message == "dialog:extension-remove:cancel" {
+            self.close_dialog_popup(false);
+        } else if let Some(id) = message.strip_prefix("extensions:uninstall-request:") {
+            self.remove_extension(&percent_decode(id));
         } else if message == "dialog:script:accept" {
             self.close_dialog_popup(true);
         } else if message == "dialog:script:cancel" {
@@ -4535,6 +4666,11 @@ impl App {
                         self.pinned_extensions.insert(parts[1].clone());
                     }
                 }
+                "extension_install_path" if parts.len() >= 3 => {
+                    if !parts[1].trim().is_empty() && !parts[2].trim().is_empty() {
+                        self.extension_install_paths.insert(parts[1].clone(), parts[2].clone());
+                    }
+                }
                 "setting" if parts.len() >= 3 => match parts[1].as_str() {
                     "dominant_color" => {
                         if let Ok(color) = parts[2].parse::<u32>() {
@@ -4743,6 +4879,13 @@ impl App {
         }
         for extension_id in &self.pinned_extensions {
             lines.push(format!("pinned_extension\t{}", escape_state(extension_id)));
+        }
+        for (id, path) in &self.extension_install_paths {
+            lines.push(format!(
+                "extension_install_path\t{}\t{}",
+                escape_state(id),
+                escape_state(path)
+            ));
         }
         for (workspace_id, active_tab_id) in &self.workspace_active_tabs {
             lines.push(format!("active_tab\t{}\t{}", workspace_id, active_tab_id));
@@ -6712,7 +6855,7 @@ impl App {
                                 let _ = list.Count(&mut count);
                                 for index in 0..count {
                                     if let Ok(ext) = list.GetValueAtIndex(index) {
-                                        extensions.push(extension_info(&ext));
+                                        extensions.push(extension_info(&ext, None));
                                     }
                                 }
                             }
@@ -6789,6 +6932,7 @@ impl App {
                             }
                             app.sync_store_installed_extensions();
                             app.reload_extensions_pages();
+                            app.save_state();
                             app.refresh();
                         });
                         Ok(())
@@ -6876,7 +7020,7 @@ impl App {
                             app.extension_notice = if error_code.is_ok() {
                                 let name = extension
                                     .as_ref()
-                                    .map(extension_info)
+                                    .map(|ext| extension_info(ext, Some(&path_for_callback)))
                                     .map(|info| {
                                         app.extension_install_paths
                                             .insert(info.id.clone(), path_for_callback.clone());
@@ -6915,7 +7059,7 @@ impl App {
                                 let _ = list.Count(&mut count);
                                 for index in 0..count {
                                     if let Ok(extension) = list.GetValueAtIndex(index) {
-                                        if extension_info(&extension).id == wanted {
+                                        if extension_info(&extension, None).id == wanted {
                                             if let Some(action) = action.borrow_mut().take() {
                                                 action(extension);
                                             }
@@ -6963,6 +7107,10 @@ impl App {
     }
 
     fn remove_extension(&mut self, id: &str) {
+        self.show_extension_remove_dialog(id);
+    }
+
+    fn remove_extension_final(&mut self, id: &str) {
         let id_for_notice = id.to_string();
         let hwnd = self.hwnd;
         self.extension_notice = Some("Removing extension...".to_string());
@@ -6978,6 +7126,7 @@ impl App {
                 move |error_code| {
                     with_app(hwnd, |app| {
                         app.extension_notice = if error_code.is_ok() {
+                            app.extension_install_paths.remove(&id_for_notice);
                             Some("Extension removed.".to_string())
                         } else {
                             Some(format!("Could not remove extension {id_for_notice}."))
@@ -7110,11 +7259,11 @@ impl App {
                                 app.pending_extension_installs.remove(&ext_id);
                                 let ext_name = extension
                                     .as_ref()
-                                    .map(|ext| extension_info(ext).name)
+                                    .map(|ext| extension_info(ext, Some(&path_for_callback)).name)
                                     .unwrap_or_default();
                                 app.extension_notice = if error_code.is_ok() {
                                     if let Some(ref ext) = extension {
-                                        let info = extension_info(ext);
+                                        let info = extension_info(ext, Some(&path_for_callback));
                                         app.extension_install_paths
                                             .insert(info.id.clone(), path_for_callback.clone());
                                     }
@@ -11791,7 +11940,7 @@ impl App {
             return;
         }
 
-        if self.show_default_bubble && self.sidebar_width() >= 240 {
+        if self.show_default_bubble && !self.settings_open && self.sidebar_width() >= 240 {
             if let Some(close_rect) = self.default_bubble_close_rect() {
                 if point_in_rect(x, y, close_rect) {
                     self.show_default_bubble = false;
@@ -12868,7 +13017,7 @@ impl App {
         self.drop_target = Some(DropTarget::None);
         self.split_drop_target = None;
 
-        if self.show_default_bubble && self.sidebar_width() >= 240 {
+        if self.show_default_bubble && !self.settings_open && self.sidebar_width() >= 240 {
             if let Some(close_rect) = self.default_bubble_close_rect() {
                 if point_in_rect(x, y, close_rect) {
                     self.hover_target = Some(HoverTarget::DefaultBubbleClose);
@@ -13061,7 +13210,7 @@ impl App {
             self.hover_folder = None;
         }
 
-        if self.show_default_bubble && self.sidebar_width() >= 240 {
+        if self.show_default_bubble && !self.settings_open && self.sidebar_width() >= 240 {
             if let Some(bubble_rect) = self.default_bubble_rect() {
                 if point_in_rect(x, y, bubble_rect) {
                     self.hover_tab = None;
@@ -14489,16 +14638,6 @@ unsafe extern "system" fn dialog_popup_proc(
     l_param: LPARAM,
 ) -> LRESULT {
     match msg {
-        WM_ACTIVATE => {
-            if loword(w_param.0 as u32) == 0 {
-                if let Ok(parent) = WindowsAndMessaging::GetParent(hwnd) {
-                    with_app(parent, |app| {
-                        app.close_dialog_popup(false);
-                    });
-                }
-                return LRESULT(0);
-            }
-        }
         WM_CLOSE => {
             if let Ok(parent) = WindowsAndMessaging::GetParent(hwnd) {
                 with_app(parent, |app| {
@@ -14527,12 +14666,44 @@ fn url_domain(url: &str) -> Option<String> {
     Some(host_parts.next()?.to_string())
 }
 
-fn get_manifest_info(path: &str) -> Option<(String, String, Vec<String>)> {
+fn get_mime_type(path: &str) -> &'static str {
+    let lower = path.to_lowercase();
+    if lower.ends_with(".png") {
+        "image/png"
+    } else if lower.ends_with(".jpg") || lower.ends_with(".jpeg") {
+        "image/jpeg"
+    } else if lower.ends_with(".webp") {
+        "image/webp"
+    } else if lower.ends_with(".gif") {
+        "image/gif"
+    } else if lower.ends_with(".svg") {
+        "image/svg+xml"
+    } else {
+        "image/png"
+    }
+}
+
+fn get_extension_icon_as_base64(extension_path: &str, icon_rel_path: &str) -> Option<String> {
+    let clean_rel = icon_rel_path.trim_start_matches('/');
+    let full_path = Path::new(extension_path).join(clean_rel);
+    if let Ok(data) = fs::read(&full_path) {
+        let mime = get_mime_type(clean_rel);
+        let b64 = general_purpose::STANDARD.encode(&data);
+        Some(format!("data:{};base64,{}", mime, b64))
+    } else {
+        None
+    }
+}
+
+fn get_manifest_info(path: &str) -> Option<(String, String, Vec<String>, Option<String>)> {
     let manifest_path = Path::new(path).join("manifest.json");
     let content = fs::read_to_string(manifest_path).ok()?;
     let json: serde_json::Value = serde_json::from_str(&content).ok()?;
-    let name = json["name"].as_str().unwrap_or("Extension").to_string();
-    let description = json["description"].as_str().unwrap_or("").to_string();
+    let default_locale = json.get("default_locale").and_then(|v| v.as_str()).unwrap_or("en");
+    let name_raw = json["name"].as_str().unwrap_or("Extension").to_string();
+    let description_raw = json["description"].as_str().unwrap_or("").to_string();
+    let name = resolve_manifest_text(Path::new(path), &name_raw, default_locale);
+    let description = resolve_manifest_text(Path::new(path), &description_raw, default_locale);
     let mut permissions = Vec::new();
     if let Some(perms_arr) = json["permissions"].as_array() {
         for val in perms_arr {
@@ -14548,7 +14719,19 @@ fn get_manifest_info(path: &str) -> Option<(String, String, Vec<String>)> {
             }
         }
     }
-    Some((name, description, permissions))
+    let icon_path = pick_best_icon(
+        json.get("icons"),
+        json.get("action")
+            .or_else(|| json.get("browser_action"))
+            .and_then(|a| a.get("default_icon")),
+        path,
+    );
+    let icon_base64 = if !icon_path.is_empty() {
+        get_extension_icon_as_base64(path, &icon_path)
+    } else {
+        None
+    };
+    Some((name, description, permissions, icon_base64))
 }
 
 fn translate_permissions(permissions: &[String]) -> Vec<String> {
@@ -14704,6 +14887,12 @@ body {{
   width: 20px;
   height: 20px;
   fill: var(--accent);
+}}
+.icon-box img {{
+  width: 28px;
+  height: 28px;
+  object-fit: contain;
+  border-radius: 4px;
 }}
 .titles {{
   display: flex;
@@ -19793,7 +19982,7 @@ unsafe fn take_pwstr(value: PWSTR) -> String {
     out
 }
 
-fn extension_info(extension: &ICoreWebView2BrowserExtension) -> BrowserExtensionInfo {
+fn extension_info(extension: &ICoreWebView2BrowserExtension, known_path: Option<&str>) -> BrowserExtensionInfo {
     unsafe {
         let mut id = PWSTR::null();
         let mut name = PWSTR::null();
@@ -19809,7 +19998,8 @@ fn extension_info(extension: &ICoreWebView2BrowserExtension) -> BrowserExtension
             String::new()
         };
         let _ = extension.IsEnabled(&mut enabled);
-        let install_path = crx_install_dir(&id).to_string_lossy().to_string();
+        let install_path = resolve_extension_install_path(&id, &name, known_path)
+            .unwrap_or_else(|| crx_install_dir(&id).to_string_lossy().to_string());
         let details = if Path::new(&install_path).join("manifest.json").exists() {
             read_extension_manifest(&install_path)
         } else {
