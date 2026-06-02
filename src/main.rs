@@ -58,11 +58,13 @@ use windows::{
                 VK_F5, VK_MENU, VK_RETURN, VK_SHIFT,
             },
             WindowsAndMessaging::{
-                self, CreateIconIndirect, GetCursorPos, GetTopWindow, GetWindow, CREATESTRUCTW,
-                CW_USEDEFAULT, EC_LEFTMARGIN, EC_RIGHTMARGIN, GWLP_USERDATA, GWLP_WNDPROC,
-                GWL_STYLE, GW_HWNDNEXT, HICON, HMENU, HWND_TOP, ICONINFO, ICON_BIG, ICON_SMALL,
-                IDC_ARROW, IDC_SIZEWE, MSG, WINDOW_EX_STYLE, WINDOW_LONG_PTR_INDEX, WINDOW_STYLE,
-                WM_ACTIVATE, WM_APP, WM_CHAR, WM_CLOSE, WM_COMMAND, WM_CREATE, WM_CTLCOLORBTN,
+                self, CreateIconIndirect, GetCursorPos, GetTopWindow, GetWindow,
+                CREATESTRUCTW, CW_USEDEFAULT, EC_LEFTMARGIN, EC_RIGHTMARGIN,
+                GWLP_USERDATA, GWLP_WNDPROC, GWL_STYLE, GW_HWNDNEXT, HICON, HMENU, HWND_TOP,
+                ICONINFO, ICON_BIG, ICON_SMALL, IDC_ARROW, IDC_SIZEWE, MSG,
+                WINDOWPLACEMENT, WINDOWPLACEMENT_FLAGS, WINDOW_EX_STYLE, WINDOW_LONG_PTR_INDEX,
+                WINDOW_STYLE, WM_ACTIVATE,
+                WM_APP, WM_CHAR, WM_CLOSE, WM_COMMAND, WM_CREATE, WM_CTLCOLORBTN,
                 WM_CTLCOLOREDIT, WM_CTLCOLORSTATIC, WM_DESTROY, WM_ERASEBKGND, WM_KEYDOWN,
                 WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL,
                 WM_NCCREATE, WM_PAINT, WM_RBUTTONDOWN, WM_SETCURSOR, WM_SETFOCUS, WM_SETFONT,
@@ -1324,6 +1326,7 @@ struct App {
     drag_ghost_hwnd: Cell<Option<HWND>>,
     saved_style: isize,
     saved_rect: RECT,
+    saved_placement: Option<WINDOWPLACEMENT>,
     command_selected_index: Option<usize>,
     command_scroll_offset: usize,
     find_open: bool,
@@ -1528,6 +1531,7 @@ impl App {
             drag_ghost_hwnd: Cell::new(None),
             saved_style: 0,
             saved_rect: RECT::default(),
+            saved_placement: None,
             command_selected_index: None,
             command_scroll_offset: 0,
             find_open: false,
@@ -1604,6 +1608,11 @@ impl App {
         }
 
         app.ensure_default_bookmark_folder();
+        if let Some(placement) = app.saved_placement {
+            unsafe {
+                let _ = WindowsAndMessaging::SetWindowPlacement(app.hwnd, &placement);
+            }
+        }
         unsafe {
             let _ = WindowsAndMessaging::SetTimer(Some(app.hwnd), HOVER_DETECT_TIMER_ID, 100, None);
         }
@@ -4721,6 +4730,24 @@ impl App {
                     self.custom_keybinds
                         .push((parts[1].clone(), parts[2].clone()));
                 }
+                "window_placement" if parts.len() >= 6 => {
+                    if let (Ok(show_cmd), Ok(left), Ok(top), Ok(right), Ok(bottom)) = (
+                        parts[1].parse::<u32>(),
+                        parts[2].parse::<i32>(),
+                        parts[3].parse::<i32>(),
+                        parts[4].parse::<i32>(),
+                        parts[5].parse::<i32>(),
+                    ) {
+                        self.saved_placement = Some(WINDOWPLACEMENT {
+                            length: std::mem::size_of::<WINDOWPLACEMENT>() as u32,
+                            flags: WINDOWPLACEMENT_FLAGS(0),
+                            showCmd: show_cmd,
+                            ptMinPosition: POINT { x: 0, y: 0 },
+                            ptMaxPosition: POINT { x: -1, y: -1 },
+                            rcNormalPosition: RECT { left, top, right, bottom },
+                        });
+                    }
+                }
                 _ => {}
             }
         }
@@ -4967,6 +4994,22 @@ impl App {
                 site.last_visit_time,
                 escape_state(&site.title)
             ));
+        }
+        unsafe {
+            let mut placement = WINDOWPLACEMENT {
+                length: std::mem::size_of::<WINDOWPLACEMENT>() as u32,
+                ..Default::default()
+            };
+            if WindowsAndMessaging::GetWindowPlacement(self.hwnd, &mut placement).is_ok() {
+                lines.push(format!(
+                    "window_placement\t{}\t{}\t{}\t{}\t{}",
+                    placement.showCmd,
+                    placement.rcNormalPosition.left,
+                    placement.rcNormalPosition.top,
+                    placement.rcNormalPosition.right,
+                    placement.rcNormalPosition.bottom,
+                ));
+            }
         }
         let _ = fs::write(state_path(), lines.join("\n"));
     }
@@ -14203,7 +14246,9 @@ fn main() -> AppResult<()> {
             app.request_missing_favicons();
             app.refresh_extensions();
         });
-        let _ = WindowsAndMessaging::ShowWindow(hwnd, WindowsAndMessaging::SW_SHOW);
+        if !WindowsAndMessaging::IsWindowVisible(hwnd).as_bool() {
+            let _ = WindowsAndMessaging::ShowWindow(hwnd, WindowsAndMessaging::SW_SHOW);
+        }
         let _ = Gdi::UpdateWindow(hwnd);
     }
 
@@ -16473,6 +16518,7 @@ extern "system" fn window_proc(hwnd: HWND, msg: u32, w_param: WPARAM, l_param: L
         },
         WM_CLOSE => {
             unsafe {
+                with_app(hwnd, |app| app.save_state());
                 let _ = WindowsAndMessaging::DestroyWindow(hwnd);
             }
             LRESULT(0)
