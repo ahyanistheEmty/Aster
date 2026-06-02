@@ -2052,7 +2052,9 @@ impl App {
             return;
         }
         let url = extension_page_url(&ext.id, open_path);
-        if let Ok(hwnd) = create_extension_popup_window(self.hwnd, anchor) {
+        if let Ok(hwnd) =
+            create_extension_popup_window(self.hwnd, anchor, self.topbar_pushed_height())
+        {
             if let Ok(controller) = create_webview_controller(&self.environment, hwnd) {
                 unsafe {
                     let _ = controller.SetBounds(client_rect(hwnd));
@@ -2069,6 +2071,7 @@ impl App {
                 self.extension_popup_hwnd = hwnd;
                 self.extension_popup_controller = Some(controller);
                 self.extension_popup_anchor = Some(anchor);
+                self.layout_extension_popup_chrome();
             }
         }
         self.refresh();
@@ -2191,8 +2194,9 @@ impl App {
         let anchor = self
             .extension_popup_anchor
             .unwrap_or_else(|| self.extension_button_rect());
-        let size = extension_popup_size_for_content(self.hwnd, width, height);
-        let (x, y) = extension_popup_position(self.hwnd, anchor, size.0, size.1);
+        let pushed_top = self.topbar_pushed_height();
+        let size = extension_popup_size_for_content(self.hwnd, pushed_top, width, height);
+        let (x, y) = extension_popup_position(self.hwnd, anchor, pushed_top, size.0, size.1);
         unsafe {
             let _ = WindowsAndMessaging::SetWindowPos(
                 self.extension_popup_hwnd,
@@ -2205,6 +2209,68 @@ impl App {
             );
             if let Some(controller) = &self.extension_popup_controller {
                 let _ = controller.SetBounds(client_rect(self.extension_popup_hwnd));
+            }
+            self.apply_extension_popup_chrome_clip(size.0, size.1);
+        }
+    }
+
+    fn layout_extension_popup_chrome(&self) {
+        if self.extension_popup_hwnd == HWND(std::ptr::null_mut()) {
+            return;
+        }
+        let mut popup_rect = RECT::default();
+        unsafe {
+            if WindowsAndMessaging::GetWindowRect(self.extension_popup_hwnd, &mut popup_rect)
+                .is_err()
+            {
+                return;
+            }
+        }
+        let width = (popup_rect.right - popup_rect.left).max(1);
+        let height = (popup_rect.bottom - popup_rect.top).max(1);
+        let anchor = self
+            .extension_popup_anchor
+            .unwrap_or_else(|| self.extension_button_rect());
+        let pushed_top = self.topbar_pushed_height();
+        let (x, y) = extension_popup_position(self.hwnd, anchor, pushed_top, width, height);
+        unsafe {
+            let _ = WindowsAndMessaging::SetWindowPos(
+                self.extension_popup_hwnd,
+                Some(HWND_TOP),
+                x,
+                y,
+                width,
+                height,
+                WindowsAndMessaging::SWP_NOACTIVATE | WindowsAndMessaging::SWP_NOSIZE,
+            );
+            self.apply_extension_popup_chrome_clip(width, height);
+        }
+    }
+
+    fn apply_extension_popup_chrome_clip(&self, popup_w: i32, popup_h: i32) {
+        if self.extension_popup_hwnd == HWND(std::ptr::null_mut()) {
+            return;
+        }
+        let mut parent_rect = RECT::default();
+        let mut popup_rect = RECT::default();
+        unsafe {
+            if WindowsAndMessaging::GetWindowRect(self.hwnd, &mut parent_rect).is_err()
+                || WindowsAndMessaging::GetWindowRect(self.extension_popup_hwnd, &mut popup_rect)
+                    .is_err()
+            {
+                return;
+            }
+        }
+        let topbar_bottom = parent_rect.top + self.topbar_height.ceil() as i32;
+        let sidebar_right = parent_rect.left + self.sidebar_width();
+        let clip_top = (topbar_bottom - popup_rect.top).clamp(0, popup_h.saturating_sub(1));
+        let clip_left = (sidebar_right - popup_rect.left).clamp(0, popup_w.saturating_sub(1));
+        unsafe {
+            if clip_top > 0 || clip_left > 0 {
+                let region = CreateRectRgn(clip_left, clip_top, popup_w, popup_h);
+                let _ = SetWindowRgn(self.extension_popup_hwnd, Some(region), true);
+            } else {
+                let _ = SetWindowRgn(self.extension_popup_hwnd, None, true);
             }
         }
     }
@@ -8368,6 +8434,8 @@ impl App {
                 );
             }
         }
+        self.layout_extension_popup_chrome();
+        self.raise_native_chrome_windows();
         unsafe {
             if self.download_popup_hwnd != HWND(std::ptr::null_mut()) && self.sidebar_width < 1.0 {
                 if let Some(toast) = &self.download_toast {
@@ -8394,6 +8462,78 @@ impl App {
             self.last_bounds_rect.set(bounds);
         }
         self.position_rename_edit();
+    }
+
+    fn raise_native_chrome_windows(&self) {
+        unsafe {
+            let flags = WindowsAndMessaging::SWP_NOMOVE
+                | WindowsAndMessaging::SWP_NOSIZE
+                | WindowsAndMessaging::SWP_NOACTIVATE;
+            if self.overlay_menu.is_some() {
+                let _ = WindowsAndMessaging::SetWindowPos(
+                    self.overlay_menu_hwnd,
+                    Some(HWND_TOP),
+                    0,
+                    0,
+                    0,
+                    0,
+                    flags,
+                );
+            }
+            if self.command_open && !self.fullscreen {
+                let _ = WindowsAndMessaging::SetWindowPos(
+                    self.command_hwnd,
+                    Some(HWND_TOP),
+                    0,
+                    0,
+                    0,
+                    0,
+                    flags,
+                );
+                let _ = WindowsAndMessaging::SetWindowPos(
+                    self.address_hwnd,
+                    Some(HWND_TOP),
+                    0,
+                    0,
+                    0,
+                    0,
+                    flags,
+                );
+            }
+            if self.find_open && !self.fullscreen {
+                let _ = WindowsAndMessaging::SetWindowPos(
+                    self.find_hwnd,
+                    Some(HWND_TOP),
+                    0,
+                    0,
+                    0,
+                    0,
+                    flags,
+                );
+            }
+            if self.download_popup_hwnd != HWND(std::ptr::null_mut()) {
+                let _ = WindowsAndMessaging::SetWindowPos(
+                    self.download_popup_hwnd,
+                    Some(HWND_TOP),
+                    0,
+                    0,
+                    0,
+                    0,
+                    flags,
+                );
+            }
+            if self.bookmark_popup_hwnd != HWND(std::ptr::null_mut()) {
+                let _ = WindowsAndMessaging::SetWindowPos(
+                    self.bookmark_popup_hwnd,
+                    Some(HWND_TOP),
+                    0,
+                    0,
+                    0,
+                    0,
+                    flags,
+                );
+            }
+        }
     }
 
     fn paint(&self, hdc: HDC) {
@@ -11317,6 +11457,7 @@ impl App {
         target: MenuTarget,
         items: Vec<OverlayMenuItem>,
     ) {
+        self.close_extension_popup();
         if target.keeps_topbar_expanded() && !self.fullscreen {
             if self.topbar_mode != SidebarMode::Pushed
                 && self.topbar_expand_mode != SidebarMode::Pushed
@@ -11369,6 +11510,7 @@ impl App {
             let _ = InvalidateRect(Some(self.overlay_menu_hwnd), None, false);
             let _ = SetFocus(Some(self.overlay_menu_hwnd));
         }
+        self.raise_native_chrome_windows();
         self.refresh();
     }
 
@@ -12630,15 +12772,22 @@ impl App {
     }
 
     fn set_sidebar_mode(&mut self, mode: SidebarMode) {
+        let target = match mode {
+            SidebarMode::Hidden => SIDEBAR_HIDDEN,
+            SidebarMode::Overlay | SidebarMode::Pushed => SIDEBAR_EXPANDED,
+        };
+        if (self.sidebar_target - target).abs() < 0.5
+            && self.sidebar_expand_mode == mode
+            && (self.animating_sidebar || self.sidebar_mode == mode)
+        {
+            return;
+        }
         if mode != SidebarMode::Hidden {
             if let Some(toast) = &mut self.download_toast {
                 toast.fading = true;
             }
         }
-        self.sidebar_target = match mode {
-            SidebarMode::Hidden => SIDEBAR_HIDDEN,
-            SidebarMode::Overlay | SidebarMode::Pushed => SIDEBAR_EXPANDED,
-        };
+        self.sidebar_target = target;
         self.animating_sidebar = true;
         unsafe {
             if mode != SidebarMode::Hidden && self.topbar_mode != SidebarMode::Hidden {
@@ -12649,10 +12798,17 @@ impl App {
     }
 
     fn set_topbar_mode(&mut self, mode: SidebarMode) {
-        self.topbar_target = match mode {
+        let target = match mode {
             SidebarMode::Hidden => TOPBAR_HIDDEN,
             SidebarMode::Overlay | SidebarMode::Pushed => TOPBAR_EXPANDED,
         };
+        if (self.topbar_target - target).abs() < 0.5
+            && self.topbar_expand_mode == mode
+            && (self.animating_topbar || self.topbar_mode == mode)
+        {
+            return;
+        }
+        self.topbar_target = target;
         self.animating_topbar = true;
         unsafe {
             if mode != SidebarMode::Hidden && self.sidebar_mode != SidebarMode::Hidden {
@@ -12704,10 +12860,6 @@ impl App {
                 let _ = InvalidateRect(Some(self.hwnd), None, false);
             }
         }
-        self.layout();
-        unsafe {
-            let _ = InvalidateRect(Some(self.hwnd), None, false);
-        }
     }
 
     fn tick_topbar_animation(&mut self) {
@@ -12754,6 +12906,7 @@ impl App {
 
     fn clear_webview_clipping(&self) {
         self.last_clip_width.set(0.0);
+        self.last_clip_top.set(0.0);
         for tab in &self.tabs {
             unsafe {
                 let _ = SetWindowRgn(tab.child_hwnd, None, false);
@@ -13372,9 +13525,9 @@ fn create_bookmark_popup(parent: HWND) -> AppResult<HWND> {
     }
 }
 
-fn create_extension_popup_window(parent: HWND, btn_rect: RECT) -> AppResult<HWND> {
-    let (popup_w, popup_h) = extension_popup_size_for_content(parent, 380, 480);
-    let (x, y) = extension_popup_position(parent, btn_rect, popup_w, popup_h);
+fn create_extension_popup_window(parent: HWND, btn_rect: RECT, pushed_top: i32) -> AppResult<HWND> {
+    let (popup_w, popup_h) = extension_popup_size_for_content(parent, pushed_top, 420, 560);
+    let (x, y) = extension_popup_position(parent, btn_rect, pushed_top, popup_w, popup_h);
     unsafe {
         let hwnd = WindowsAndMessaging::CreateWindowExW(
             WINDOW_EX_STYLE(0x00000080 /* WS_EX_TOOLWINDOW */),
@@ -13400,18 +13553,24 @@ fn create_extension_popup_window(parent: HWND, btn_rect: RECT) -> AppResult<HWND
     }
 }
 
-fn extension_popup_size_for_content(parent: HWND, content_w: i32, content_h: i32) -> (i32, i32) {
+fn extension_popup_size_for_content(
+    parent: HWND,
+    pushed_top: i32,
+    content_w: i32,
+    content_h: i32,
+) -> (i32, i32) {
     let client = client_rect(parent);
-    let max_w = (client.right - client.left - 24).max(160);
-    let max_h = (client.bottom - client.top - 24).max(120);
-    let width = content_w.clamp(160, max_w);
-    let height = content_h.clamp(120, max_h);
+    let max_w = (client.right - client.left - 16).max(240);
+    let max_h = (client.bottom - client.top - pushed_top - 16).max(180);
+    let width = content_w.clamp(240, max_w);
+    let height = content_h.clamp(180, max_h);
     (width, height)
 }
 
 fn extension_popup_position(
     parent: HWND,
     _btn_rect: RECT,
+    pushed_top: i32,
     popup_w: i32,
     popup_h: i32,
 ) -> (i32, i32) {
@@ -13429,10 +13588,10 @@ fn extension_popup_position(
         let _ = Gdi::ClientToScreen(parent, &mut client_bottom_right);
         let min_x = client_top_left.x + 8;
         let max_x = (client_bottom_right.x - popup_w - 8).max(min_x);
-        let min_y = client_top_left.y + 8;
+        let min_y = client_top_left.y + pushed_top + 8;
         let max_y = (client_bottom_right.y - popup_h - 8).max(min_y);
-        let x = (client_top_left.x + 12).clamp(min_x, max_x);
-        let y = (client_top_left.y + 12).clamp(min_y, max_y);
+        let x = max_x;
+        let y = min_y.clamp(min_y, max_y);
         (x, y)
     }
 }
@@ -13543,6 +13702,32 @@ unsafe extern "system" fn overlay_menu_proc(
         WindowsAndMessaging::WM_KILLFOCUS => {
             if let Ok(parent) = WindowsAndMessaging::GetParent(hwnd) {
                 with_app(parent, |app| {
+                    let keep_open = app
+                        .overlay_menu
+                        .as_ref()
+                        .map(|menu| {
+                            if !menu.target.keeps_topbar_expanded() {
+                                return false;
+                            }
+                            let mut pt = POINT::default();
+                            if GetCursorPos(&mut pt).is_err()
+                                || !ScreenToClient(parent, &mut pt).as_bool()
+                            {
+                                return false;
+                            }
+                            let topbar_rect = RECT {
+                                left: 0,
+                                top: app.topbar_y(),
+                                right: client_rect(parent).right,
+                                bottom: app.topbar_y() + TOPBAR_HEIGHT,
+                            };
+                            point_in_rect(pt.x, pt.y, menu.rect)
+                                || point_in_rect(pt.x, pt.y, topbar_rect)
+                        })
+                        .unwrap_or(false);
+                    if keep_open {
+                        return;
+                    }
                     app.overlay_menu = None;
                     let _ = WindowsAndMessaging::ShowWindow(
                         app.overlay_menu_hwnd,
