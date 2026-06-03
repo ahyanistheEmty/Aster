@@ -7,7 +7,7 @@ use std::{
     path::{Path, PathBuf},
     process::Command,
     ptr,
-    sync::mpsc,
+    sync::{mpsc, OnceLock},
 };
 
 use aes_gcm::{
@@ -84,7 +84,6 @@ const DOWNLOAD_POPUP_ID: i32 = 1003;
 const FIND_ID: i32 = 1004;
 const BOOKMARK_POPUP_ID: i32 = 1005;
 const DEFAULT_URL: &str = "https://www.google.com";
-const SIDEBAR_EXPANDED: f32 = 248.0;
 const SIDEBAR_HIDDEN: f32 = 0.0;
 const TOPBAR_EXPANDED: f32 = 58.0;
 const TOPBAR_HIDDEN: f32 = 0.0;
@@ -483,17 +482,6 @@ const MENU_EXTENSION_ITEM_BASE: usize = 4110;
 const MENU_WIDTH: i32 = 270;
 const MENU_ROW_HEIGHT: i32 = 34;
 const CHROME_WEB_STORE_URL: &str = "https://chromewebstore.google.com/";
-
-const COLOR_BLACK: u32 = 0x000000;
-const COLOR_PANEL: u32 = 0x090909;
-const COLOR_PANEL_2: u32 = 0x121212;
-const COLOR_SURFACE_HOVER: u32 = 0x242424;
-const COLOR_BORDER: u32 = 0x343434;
-const COLOR_TEXT: u32 = 0xf5f5f5;
-const COLOR_MUTED: u32 = 0xa1a1a1;
-const COLOR_ACCENT: u32 = 0xf16f63;
-#[allow(dead_code)]
-const COLOR_SELECTION: u32 = 0xf16f63; // Signature Accent Color (#636ff1)
 const ASTER_BACKGROUND_SVG: &str = include_str!("../assets/aster-background.svg");
 
 static mut OLD_ADDRESS_PROC: WNDPROC = None;
@@ -511,6 +499,183 @@ static mut OLD_DRAG_GHOST_PROC: WNDPROC = None;
 static mut CURRENT_DRAG_GHOST_BITMAP: Option<HBITMAP> = None;
 
 type AppResult<T> = std::result::Result<T, AppError>;
+
+static CONFIG: OnceLock<Config> = OnceLock::new();
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+struct Config {
+    max_visited_sites: usize,
+    max_history_entries: usize,
+    max_closed_tabs: usize,
+    sidebar_width: f32,
+    animation_duration: u64,
+    colors: UiColors,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+struct UiColors {
+    window_background: u32,
+    panel_background: u32,
+    panel_accent: u32,
+    surface_hover: u32,
+    border: u32,
+    text: u32,
+    muted: u32,
+    accent: u32,
+    selection: u32,
+}
+
+impl Default for UiColors {
+    fn default() -> Self {
+        Self {
+            window_background: 0x000000,
+            panel_background: 0x090909,
+            panel_accent: 0x121212,
+            surface_hover: 0x242424,
+            border: 0x343434,
+            text: 0xf5f5f5,
+            muted: 0xa1a1a1,
+            accent: 0xf16f63,
+            selection: 0xf16f63,
+        }
+    }
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            max_visited_sites: 500,
+            max_history_entries: 80,
+            max_closed_tabs: 100,
+            sidebar_width: 248.0,
+            animation_duration: 180,
+            colors: UiColors::default(),
+        }
+    }
+}
+
+trait ColorValue {
+    fn resolve(self) -> u32;
+}
+
+impl ColorValue for u32 {
+    fn resolve(self) -> u32 {
+        self
+    }
+}
+
+impl ColorValue for fn() -> u32 {
+    fn resolve(self) -> u32 {
+        self()
+    }
+}
+
+fn resolve_color<C: ColorValue>(color: C) -> u32 {
+    color.resolve()
+}
+
+fn config_path() -> PathBuf {
+    if let Some(appdata) = std::env::var_os("APPDATA") {
+        PathBuf::from(appdata).join("Aster").join("config.toml")
+    } else if let Some(home) = std::env::var_os("HOME") {
+        PathBuf::from(home)
+            .join(".config")
+            .join("Aster")
+            .join("config.toml")
+    } else {
+        PathBuf::from("config.toml")
+    }
+}
+
+fn load_or_create_config() -> &'static Config {
+    CONFIG.get_or_init(load_config)
+}
+
+fn load_config() -> Config {
+    let path = config_path();
+    match fs::read_to_string(&path) {
+        Ok(raw) => match toml::from_str::<Config>(&raw) {
+            Ok(config) => config,
+            Err(_) => {
+                let config = Config::default();
+                let _ = write_config(&path, &config);
+                config
+            }
+        },
+        Err(_) => {
+            let config = Config::default();
+            let _ = write_config(&path, &config);
+            config
+        }
+    }
+}
+
+fn write_config(path: &Path, config: &Config) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let text = toml::to_string_pretty(config)
+        .or_else(|_| toml::to_string(config))
+        .unwrap_or_default();
+    fs::write(path, text)
+}
+
+fn sidebar_expanded() -> f32 {
+    load_or_create_config().sidebar_width
+}
+
+fn animation_duration() -> u64 {
+    load_or_create_config().animation_duration
+}
+
+fn color_window_background() -> u32 {
+    load_or_create_config().colors.window_background
+}
+
+fn color_panel_background() -> u32 {
+    load_or_create_config().colors.panel_background
+}
+
+fn color_panel_accent() -> u32 {
+    load_or_create_config().colors.panel_accent
+}
+
+fn color_surface_hover() -> u32 {
+    load_or_create_config().colors.surface_hover
+}
+
+fn color_border() -> u32 {
+    load_or_create_config().colors.border
+}
+
+fn color_text() -> u32 {
+    load_or_create_config().colors.text
+}
+
+fn color_muted() -> u32 {
+    load_or_create_config().colors.muted
+}
+
+fn color_accent() -> u32 {
+    load_or_create_config().colors.accent
+}
+
+fn color_selection() -> u32 {
+    load_or_create_config().colors.selection
+}
+
+const COLOR_BLACK: fn() -> u32 = color_window_background;
+const COLOR_PANEL: fn() -> u32 = color_panel_background;
+const COLOR_PANEL_2: fn() -> u32 = color_panel_accent;
+const COLOR_SURFACE_HOVER: fn() -> u32 = color_surface_hover;
+const COLOR_BORDER: fn() -> u32 = color_border;
+const COLOR_TEXT: fn() -> u32 = color_text;
+const COLOR_MUTED: fn() -> u32 = color_muted;
+const COLOR_ACCENT: fn() -> u32 = color_accent;
+#[allow(dead_code)]
+const COLOR_SELECTION: fn() -> u32 = color_selection;
 
 #[derive(Debug)]
 enum AppError {
@@ -1409,9 +1574,9 @@ impl App {
         let brushes = UiBrushes {
             black: solid_brush(COLOR_BLACK),
             panel: solid_brush(COLOR_PANEL),
-            secondary: solid_brush(COLOR_PANEL),
+            secondary: solid_brush(COLOR_PANEL_2),
             panel_2: solid_brush(COLOR_PANEL_2),
-            edit: solid_brush(0x080808),
+            edit: solid_brush(mix_color(COLOR_PANEL, COLOR_BLACK, 0.12)),
             hover: solid_brush(COLOR_SURFACE_HOVER),
         };
 
@@ -1502,9 +1667,9 @@ impl App {
                 right: -1,
                 bottom: -1,
             }),
-            dominant_color: COLOR_BLACK,
-            secondary_color: COLOR_PANEL,
-            accent_color: COLOR_ACCENT,
+            dominant_color: resolve_color(COLOR_BLACK),
+            secondary_color: resolve_color(COLOR_PANEL),
+            accent_color: resolve_color(COLOR_ACCENT),
             custom_keybinds: Vec::new(),
             site_mode: SiteMode::Auto,
             history_sort_mode: HistorySortMode::Latest,
@@ -5461,7 +5626,7 @@ impl App {
         if self.downloads.len() == 4 && old_count == 3 {
             self.download_collapse_anim = Some(DownloadCollapseAnim {
                 start_time: std::time::Instant::now(),
-                duration: 180,
+                duration: animation_duration(),
             });
         }
         if self.sidebar_width() <= 92 {
@@ -5574,7 +5739,7 @@ impl App {
     fn tick_download_toast(&mut self) {
         if let Some(toast) = &mut self.download_toast {
             if toast.fading {
-                if self.sidebar_width >= SIDEBAR_EXPANDED {
+                if self.sidebar_width >= sidebar_expanded() {
                     if self.download_popup_hwnd != HWND(std::ptr::null_mut()) {
                         unsafe {
                             let _ = WindowsAndMessaging::ShowWindow(
@@ -6016,7 +6181,7 @@ impl App {
                     if old_count >= 1 && old_count <= 4 {
                         self.download_removal_anim = Some(DownloadRemovalAnim {
                             start_time: std::time::Instant::now(),
-                            duration: 180,
+                            duration: animation_duration(),
                             removed_id: id,
                             removed_index: idx,
                             old_count,
@@ -6135,8 +6300,9 @@ impl App {
                         url: tab.url.clone(),
                     });
                     tab.history_cursor = tab.history.len().saturating_sub(1);
-                    if tab.history.len() > 80 {
-                        let drain = tab.history.len() - 80;
+                    let max_history_entries = load_or_create_config().max_history_entries;
+                    if tab.history.len() > max_history_entries {
+                        let drain = tab.history.len() - max_history_entries;
                         tab.history.drain(0..drain);
                         tab.history_cursor = tab.history_cursor.saturating_sub(drain);
                     }
@@ -6328,9 +6494,11 @@ impl App {
                 last_visit_time: now,
             });
         }
-        if self.visited_sites.len() > 500 {
+        let max_visited_sites = load_or_create_config().max_visited_sites;
+        if self.visited_sites.len() > max_visited_sites {
             self.visited_sites.sort_by_key(|s| s.last_visit_time);
-            self.visited_sites.remove(0);
+            let drain = self.visited_sites.len() - max_visited_sites;
+            self.visited_sites.drain(0..drain);
         }
     }
 
@@ -6460,7 +6628,7 @@ impl App {
                 workspace_id: tab.workspace_id,
                 folder_id: tab.folder_id,
             });
-            if self.closed_tabs.len() > 100 {
+            if self.closed_tabs.len() > load_or_create_config().max_closed_tabs {
                 self.closed_tabs.remove(0);
             }
         }
@@ -8804,7 +8972,7 @@ impl App {
         } else {
             match self.sidebar_mode {
                 SidebarMode::Hidden => {
-                    if self.sidebar_target >= SIDEBAR_EXPANDED {
+                    if self.sidebar_target >= sidebar_expanded() {
                         match self.sidebar_expand_mode {
                             SidebarMode::Overlay => RECT {
                                 left: 0,
@@ -9236,7 +9404,7 @@ impl App {
             && (self.sidebar_mode == SidebarMode::Overlay
                 || (self.sidebar_mode == SidebarMode::Hidden
                     && self.sidebar_expand_mode == SidebarMode::Overlay
-                    && self.sidebar_target >= SIDEBAR_EXPANDED)
+                    && self.sidebar_target >= sidebar_expanded())
                 || self.topbar_mode == SidebarMode::Overlay
                 || (self.topbar_mode == SidebarMode::Hidden
                     && self.topbar_expand_mode == SidebarMode::Overlay
@@ -9811,7 +9979,11 @@ impl App {
             {
                 let cx = (close_btn.left + close_btn.right) / 2;
                 let cy = (close_btn.top + close_btn.bottom) / 2;
-                let color = if close_hover { 0xffffff } else { COLOR_TEXT };
+                let color = if close_hover {
+                    0xffffff
+                } else {
+                    resolve_color(COLOR_TEXT)
+                };
                 for i in -4..=4 {
                     fill_rect(
                         hdc,
@@ -10114,7 +10286,7 @@ impl App {
                         if is_close_hovered {
                             0xffffff
                         } else {
-                            COLOR_MUTED
+                            resolve_color(COLOR_MUTED)
                         },
                     );
 
@@ -10810,7 +10982,7 @@ impl App {
             return;
         }
         let alpha = if toast.fading {
-            let fade_progress = (self.sidebar_width / SIDEBAR_EXPANDED).clamp(0.0, 1.0);
+            let fade_progress = (self.sidebar_width / sidebar_expanded()).clamp(0.0, 1.0);
             (1.0 - fade_progress).clamp(0.0, 1.0)
         } else {
             1.0
@@ -11369,7 +11541,11 @@ impl App {
                 right: rect.right - 2,
                 bottom: rect.bottom - 2,
             };
-            let icon_color = if is_ghost { 0x555555 } else { COLOR_MUTED };
+            let icon_color = if is_ghost {
+                0x555555
+            } else {
+                resolve_color(COLOR_MUTED)
+            };
             if is_ghost {
                 fill_round_rect(hdc, item, 0x0f0f0f, 8);
                 draw_outline(hdc, item, 0x333333, 8);
@@ -11737,9 +11913,9 @@ impl App {
             let text_color = if is_ghost {
                 0x555555
             } else if Some(index) == self.active_tab_index() {
-                COLOR_TEXT
+                resolve_color(COLOR_TEXT)
             } else {
-                COLOR_MUTED
+                resolve_color(COLOR_MUTED)
             };
             draw_text(
                 hdc,
@@ -11983,6 +12159,7 @@ impl App {
             return;
         }
 
+        if self.show_default_bubble && self.sidebar_width() >= sidebar_expanded() as i32 - 8 {
         if self.show_default_bubble && !self.settings_open && self.sidebar_width() >= 240 {
             if let Some(close_rect) = self.default_bubble_close_rect() {
                 if point_in_rect(x, y, close_rect) {
@@ -12052,7 +12229,7 @@ impl App {
         }
 
         if self.sidebar_mode == SidebarMode::Overlay
-            && self.sidebar_width > SIDEBAR_EXPANDED * 0.5
+            && self.sidebar_width > sidebar_expanded() * 0.5
             && (x as f32) >= self.sidebar_width
         {
             self.settings_open = false;
@@ -13253,6 +13430,7 @@ impl App {
             self.hover_folder = None;
         }
 
+        if self.show_default_bubble && self.sidebar_width() >= sidebar_expanded() as i32 - 8 {
         if self.show_default_bubble && !self.settings_open && self.sidebar_width() >= 240 {
             if let Some(bubble_rect) = self.default_bubble_rect() {
                 if point_in_rect(x, y, bubble_rect) {
@@ -13876,7 +14054,10 @@ impl App {
                 toast.fading = true;
             }
         }
-        self.sidebar_target = target;
+        self.sidebar_target = match mode {
+            SidebarMode::Hidden => SIDEBAR_HIDDEN,
+            SidebarMode::Overlay | SidebarMode::Pushed => sidebar_expanded(),
+        };
         self.animating_sidebar = true;
         unsafe {
             if mode != SidebarMode::Hidden && self.topbar_mode != SidebarMode::Hidden {
@@ -13923,7 +14104,7 @@ impl App {
                 self.settings_open = false;
                 self.clear_webview_clipping();
                 self.ensure_hover_detect_timer();
-            } else if self.sidebar_target >= SIDEBAR_EXPANDED {
+            } else if self.sidebar_target >= sidebar_expanded() {
                 self.sidebar_mode = self.sidebar_expand_mode;
                 if self.sidebar_mode == SidebarMode::Overlay {
                     self.clear_webview_clipping();
@@ -14196,6 +14377,7 @@ fn main() -> AppResult<()> {
     unsafe {
         CoInitializeEx(None, COINIT_APARTMENTTHREADED).ok()?;
     }
+    let _ = load_or_create_config();
 
     unsafe {
         if let Ok(existing_hwnd) = WindowsAndMessaging::FindWindowW(CLASS_NAME, None) {
@@ -14438,14 +14620,14 @@ fn enable_dark_titlebar(hwnd: HWND) {
             &enabled as *const _ as *const _,
             mem::size_of_val(&enabled) as u32,
         );
-        let caption = COLOR_PANEL;
+        let caption = resolve_color(COLOR_PANEL);
         let _ = DwmSetWindowAttribute(
             hwnd,
             DWMWA_CAPTION_COLOR,
             &caption as *const _ as *const _,
             mem::size_of_val(&caption) as u32,
         );
-        let text = COLOR_TEXT;
+        let text = resolve_color(COLOR_TEXT);
         let _ = DwmSetWindowAttribute(
             hwnd,
             DWMWA_TEXT_COLOR,
@@ -14462,7 +14644,7 @@ fn create_address_bar(parent: HWND) -> AppResult<HWND> {
             w!("EDIT"),
             w!(""),
             WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0),
-            SIDEBAR_EXPANDED as i32 + 168,
+            sidebar_expanded() as i32 + 168,
             20,
             680,
             22,
@@ -16503,7 +16685,7 @@ extern "system" fn window_proc(hwnd: HWND, msg: u32, w_param: WPARAM, l_param: L
         }
         WM_CTLCOLORSTATIC | WM_CTLCOLOREDIT | WM_CTLCOLORBTN => unsafe {
             let hdc = HDC(w_param.0 as *mut _);
-            let _ = SetTextColor(hdc, COLORREF(COLOR_TEXT));
+            let _ = SetTextColor(hdc, COLORREF(resolve_color(COLOR_TEXT)));
             let _ = SetBkMode(hdc, TRANSPARENT);
             let brush = with_app_return(hwnd, |app| app.brushes.edit)
                 .unwrap_or_else(|| solid_brush(0x151515));
@@ -16812,7 +16994,7 @@ fn draw_logo(hdc: HDC, rect: RECT, hovered: bool) {
         let color = if hovered {
             mix_color(COLOR_ACCENT, COLOR_TEXT, 0.22)
         } else {
-            COLOR_ACCENT
+            resolve_color(COLOR_ACCENT)
         };
         draw_aster_mark(hdc, rect, color);
     }
@@ -16831,7 +17013,7 @@ fn draw_settings_button(hdc: HDC, rect: RECT, hovered: bool) {
             let mut c = cache.borrow_mut();
             let brush = *c
                 .brushes
-                .entry(COLOR_MUTED)
+                .entry(resolve_color(COLOR_MUTED))
                 .or_insert_with(|| solid_brush(COLOR_MUTED));
             let old_brush = SelectObject(hdc, HGDIOBJ(brush.0));
             let old_pen = SelectObject(hdc, GetStockObject(NULL_PEN));
@@ -17002,8 +17184,9 @@ unsafe fn draw_download_popup_gdi(hdc: HDC, rect: RECT, elapsed_ms: u64) {
 }
 
 unsafe fn draw_bookmark_popup_gdi(hdc: HDC, rect: RECT, elapsed_ms: u64, is_unbookmark: bool) {
-    let slide = if elapsed_ms < 180 {
-        1.0 - (elapsed_ms as f32 / 180.0)
+    let duration = animation_duration().max(1) as u64;
+    let slide = if elapsed_ms < duration {
+        1.0 - (elapsed_ms as f32 / duration as f32)
     } else {
         0.0
     };
@@ -17153,7 +17336,7 @@ fn render_download_indicator_pixels(
     let bg = if hovered {
         mix_color(COLOR_PANEL_2, COLOR_SURFACE_HOVER, 0.76)
     } else {
-        COLOR_PANEL_2
+        resolve_color(COLOR_PANEL_2)
     };
     let morph_amount = if cancelled {
         morph.clamp(0.0, 1.0)
@@ -17189,7 +17372,7 @@ fn render_download_indicator_pixels(
             radius - 0.7,
             1.8,
             progress.clamp(0.0, 1.0),
-            COLOR_ACCENT,
+            resolve_color(COLOR_ACCENT),
             1.0,
             0.0,
         );
@@ -17396,7 +17579,7 @@ fn draw_aa_arc(
     draw_aa_dot(pixels, size, end_x, end_y, half, color, alpha);
 }
 
-fn draw_aa_line(
+fn draw_aa_line<C: ColorValue>(
     pixels: &mut [u8],
     size: i32,
     x1: f32,
@@ -17404,9 +17587,10 @@ fn draw_aa_line(
     x2: f32,
     y2: f32,
     stroke: f32,
-    color: u32,
+    color: C,
     alpha: f32,
 ) {
+    let color = resolve_color(color);
     let min_x = (x1.min(x2) - stroke).floor().max(0.0) as i32;
     let max_x = (x1.max(x2) + stroke).ceil().min((size - 1) as f32) as i32;
     let min_y = (y1.min(y2) - stroke).floor().max(0.0) as i32;
@@ -17498,7 +17682,7 @@ impl IconKind {
     }
 }
 
-unsafe fn draw_aster_mark(hdc: HDC, rect: RECT, color: u32) {
+unsafe fn draw_aster_mark<C: ColorValue>(hdc: HDC, rect: RECT, color: C) {
     let cx = (rect.left + rect.right) / 2;
     let cy = (rect.top + rect.bottom) / 2;
     let radius = ((rect.right - rect.left).min(rect.bottom - rect.top) / 2) - 7;
@@ -17514,20 +17698,21 @@ unsafe fn draw_aster_mark(hdc: HDC, rect: RECT, color: u32) {
     });
 }
 
-unsafe fn with_pen<F>(hdc: HDC, color: u32, width: i32, f: F)
+unsafe fn with_pen<C: ColorValue, F>(hdc: HDC, color: C, width: i32, f: F)
 where
     F: FnOnce(),
 {
-    let pen = CreatePen(Gdi::PS_SOLID, width, COLORREF(color));
+    let pen = CreatePen(Gdi::PS_SOLID, width, COLORREF(resolve_color(color)));
     let old_pen = SelectObject(hdc, HGDIOBJ(pen.0));
     f();
     let _ = SelectObject(hdc, old_pen);
     let _ = DeleteObject(HGDIOBJ(pen.0));
 }
 
-unsafe fn fill_round_rect(hdc: HDC, rect: RECT, color: u32, radius: i32) {
+unsafe fn fill_round_rect<C: ColorValue>(hdc: HDC, rect: RECT, color: C, radius: i32) {
     BRUSH_CACHE.with(|cache| {
         let mut c = cache.borrow_mut();
+        let color = resolve_color(color);
         let brush = *c.brushes.entry(color).or_insert_with(|| solid_brush(color));
         let old_brush = SelectObject(hdc, HGDIOBJ(brush.0));
         let old_pen = SelectObject(hdc, GetStockObject(NULL_PEN));
@@ -17545,16 +17730,17 @@ unsafe fn fill_round_rect(hdc: HDC, rect: RECT, color: u32, radius: i32) {
     });
 }
 
-unsafe fn fill_rect(hdc: HDC, rect: RECT, color: u32) {
+unsafe fn fill_rect<C: ColorValue>(hdc: HDC, rect: RECT, color: C) {
     BRUSH_CACHE.with(|cache| {
         let mut c = cache.borrow_mut();
+        let color = resolve_color(color);
         let brush = *c.brushes.entry(color).or_insert_with(|| solid_brush(color));
         let _ = FillRect(hdc, &rect, brush);
     });
 }
 
-unsafe fn draw_outline(hdc: HDC, rect: RECT, color: u32, radius: i32) {
-    let pen = CreatePen(Gdi::PS_SOLID, 1, COLORREF(color));
+unsafe fn draw_outline<C: ColorValue>(hdc: HDC, rect: RECT, color: C, radius: i32) {
+    let pen = CreatePen(Gdi::PS_SOLID, 1, COLORREF(resolve_color(color)));
     let old_pen = SelectObject(hdc, HGDIOBJ(pen.0));
     let old_brush = SelectObject(hdc, GetStockObject(NULL_BRUSH));
     let _ = RoundRect(
@@ -17571,10 +17757,10 @@ unsafe fn draw_outline(hdc: HDC, rect: RECT, color: u32, radius: i32) {
     let _ = DeleteObject(HGDIOBJ(pen.0));
 }
 
-unsafe fn draw_text(hdc: HDC, font: &HFONT, text: &str, mut rect: RECT, color: u32) {
+unsafe fn draw_text<C: ColorValue>(hdc: HDC, font: &HFONT, text: &str, mut rect: RECT, color: C) {
     let old_font = SelectObject(hdc, HGDIOBJ(font.0));
     let _ = SetBkMode(hdc, TRANSPARENT);
-    let _ = SetTextColor(hdc, COLORREF(color));
+    let _ = SetTextColor(hdc, COLORREF(resolve_color(color)));
     let mut wide = to_wide(text);
     let text_len = wide.len().saturating_sub(1);
     let _ = DrawTextW(
@@ -17586,10 +17772,16 @@ unsafe fn draw_text(hdc: HDC, font: &HFONT, text: &str, mut rect: RECT, color: u
     let _ = SelectObject(hdc, old_font);
 }
 
-unsafe fn draw_centered_text(hdc: HDC, font: &HFONT, text: &str, mut rect: RECT, color: u32) {
+unsafe fn draw_centered_text<C: ColorValue>(
+    hdc: HDC,
+    font: &HFONT,
+    text: &str,
+    mut rect: RECT,
+    color: C,
+) {
     let old_font = SelectObject(hdc, HGDIOBJ(font.0));
     let _ = SetBkMode(hdc, TRANSPARENT);
-    let _ = SetTextColor(hdc, COLORREF(color));
+    let _ = SetTextColor(hdc, COLORREF(resolve_color(color)));
     let mut wide = to_wide(text);
     let text_len = wide.len().saturating_sub(1);
     let _ = DrawTextW(
@@ -17601,10 +17793,16 @@ unsafe fn draw_centered_text(hdc: HDC, font: &HFONT, text: &str, mut rect: RECT,
     let _ = SelectObject(hdc, old_font);
 }
 
-unsafe fn draw_icon_glyph(hdc: HDC, font: &HFONT, text: &str, mut rect: RECT, color: u32) {
+unsafe fn draw_icon_glyph<C: ColorValue>(
+    hdc: HDC,
+    font: &HFONT,
+    text: &str,
+    mut rect: RECT,
+    color: C,
+) {
     let old_font = SelectObject(hdc, HGDIOBJ(font.0));
     let _ = SetBkMode(hdc, TRANSPARENT);
-    let _ = SetTextColor(hdc, COLORREF(color));
+    let _ = SetTextColor(hdc, COLORREF(resolve_color(color)));
     let mut wide = to_wide(text);
     let text_len = wide.len().saturating_sub(1);
     let _ = DrawTextW(
@@ -17632,7 +17830,11 @@ unsafe fn draw_tab_favicon(hdc: HDC, font: &HFONT, rect: RECT, tab: &Tab, dimmed
         .find(|ch| ch.is_ascii_alphanumeric())
         .map(|ch| ch.to_ascii_uppercase().to_string())
         .unwrap_or_else(|| "A".to_string());
-    let color = if dimmed { 0x555555 } else { COLOR_ACCENT };
+    let color = if dimmed {
+        0x555555
+    } else {
+        resolve_color(COLOR_ACCENT)
+    };
     draw_centered_text(hdc, font, &letter, rect, color);
 }
 
@@ -18318,7 +18520,7 @@ fn render_glyph_favicon(
     size: i32,
     codepoint: u32,
     icon_font: &HFONT,
-    color: u32,
+    color: C,
 ) -> Option<FaviconBitmap> {
     unsafe {
         let hdc = CreateCompatibleDC(None);
@@ -19922,7 +20124,9 @@ render();
         .replace("__VISIT_DIRECTION__", visit_direction)
 }
 
-fn mix_color(from: u32, to: u32, amount: f32) -> u32 {
+fn mix_color<F: ColorValue, T: ColorValue>(from: F, to: T, amount: f32) -> u32 {
+    let from = resolve_color(from);
+    let to = resolve_color(to);
     let t = amount.clamp(0.0, 1.0);
     let fr = (from & 0xff) as f32;
     let fg = ((from >> 8) & 0xff) as f32;
@@ -20631,8 +20835,8 @@ fn measure_text_width(hdc: HDC, font: &HFONT, text: &str) -> i32 {
     }
 }
 
-fn solid_brush(color: u32) -> HBRUSH {
-    unsafe { CreateSolidBrush(COLORREF(color)) }
+fn solid_brush<C: ColorValue>(color: C) -> HBRUSH {
+    unsafe { CreateSolidBrush(COLORREF(resolve_color(color))) }
 }
 
 struct BrushCache {
